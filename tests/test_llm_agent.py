@@ -3,6 +3,7 @@
 import json
 import logging
 import warnings
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -12,6 +13,8 @@ from mesa.model import Model
 from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
 
 from mesa_llm import Plan
+from mesa_llm.actions import ActionChoice, ActionManager, action, wait
+from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.memory.st_memory import ShortTermMemory
 from mesa_llm.reasoning.react import ReActReasoning
@@ -104,6 +107,425 @@ def test_llm_agent_tools_constructor_tri_state():
     assert explicit_tools_agent._tool_manager.tools == {
         "agent_constructor_tool": agent_constructor_tool
     }
+
+
+def test_llm_agent_actions_constructor_tri_state():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    model = DummyModel()
+
+    no_actions_agent = LLMAgent(model, reasoning=ReActReasoning, actions=None)
+    empty_actions_agent = LLMAgent(model, reasoning=ReActReasoning, actions=[])
+    explicit_actions_agent = LLMAgent(
+        model,
+        reasoning=ReActReasoning,
+        actions=[wait],
+    )
+
+    assert no_actions_agent._action_manager.actions == {}
+    assert empty_actions_agent._action_manager.actions == {}
+    assert explicit_actions_agent._action_manager.actions == {"wait": wait}
+    assert explicit_actions_agent._action_manager.available_actions() == {"wait": wait}
+
+
+def test_llm_agent_actions_constructor_accepts_registered_action_name():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    original_registry = dict(_GLOBAL_ACTION_REGISTRY)
+    try:
+
+        @action
+        def llm_agent_registered_action(agent, value: int) -> int:
+            """Registered action.
+
+            Args:
+                value: Value to return.
+
+            Returns:
+                The value.
+            """
+            del agent
+            return value
+
+        agent = LLMAgent(
+            DummyModel(),
+            reasoning=ReActReasoning,
+            actions=["llm_agent_registered_action"],
+        )
+
+        assert agent._action_manager.actions == {
+            "llm_agent_registered_action": llm_agent_registered_action
+        }
+        assert agent._action_manager.available_actions() == {
+            "llm_agent_registered_action": llm_agent_registered_action
+        }
+    finally:
+        _GLOBAL_ACTION_REGISTRY.clear()
+        _GLOBAL_ACTION_REGISTRY.update(original_registry)
+
+
+def test_llm_agent_actions_constructor_unknown_name_fails_fast():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    with pytest.raises(ValueError, match="Unknown action name"):
+        LLMAgent(
+            DummyModel(),
+            reasoning=ReActReasoning,
+            actions=["missing_llm_agent_action"],
+        )
+
+
+def test_llm_agent_does_not_expose_public_action_manager_property():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+
+    assert agent._action_manager.available_actions() == {"wait": wait}
+    assert not hasattr(agent, "action_manager")
+
+
+def test_execute_action_validates_before_mutation_and_executes_configured_action():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[increment_counter],
+    )
+    agent.counter = 0
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        agent.execute_action(
+            ActionChoice(name="increment_counter", arguments={}),
+        )
+
+    assert agent.counter == 0
+
+    result = agent.execute_action(
+        ActionChoice(
+            name="increment_counter",
+            arguments={"amount": "2"},
+        ),
+    )
+
+    assert result == "incremented"
+    assert agent.counter == 2
+
+
+def test_execute_action_respects_omitted_explicit_and_narrowed_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def selected_action(agent, amount: int) -> str:
+        """Selected action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Selection confirmation.
+        """
+        agent.selected += amount
+        return "selected"
+
+    @action(action_manager=ActionManager())
+    def other_action(agent, amount: int) -> str:
+        """Other action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Other confirmation.
+        """
+        agent.other += amount
+        return "other"
+
+    @action(action_manager=ActionManager())
+    def unconfigured_action(agent) -> str:
+        """Unconfigured action.
+
+        Returns:
+            Unconfigured confirmation.
+        """
+        agent.unconfigured += 1
+        return "unconfigured"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[selected_action, other_action],
+    )
+    agent.selected = 0
+    agent.other = 0
+    agent.unconfigured = 0
+
+    assert (
+        agent.execute_action(
+            ActionChoice(name="other_action", arguments={"amount": 3}),
+        )
+        == "other"
+    )
+    assert agent.other == 3
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="Unknown action name"):
+            agent.execute_action(
+                ActionChoice(name="selected_action", arguments={"amount": 1}),
+                actions=no_actions,
+            )
+
+    assert agent.selected == 0
+
+    assert (
+        agent.execute_action(
+            ActionChoice(name="selected_action", arguments={"amount": 2}),
+            actions=["selected_action"],
+        )
+        == "selected"
+    )
+    assert agent.selected == 2
+
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.execute_action(
+            ActionChoice(name="other_action", arguments={"amount": 1}),
+            actions=[selected_action],
+        )
+
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.execute_action(
+            ActionChoice(name="selected_action", arguments={"amount": 1}),
+            actions=[unconfigured_action],
+        )
+
+    assert agent.selected == 2
+    assert agent.other == 3
+    assert agent.unconfigured == 0
+
+
+def _action_choice_response(content):
+    message = SimpleNamespace(content=content)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(choices=[choice])
+
+
+def test_choose_action_uses_structured_output_context_and_does_not_execute():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[increment_counter],
+    )
+    agent.counter = 0
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "increment_counter",
+                    "arguments": {"amount": "4"},
+                    "rationale": "Need to update the counter.",
+                },
+            ),
+        ),
+    )
+
+    choice = agent.choose_action(
+        "Choose the next committed action.",
+        system_prompt="system action prompt",
+    )
+
+    assert choice.name == "increment_counter"
+    assert choice.arguments == {"amount": 4}
+    assert choice.rationale == "Need to update the counter."
+    assert agent.counter == 0
+
+    agent.llm.generate.assert_called_once()
+    call_kwargs = agent.llm.generate.call_args.kwargs
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["system_prompt"] == "system action prompt"
+
+    action_context = call_kwargs["prompt"][0]
+    assert "Available actions:" in action_context
+    assert '"name": "increment_counter"' in action_context
+    assert '"amount"' in action_context
+    assert "Choose the next committed action." in call_kwargs["prompt"][1]
+
+
+def test_choose_action_fails_fast_when_no_actions_are_available():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    no_action_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=None,
+    )
+    no_action_agent.llm.generate = Mock()
+
+    with pytest.raises(ValueError, match="No actions are available"):
+        no_action_agent.choose_action("Choose an action.")
+
+    no_action_agent.llm.generate.assert_not_called()
+
+    configured_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[wait],
+    )
+    configured_agent.llm.generate = Mock()
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="No actions are available"):
+            configured_agent.choose_action("Choose an action.", actions=no_actions)
+
+    configured_agent.llm.generate.assert_not_called()
+
+
+def test_choose_action_respects_narrowed_actions_and_validates_returned_choice():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def selected_action(agent, amount: int) -> str:
+        """Selected action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Selection confirmation.
+        """
+        agent.selected += amount
+        return "selected"
+
+    @action(action_manager=ActionManager())
+    def other_action(agent, amount: int) -> str:
+        """Other action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Other confirmation.
+        """
+        agent.other += amount
+        return "other"
+
+    @action(action_manager=ActionManager())
+    def unconfigured_action(agent) -> str:
+        """Unconfigured action.
+
+        Returns:
+            Unconfigured confirmation.
+        """
+        agent.unconfigured += 1
+        return "unconfigured"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[selected_action, other_action],
+    )
+    agent.selected = 0
+    agent.other = 0
+    agent.unconfigured = 0
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "selected_action",
+                    "arguments": {"amount": 5},
+                },
+            ),
+        ),
+    )
+
+    choice = agent.choose_action(
+        "Choose from the narrowed action set.",
+        actions=[selected_action],
+    )
+
+    assert choice.name == "selected_action"
+    assert choice.arguments == {"amount": 5}
+    action_context = agent.llm.generate.call_args.kwargs["prompt"][0]
+    assert '"name": "selected_action"' in action_context
+    assert '"name": "other_action"' not in action_context
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "other_action",
+                    "arguments": {"amount": 1},
+                },
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.choose_action(
+            "Choose from the narrowed action set.",
+            actions=[selected_action],
+        )
+
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    agent.llm.generate = Mock()
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.choose_action(
+            "Choose from an unconfigured action set.",
+            actions=[unconfigured_action],
+        )
+
+    agent.llm.generate.assert_not_called()
+    assert agent.unconfigured == 0
 
 
 def test_llm_agent_tool_manager_property_is_deprecated():

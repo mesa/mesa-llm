@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mesa.agent import Agent
 from mesa.discrete_space import (
@@ -18,6 +19,14 @@ from mesa.space import (
 )
 
 from mesa_llm import Plan
+from mesa_llm.actions.action_manager import (
+    _UNSET as _ACTIONS_UNSET,
+)
+from mesa_llm.actions.action_manager import (
+    ActionChoice,
+    ActionManager,
+    ActionSelection,
+)
 from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.module_llm import ModuleLLM
 from mesa_llm.reasoning.reasoning import (
@@ -55,6 +64,10 @@ class LLMAgent(Agent):
             Explicit tools exposed to this agent. ``None`` and ``[]`` expose
             no tools; pass a tool-set factory such as ``legacy_tools()`` to
             opt in to compatibility built-ins.
+        actions (list[Callable | str] | tuple[Callable | str, ...] | None):
+            Explicit actions exposed to this agent. ``None`` and ``[]`` expose
+            no actions; pass an explicit action list or action-set factory to
+            opt in to action capabilities.
 
     Attributes:
         llm (ModuleLLM): The internal LLM interface used by the agent.
@@ -72,6 +85,7 @@ class LLMAgent(Agent):
         step_prompt: str | None = None,
         api_base: str | None = None,
         tools: list[Callable | str] | tuple[Callable | str, ...] | None = None,
+        actions: list[Callable | str] | tuple[Callable | str, ...] | None = None,
     ):
         super().__init__(model=model)
 
@@ -90,6 +104,7 @@ class LLMAgent(Agent):
         )
 
         self._tool_manager = ToolManager(tools=tools)
+        self._action_manager = ActionManager(actions=actions)
         self.vision = vision
         self.reasoning = reasoning(agent=self)
         self.system_prompt = system_prompt
@@ -138,6 +153,97 @@ class LLMAgent(Agent):
             stacklevel=2,
         )
         self._tool_manager = value
+
+    def execute_action(
+        self,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+    ) -> Any:
+        """Validate and execute one configured action locally."""
+        return self._action_manager.execute(self, action_choice, actions=actions)
+
+    def choose_action(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActionChoice:
+        """Choose one structured action without executing or mutating state."""
+        action_schemas = self._action_manager.get_actions_schema(
+            agent=self,
+            actions=actions,
+        )
+        if not action_schemas:
+            raise ValueError(
+                "No actions are available for this call. Configure actions on "
+                "the agent or pass a non-empty configured action selector."
+            )
+
+        response = self.llm.generate(
+            prompt=self._build_action_choice_prompt(prompt, action_schemas),
+            tool_schema=None,
+            tool_choice="none",
+            response_format=ActionChoice,
+            system_prompt=system_prompt,
+        )
+        action_choice = self._parse_action_choice_response(response)
+        return self._action_manager.validate(self, action_choice, actions=actions)
+
+    def _build_action_choice_prompt(
+        self,
+        prompt: str | list[str],
+        action_schemas: list[dict[str, Any]],
+    ) -> list[str]:
+        action_context = (
+            "Choose exactly one action from the available action specs below. "
+            "Return only a JSON object matching this shape: "
+            '{"name": str, "arguments": object, "rationale": str | null}. '
+            "Do not call tools and do not execute the action.\n\n"
+            f"Available actions:\n{json.dumps(action_schemas, indent=2)}"
+        )
+        if isinstance(prompt, str):
+            return [action_context, prompt]
+        if isinstance(prompt, list):
+            return [action_context, *prompt]
+        raise TypeError(
+            f"Invalid prompt type '{type(prompt).__name__}'. Expected str or list[str]."
+        )
+
+    def _parse_action_choice_response(self, response: Any) -> ActionChoice:
+        message = response.choices[0].message
+        parsed = getattr(message, "parsed", None)
+        if parsed is not None:
+            if isinstance(parsed, ActionChoice):
+                return parsed
+            if isinstance(parsed, dict):
+                return ActionChoice(**parsed)
+            if hasattr(parsed, "model_dump"):
+                return ActionChoice(**parsed.model_dump())
+
+        content = getattr(message, "content", message)
+        if isinstance(content, ActionChoice):
+            return content
+        if isinstance(content, dict):
+            return ActionChoice(**content)
+        if isinstance(content, str):
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "LLM action choice response must be valid JSON matching "
+                    "ActionChoice."
+                ) from exc
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "LLM action choice response must be a JSON object matching "
+                    "ActionChoice."
+                )
+            return ActionChoice(**data)
+
+        raise TypeError(
+            "LLM action choice response must be an ActionChoice, dict, or JSON "
+            f"object string, got {type(content).__name__}."
+        )
 
     def _format_message_status(
         self, message: str, delivered_ids: list[int], skipped_ids: list[int]
