@@ -231,7 +231,7 @@ def test_validate_does_not_execute_action_or_mutate_state():
     assert model.counter == 0
 
 
-def test_validate_coerces_numeric_string_arguments():
+def test_validate_coerces_exact_numeric_string_arguments():
     @action
     def record_measurement(agent, amount: int, ratio: float) -> tuple[int, float]:
         """Record typed numeric values.
@@ -262,7 +262,243 @@ def test_validate_coerces_numeric_string_arguments():
     assert isinstance(validated.arguments["ratio"], float)
 
 
-@pytest.mark.parametrize("invalid_amount", ["bad", 2.9, "2.9"])
+def test_execute_rejects_embedded_float_text_before_mutation():
+    @action
+    def scale_total(agent, ratio: float) -> str:
+        """Scale the live agent total.
+
+        Args:
+            ratio: Floating point multiplier.
+
+        Returns:
+            Scale confirmation.
+        """
+        agent.total *= ratio
+        return "scaled"
+
+    agent = SimpleNamespace(total=10.0)
+    manager = ActionManager(actions=[scale_total])
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*ratio.*float"):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="scale_total",
+                arguments={"ratio": "ratio 2.5"},
+            ),
+        )
+
+    assert agent.total == 10.0
+
+
+def test_validate_coerces_single_embedded_integer_from_llm_text():
+    @action
+    def arrest_citizen(agent, citizen_id: int) -> int:
+        """Arrest a citizen by id.
+
+        Args:
+            citizen_id: Citizen id to arrest.
+
+        Returns:
+            The normalized citizen id.
+        """
+        del agent
+        return citizen_id
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[arrest_citizen])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(
+            name="arrest_citizen",
+            arguments={"citizen_id": "Citizen 12"},
+        ),
+    )
+
+    assert validated.arguments == {"citizen_id": 12}
+    assert isinstance(validated.arguments["citizen_id"], int)
+
+
+def test_validate_rejects_ambiguous_embedded_integers_for_scalar_int():
+    @action
+    def arrest_citizen(agent, citizen_id: int) -> int:
+        """Arrest a citizen by id.
+
+        Args:
+            citizen_id: Citizen id to arrest.
+
+        Returns:
+            The normalized citizen id.
+        """
+        del agent
+        return citizen_id
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[arrest_citizen])
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*citizen_id.*int"):
+        manager.validate(
+            agent,
+            ActionChoice(
+                name="arrest_citizen",
+                arguments={"citizen_id": "Citizens 12 and 13"},
+            ),
+        )
+
+
+def test_validate_coerces_string_json_list_to_int_list():
+    @action
+    def notify_agents(agent, listener_agent_ids: list[int]) -> list[int]:
+        """Notify agents by id.
+
+        Args:
+            listener_agent_ids: Agent ids to notify.
+
+        Returns:
+            The normalized agent ids.
+        """
+        del agent
+        return listener_agent_ids
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[notify_agents])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(
+            name="notify_agents",
+            arguments={"listener_agent_ids": "[12, 13]"},
+        ),
+    )
+
+    assert validated.arguments == {"listener_agent_ids": [12, 13]}
+
+
+def test_validate_coerces_single_free_text_id_to_int_list():
+    @action
+    def notify_agents(agent, listener_agent_ids: list[int]) -> list[int]:
+        """Notify agents by id.
+
+        Args:
+            listener_agent_ids: Agent ids to notify.
+
+        Returns:
+            The normalized agent ids.
+        """
+        del agent
+        return listener_agent_ids
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[notify_agents])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(
+            name="notify_agents",
+            arguments={"listener_agent_ids": "Agent 12"},
+        ),
+    )
+
+    assert validated.arguments == {"listener_agent_ids": [12]}
+
+
+def test_execute_rejects_multi_id_prose_int_list_before_mutation():
+    @action
+    def notify_agents(agent, listener_agent_ids: list[int]) -> str:
+        """Notify agents by id.
+
+        Args:
+            listener_agent_ids: Agent ids to notify.
+
+        Returns:
+            Notification confirmation.
+        """
+        agent.notified_ids.extend(listener_agent_ids)
+        return "notified"
+
+    agent = SimpleNamespace(notified_ids=[])
+    manager = ActionManager(actions=[notify_agents])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*listener_agent_ids.*list\[int\]",
+    ):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="notify_agents",
+                arguments={"listener_agent_ids": "agents 1 and 2"},
+            ),
+        )
+
+    assert agent.notified_ids == []
+
+
+def test_validate_coerces_json_string_tuple_arguments():
+    @action
+    def move_to(agent, target_coordinates: tuple[int, int]) -> tuple[int, int]:
+        """Move to coordinates.
+
+        Args:
+            target_coordinates: Two-dimensional target coordinates.
+
+        Returns:
+            The normalized coordinates.
+        """
+        del agent
+        return target_coordinates
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[move_to])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(
+            name="move_to",
+            arguments={"target_coordinates": "[2, 3]"},
+        ),
+    )
+
+    assert validated.arguments == {"target_coordinates": (2, 3)}
+
+
+def test_execute_rejects_prose_coordinate_tuple_before_mutation():
+    @action
+    def move_to(agent, target_coordinates: tuple[int, int]) -> str:
+        """Move to coordinates.
+
+        Args:
+            target_coordinates: Two-dimensional target coordinates.
+
+        Returns:
+            Move confirmation.
+        """
+        agent.pos = target_coordinates
+        return "moved"
+
+    agent = SimpleNamespace(pos=(0, 0))
+    manager = ActionManager(actions=[move_to])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*target_coordinates.*tuple\[int, int\]",
+    ):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="move_to",
+                arguments={"target_coordinates": "coords 1 and 2"},
+            ),
+        )
+
+    assert agent.pos == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "invalid_amount",
+    ["bad", 2.9, "2.9", "Citizen 12.5", "agents 1 and 2"],
+)
 def test_execute_invalid_int_args_fail_before_execution_and_mutation(invalid_amount):
     @action
     def increment_counter(agent, amount: int) -> str:

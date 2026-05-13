@@ -4,8 +4,15 @@ from mesa_llm.actions.action_decorator import (
 )
 from mesa_llm.actions.action_manager import ActionChoice, ActionManager
 from mesa_llm.actions.action_result import ActResult
-from mesa_llm.actions.defaults import default_actions
-from mesa_llm.actions.inbuilt_actions import wait
+from mesa_llm.actions.builtins import (
+    default_actions,
+    move_one_step,
+    social_actions,
+    spatial_actions,
+    speak_to,
+    teleport_to_location,
+    wait,
+)
 
 __all__ = [
     "ActResult",
@@ -14,5 +21,10 @@ __all__ = [
     "ActionMetadata",
     "action",
     "default_actions",
+    "move_one_step",
+    "social_actions",
+    "spatial_actions",
+    "speak_to",
+    "teleport_to_location",
     "wait",
 ]

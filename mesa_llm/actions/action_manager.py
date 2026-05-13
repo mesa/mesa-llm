@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import copy
 import inspect
+import json
+import re
 from collections.abc import Callable
 from types import UnionType
 from typing import (
@@ -22,6 +24,11 @@ from terminal_style import style
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
 
 _UNSET = object()
+_EMBEDDED_NUMBER_PATTERN = re.compile(
+    r"(?<![\w.+-])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    r"(?![\w.+-])"
+)
+_INTEGER_TOKEN_PATTERN = re.compile(r"[-+]?\d+")
 ActionRef = Callable | str
 ActionSelection = ActionRef | list[ActionRef] | tuple[ActionRef, ...] | None
 
@@ -494,6 +501,17 @@ class ActionManager:
         origin: Any,
         args: tuple[Any, ...],
     ) -> Any:
+        container_type = origin or expected_type
+        item_types = args
+        if isinstance(value, str):
+            coerced_sequence = self._coerce_string_sequence_value(
+                value,
+                container_type,
+                item_types,
+            )
+            if coerced_sequence is not None:
+                value = coerced_sequence
+
         if not isinstance(value, (list, tuple, set)):
             raise self._invalid_action_argument_type_error(
                 action_name,
@@ -502,8 +520,6 @@ class ActionManager:
                 value,
             )
 
-        container_type = origin or expected_type
-        item_types = args
         if container_type is tuple and item_types and item_types[-1] is not Ellipsis:
             if len(value) != len(item_types):
                 raise self._invalid_action_argument_type_error(
@@ -546,6 +562,34 @@ class ActionManager:
                     value,
                 ) from exc
         return list(coerced_items)
+
+    def _coerce_string_sequence_value(
+        self,
+        value: str,
+        container_type: Any,
+        item_types: tuple[Any, ...],
+    ) -> list[Any] | None:
+        value = value.strip()
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                return decoded
+
+        if self._can_coerce_single_embedded_int_list(container_type, item_types):
+            embedded_ints = self._extract_embedded_ints(value)
+            if embedded_ints is not None and len(embedded_ints) == 1:
+                return embedded_ints
+
+        return None
+
+    def _can_coerce_single_embedded_int_list(
+        self,
+        container_type: Any,
+        item_types: tuple[Any, ...],
+    ) -> bool:
+        if container_type is not list or len(item_types) != 1:
+            return False
+        return self._is_int_annotation(item_types[0])
 
     def _validate_and_coerce_mapping_value(
         self,
@@ -594,7 +638,28 @@ class ActionManager:
                 return value
             return coerced_value
 
+        if expected_type is int and isinstance(value, str):
+            embedded_ints = self._extract_embedded_ints(value)
+            if embedded_ints is not None and len(embedded_ints) == 1:
+                return embedded_ints[0]
+
         return value
+
+    def _extract_embedded_ints(self, value: str) -> list[int] | None:
+        number_tokens = _EMBEDDED_NUMBER_PATTERN.findall(value)
+        if not number_tokens:
+            return []
+        if not all(_INTEGER_TOKEN_PATTERN.fullmatch(token) for token in number_tokens):
+            return None
+        return [int(token) for token in number_tokens]
+
+    def _is_int_annotation(self, annotation: Any) -> bool:
+        annotation = self._normalize_action_annotation(annotation)
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin is Annotated and args:
+            return self._is_int_annotation(args[0])
+        return annotation is int
 
     def _is_lossless_int_coercion(self, value: Any, coerced_value: int) -> bool:
         if isinstance(value, str):

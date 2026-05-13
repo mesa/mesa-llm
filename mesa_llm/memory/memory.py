@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def _format_message_entry(msg_value) -> str:
     """Render a message memory value as a readable string.
 
-    Handles the nested dict produced by the speak_to tool:
+    Handles the nested dict produced by the speak_to action:
         {"message": "<text>", "sender": <id>, "recipients": [...]}
     as well as plain strings stored by legacy or test code.
     """

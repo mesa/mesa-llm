@@ -4,7 +4,7 @@ import json
 import logging
 import warnings
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from mesa.agent import Agent
@@ -530,6 +530,235 @@ def test_choose_action_respects_narrowed_actions_and_validates_returned_choice()
     assert agent.unconfigured == 0
 
 
+@pytest.mark.asyncio
+async def test_achoose_action_uses_structured_output_context_and_does_not_execute():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[increment_counter],
+    )
+    agent.counter = 0
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "increment_counter",
+                    "arguments": {"amount": "4"},
+                    "rationale": "Need to update the counter.",
+                },
+            ),
+        ),
+    )
+
+    choice = await agent.achoose_action(
+        "Choose the next committed action.",
+        system_prompt="async system action prompt",
+    )
+
+    assert choice.name == "increment_counter"
+    assert choice.arguments == {"amount": 4}
+    assert choice.rationale == "Need to update the counter."
+    assert agent.counter == 0
+
+    agent.llm.agenerate.assert_awaited_once()
+    call_kwargs = agent.llm.agenerate.call_args.kwargs
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["system_prompt"] == "async system action prompt"
+
+    action_context = call_kwargs["prompt"][0]
+    assert "Available actions:" in action_context
+    assert '"name": "increment_counter"' in action_context
+    assert '"amount"' in action_context
+    assert "Choose the next committed action." in call_kwargs["prompt"][1]
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_fails_fast_when_no_actions_are_available():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    no_action_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=None,
+    )
+    no_action_agent.llm.agenerate = AsyncMock()
+
+    with pytest.raises(ValueError, match="No actions are available"):
+        await no_action_agent.achoose_action("Choose an action.")
+
+    no_action_agent.llm.agenerate.assert_not_called()
+
+    configured_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[wait],
+    )
+    configured_agent.llm.agenerate = AsyncMock()
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="No actions are available"):
+            await configured_agent.achoose_action(
+                "Choose an action.",
+                actions=no_actions,
+            )
+
+    configured_agent.llm.agenerate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_respects_omitted_explicit_and_narrowed_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def selected_action(agent, amount: int) -> str:
+        """Selected action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Selection confirmation.
+        """
+        agent.selected += amount
+        return "selected"
+
+    @action(action_manager=ActionManager())
+    def other_action(agent, amount: int) -> str:
+        """Other action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Other confirmation.
+        """
+        agent.other += amount
+        return "other"
+
+    @action(action_manager=ActionManager())
+    def unconfigured_action(agent) -> str:
+        """Unconfigured action.
+
+        Returns:
+            Unconfigured confirmation.
+        """
+        agent.unconfigured += 1
+        return "unconfigured"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[selected_action, other_action],
+    )
+    agent.selected = 0
+    agent.other = 0
+    agent.unconfigured = 0
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "other_action",
+                    "arguments": {"amount": 2},
+                },
+            ),
+        ),
+    )
+
+    omitted_choice = await agent.achoose_action("Use the configured action set.")
+
+    assert omitted_choice.name == "other_action"
+    assert omitted_choice.arguments == {"amount": 2}
+    omitted_context = agent.llm.agenerate.call_args.kwargs["prompt"][0]
+    assert '"name": "selected_action"' in omitted_context
+    assert '"name": "other_action"' in omitted_context
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    for no_actions in [None, []]:
+        agent.llm.agenerate = AsyncMock()
+        with pytest.raises(ValueError, match="No actions are available"):
+            await agent.achoose_action(
+                "Explicitly disable actions.",
+                actions=no_actions,
+            )
+        agent.llm.agenerate.assert_not_called()
+
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "selected_action",
+                    "arguments": {"amount": 5},
+                },
+            ),
+        ),
+    )
+
+    narrowed_choice = await agent.achoose_action(
+        "Choose from the narrowed action set.",
+        actions=[selected_action],
+    )
+
+    assert narrowed_choice.name == "selected_action"
+    assert narrowed_choice.arguments == {"amount": 5}
+    narrowed_context = agent.llm.agenerate.call_args.kwargs["prompt"][0]
+    assert '"name": "selected_action"' in narrowed_context
+    assert '"name": "other_action"' not in narrowed_context
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "other_action",
+                    "arguments": {"amount": 1},
+                },
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="Unknown action name"):
+        await agent.achoose_action(
+            "Choose from the narrowed action set.",
+            actions=[selected_action],
+        )
+
+    agent.llm.agenerate = AsyncMock()
+    with pytest.raises(ValueError, match="Unknown action name"):
+        await agent.achoose_action(
+            "Choose from an unconfigured action set.",
+            actions=[unconfigured_action],
+        )
+
+    agent.llm.agenerate.assert_not_called()
+    assert agent.selected == 0
+    assert agent.other == 0
+    assert agent.unconfigured == 0
+
+
 def test_plan_delegates_to_reasoning_without_exposing_actions():
     class DummyModel(Model):
         def __init__(self):
@@ -720,6 +949,147 @@ def test_act_fails_fast_when_explicit_actions_expose_no_actions():
     agent.plan.assert_not_called()
     agent.llm.generate.assert_not_called()
     agent.execute_action.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aact_awaits_action_choice_executes_once_and_returns_act_result():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    choice = ActionChoice(
+        name="wait", arguments={}, rationale="No state change needed."
+    )
+    agent.plan = Mock(side_effect=AssertionError("aact() must not call plan()"))
+    agent.reasoning.aplan = AsyncMock(
+        side_effect=AssertionError("aact() must not call aplan()")
+    )
+    agent.achoose_action = AsyncMock(return_value=choice)
+    agent.execute_action = Mock(return_value="waited")
+
+    result = await agent.aact(
+        "Take one async turn.",
+        actions=[wait],
+        system_prompt="async action system prompt",
+    )
+
+    agent.achoose_action.assert_awaited_once_with(
+        "Take one async turn.",
+        actions=[wait],
+        system_prompt="async action system prompt",
+    )
+    agent.execute_action.assert_called_once_with(choice, actions=[wait])
+    agent.plan.assert_not_called()
+    agent.reasoning.aplan.assert_not_called()
+    assert result.__class__.__name__ == "ActResult"
+    assert result.action is choice
+    assert result.result == "waited"
+    assert not hasattr(result, "plan")
+    assert not hasattr(result, "success")
+
+
+@pytest.mark.asyncio
+async def test_aact_records_successful_execution_and_does_not_record_failures():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def recorded_async_action(agent, amount: int) -> str:
+        """Recorded async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.counter += amount
+        return "recorded"
+
+    successful_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[recorded_async_action],
+    )
+    successful_agent.memory = ShortTermMemory(
+        agent=successful_agent,
+        n=5,
+        display=False,
+    )
+    successful_agent.recorder = Mock()
+    successful_agent.counter = 0
+    successful_agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "recorded_async_action",
+                    "arguments": {"amount": 3},
+                },
+            ),
+        ),
+    )
+
+    result = await successful_agent.aact("Take one recorded async action.")
+
+    assert result.action.name == "recorded_async_action"
+    assert result.action.arguments == {"amount": 3}
+    assert result.result == "recorded"
+    assert successful_agent.counter == 3
+    expected_content = {
+        "action": {
+            "name": "recorded_async_action",
+            "arguments": {"amount": 3},
+            "rationale": None,
+        },
+        "result": "recorded",
+    }
+    actions = successful_agent.memory.step_content["action"]
+    assert actions == [expected_content]
+    successful_agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=successful_agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+    @action(action_manager=ActionManager())
+    def failing_async_action(agent, amount: int) -> str:
+        """Failing async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Never returns.
+        """
+        del agent, amount
+        raise RuntimeError("async action failed")
+
+    failing_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[failing_async_action],
+    )
+    failing_agent.memory = ShortTermMemory(agent=failing_agent, n=5, display=False)
+    failing_agent.recorder = Mock()
+    failing_agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "failing_async_action",
+                    "arguments": {"amount": 1},
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="async action failed"):
+        await failing_agent.aact("Take one failing async action.")
+
+    assert "action" not in failing_agent.memory.step_content
+    failing_agent.recorder.record_event.assert_not_called()
 
 
 def test_execute_action_records_successful_action_event_after_execution():

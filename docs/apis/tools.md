@@ -2,14 +2,13 @@
 
 The tools system in Mesa-LLM exposes explicit LLM-callable helper functions through JSON schemas. Tool exposure is opt-in: `LLMAgent(..., tools=None)` and `LLMAgent(..., tools=[])` expose no tools. Pass explicit callables or a tool-set factory when a simulation should expose tools.
 
-Current built-ins such as `move_one_step`, `teleport_to_location`, and `speak_to` are available only through explicit configuration such as `legacy_tools()`.
+State-changing built-ins such as `move_one_step`, `teleport_to_location`, and `speak_to` are actions. Import them, or action-set factories such as `spatial_actions()` and `social_actions()`, from `mesa_llm.actions`.
 
 ## Tool Sets
 
-Tool sets are factory functions that return tuples. They are preferred over mutable constants and live in `mesa_llm.tools.defaults`.
+Tool sets are factory functions that return tuples. They are preferred over mutable constants and are imported from `mesa_llm.tools`.
 
 - `default_tools()` returns exactly `()` because no safe read-only built-ins are available yet.
-- `legacy_tools()` returns exactly `(move_one_step, teleport_to_location, speak_to)` for simulations migrating from old implicit built-ins.
 - `math_tools()` returns `()`.
 - `spatial_tools()` returns `()`.
 - `environment_tools()` returns `()`.
@@ -32,7 +31,7 @@ compatibility aliases.
 ```python
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.reasoning.cot import CoTReasoning
-from mesa_llm.tools.tool_decorator import tool
+from mesa_llm.tools import tool
 
 @tool
 def inspect_status(agent: "LLMAgent") -> str:
@@ -71,12 +70,16 @@ plan_without_tools = self.reasoning.plan(obs=obs, tools=None)
 
 Per-call selections are also used for execution of the returned plan. Any tool passed as `tools=[inspect_status]` must already be configured on the agent or manager; per-call `tools=[...]` cannot add unconfigured tools.
 
-To migrate code that relied on the old implicit built-ins, opt in explicitly:
+To configure state-changing built-ins, import action factories from `mesa_llm.actions` and pass them with `actions=`:
 
 ```python
-from mesa_llm.tools.defaults import legacy_tools
+from mesa_llm.actions import social_actions, spatial_actions
 
-agent = LLMAgent(model, reasoning=CoTReasoning, tools=legacy_tools())
+agent = LLMAgent(
+   model,
+   reasoning=CoTReasoning,
+   actions=[*spatial_actions(), *social_actions()],
+)
 ```
 
 ## Tool decorator
@@ -88,10 +91,10 @@ agent = LLMAgent(model, reasoning=CoTReasoning, tools=legacy_tools())
    :show-inheritance:
 ```
 
-## Built-in tools
+## Public tool exports
 
 ```{eval-rst}
-.. automodule:: mesa_llm.tools.inbuilt_tools
+.. automodule:: mesa_llm.tools
    :members:
    :undoc-members:
    :show-inheritance:

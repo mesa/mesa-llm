@@ -2,16 +2,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from mesa_llm.tools.defaults import (
+from mesa_llm.tools import (
     default_tools,
     environment_tools,
     external_tools,
-    legacy_tools,
     math_tools,
     social_query_tools,
     spatial_tools,
 )
-from mesa_llm.tools.inbuilt_tools import move_one_step, speak_to, teleport_to_location
 from mesa_llm.tools.tool_decorator import (
     _GLOBAL_TOOL_REGISTRY,
     _TOOL_CALLBACKS,
@@ -51,7 +49,6 @@ class TestToolManager:
     def test_tool_set_factories(self):
         """Tool-set factories are explicit immutable tuples."""
         assert default_tools() == ()
-        assert legacy_tools() == (move_one_step, teleport_to_location, speak_to)
         assert math_tools() == ()
         assert spatial_tools() == ()
         assert environment_tools() == ()
@@ -66,7 +63,6 @@ class TestToolManager:
                 environment_tools(),
                 social_query_tools(),
                 external_tools(),
-                legacy_tools(),
             )
         )
 

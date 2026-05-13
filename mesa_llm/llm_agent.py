@@ -64,8 +64,8 @@ class LLMAgent(Agent):
             self-hosted or remote inference endpoints.
         tools (list[Callable | str] | tuple[Callable | str, ...] | None):
             Explicit tools exposed to this agent. ``None`` and ``[]`` expose
-            no tools; pass a tool-set factory such as ``legacy_tools()`` to
-            opt in to compatibility built-ins.
+            no tools; pass explicit read-only tool callables or tool-set
+            factories to opt in to tool capabilities.
         actions (list[Callable | str] | tuple[Callable | str, ...] | None):
             Explicit actions exposed to this agent. ``None`` and ``[]`` expose
             no actions; pass an explicit action list or action-set factory to
@@ -192,6 +192,21 @@ class LLMAgent(Agent):
         result = self.execute_action(action_choice, actions=actions)
         return ActResult(action=action_choice, result=result)
 
+    async def aact(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActResult:
+        """Asynchronously choose one action, execute it, and return the result."""
+        action_choice = await self.achoose_action(
+            prompt,
+            actions=actions,
+            system_prompt=system_prompt,
+        )
+        result = self.execute_action(action_choice, actions=actions)
+        return ActResult(action=action_choice, result=result)
+
     def execute_action(
         self,
         action_choice: ActionChoice | dict[str, Any],
@@ -225,6 +240,33 @@ class LLMAgent(Agent):
             )
 
         response = self.llm.generate(
+            prompt=self._build_action_choice_prompt(prompt, action_schemas),
+            tool_schema=None,
+            tool_choice="none",
+            response_format=ActionChoice,
+            system_prompt=system_prompt,
+        )
+        action_choice = self._parse_action_choice_response(response)
+        return self._action_manager.validate(self, action_choice, actions=actions)
+
+    async def achoose_action(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActionChoice:
+        """Asynchronously choose one structured action without mutating state."""
+        action_schemas = self._action_manager.get_actions_schema(
+            agent=self,
+            actions=actions,
+        )
+        if not action_schemas:
+            raise ValueError(
+                "No actions are available for this call. Configure actions on "
+                "the agent or pass a non-empty configured action selector."
+            )
+
+        response = await self.llm.agenerate(
             prompt=self._build_action_choice_prompt(prompt, action_schemas),
             tool_schema=None,
             tool_choice="none",
@@ -311,7 +353,7 @@ class LLMAgent(Agent):
     def _format_message_status(
         self, message: str, delivered_ids: list[int], skipped_ids: list[int]
     ) -> str:
-        """Format direct-message delivery status to match the speak_to tool."""
+        """Format direct-message delivery status to match the speak_to action."""
         status_parts = []
         if delivered_ids:
             status_parts.append(f"sent message {message!r} to {delivered_ids}")

@@ -7,8 +7,7 @@ The reasoning system in Mesa-LLM provides different cognitive strategies for age
 ```python
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.reasoning.cot import CoTReasoning
-from mesa_llm.tools.defaults import legacy_tools
-from mesa_llm.tools.tool_decorator import tool
+from mesa_llm.tools import tool
 
 @tool
 def arrest_citizen(agent, citizen_id: int) -> str:
@@ -26,7 +25,7 @@ class MyAgent(LLMAgent):
       super().__init__(
             model=model,
             reasoning=CoTReasoning,  # Specify reasoning strategy
-            tools=[*legacy_tools(), arrest_citizen],
+            tools=[arrest_citizen],
             **kwargs
       )
 
@@ -35,7 +34,7 @@ class MyAgent(LLMAgent):
       obs = self.generate_obs()
       plan = self.reasoning.plan(
             obs=obs,
-            tools=["move_one_step", "speak_to"]
+            tools=["arrest_citizen"]
       )
       self.apply_plan(plan)
 
@@ -52,7 +51,7 @@ async def astep(self):
    plan = await self.reasoning.aplan(
       prompt=self.step_prompt,
       obs=obs,
-      tools=["move_one_step", "arrest_citizen"]
+      tools=["arrest_citizen"]
    )
    self.apply_plan(plan)
 ```
