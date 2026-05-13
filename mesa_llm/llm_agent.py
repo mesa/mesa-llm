@@ -18,7 +18,6 @@ from mesa.space import (
     SingleGrid,
 )
 
-from mesa_llm import Plan
 from mesa_llm.actions.action_manager import (
     _UNSET as _ACTIONS_UNSET,
 )
@@ -27,12 +26,15 @@ from mesa_llm.actions.action_manager import (
     ActionManager,
     ActionSelection,
 )
+from mesa_llm.actions.action_result import ActResult
 from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.module_llm import ModuleLLM
 from mesa_llm.reasoning.reasoning import (
     _UNSET,
     Observation,
+    Plan,
     Reasoning,
+    ToolSelection,
 )
 from mesa_llm.tools.tool_manager import ToolManager
 
@@ -154,13 +156,56 @@ class LLMAgent(Agent):
         )
         self._tool_manager = value
 
+    def plan(
+        self,
+        prompt: str | None = None,
+        obs: Observation | None = None,
+        ttl: int = 1,
+        tools: ToolSelection | object = _UNSET,
+        tool_calls: str | None = "auto",
+        selected_tools: ToolSelection | object = _UNSET,
+    ) -> Plan:
+        """Run the configured reasoning module without exposing actions."""
+        plan_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "obs": obs,
+            "ttl": ttl,
+            "tools": tools,
+            "tool_calls": tool_calls,
+        }
+        if selected_tools is not _UNSET:
+            plan_kwargs["selected_tools"] = selected_tools
+        return self.reasoning.plan(**plan_kwargs)
+
+    def act(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActResult:
+        """Choose one action, execute it, and return the successful result."""
+        action_choice = self.choose_action(
+            prompt,
+            actions=actions,
+            system_prompt=system_prompt,
+        )
+        result = self.execute_action(action_choice, actions=actions)
+        return ActResult(action=action_choice, result=result)
+
     def execute_action(
         self,
         action_choice: ActionChoice | dict[str, Any],
         actions: ActionSelection | object = _ACTIONS_UNSET,
     ) -> Any:
         """Validate and execute one configured action locally."""
-        return self._action_manager.execute(self, action_choice, actions=actions)
+        validated_choice = self._action_manager.validate(
+            self,
+            action_choice,
+            actions=actions,
+        )
+        result = self._action_manager.execute(self, validated_choice, actions=actions)
+        self._record_successful_action_event(validated_choice, result)
+        return result
 
     def choose_action(
         self,
@@ -244,6 +289,24 @@ class LLMAgent(Agent):
             "LLM action choice response must be an ActionChoice, dict, or JSON "
             f"object string, got {type(content).__name__}."
         )
+
+    def _record_successful_action_event(
+        self,
+        action_choice: ActionChoice,
+        result: Any,
+    ) -> None:
+        content = {
+            "action": action_choice.model_dump(),
+            "result": result,
+        }
+        self.memory.add_to_memory(type="action", content=content)
+        if self.recorder is not None:
+            self.recorder.record_event(
+                "action",
+                content=content,
+                agent_id=self.unique_id,
+                metadata={"source": "LLMAgent.execute_action"},
+            )
 
     def _format_message_status(
         self, message: str, delivered_ids: list[int], skipped_ids: list[int]

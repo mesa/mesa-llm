@@ -15,9 +15,11 @@ from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
 from mesa_llm import Plan
 from mesa_llm.actions import ActionChoice, ActionManager, action, wait
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
+from mesa_llm.actions.action_manager import _UNSET as _ACTIONS_UNSET
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.memory.st_memory import ShortTermMemory
 from mesa_llm.reasoning.react import ReActReasoning
+from mesa_llm.reasoning.reasoning import _UNSET as _TOOLS_UNSET
 from mesa_llm.tools.tool_decorator import tool
 from mesa_llm.tools.tool_manager import ToolManager
 
@@ -526,6 +528,290 @@ def test_choose_action_respects_narrowed_actions_and_validates_returned_choice()
 
     agent.llm.generate.assert_not_called()
     assert agent.unconfigured == 0
+
+
+def test_plan_delegates_to_reasoning_without_exposing_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @tool
+    def workflow_plan_tool(agent, value: int) -> int:
+        """Workflow plan tool.
+
+        Args:
+            value: Value to return.
+
+        Returns:
+            The value.
+        """
+        del agent
+        return value
+
+    @action(action_manager=ActionManager())
+    def workflow_action(agent) -> str:
+        """Workflow action.
+
+        Returns:
+            Action result.
+        """
+        agent.executed = True
+        return "executed"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        tools=[workflow_plan_tool],
+        actions=[workflow_action],
+    )
+    expected_plan = Plan(step=3, llm_plan="planned", ttl=2, tools=[workflow_plan_tool])
+    obs = object()
+    agent.reasoning.plan = Mock(return_value=expected_plan)
+    agent.choose_action = Mock()
+    agent.execute_action = Mock()
+    agent._action_manager.get_actions_schema = Mock(
+        side_effect=AssertionError("plan() must not expose action specs")
+    )
+
+    result = agent.plan(
+        prompt="Create a read-only plan.",
+        obs=obs,
+        ttl=2,
+        tools=[workflow_plan_tool],
+        tool_calls="required",
+    )
+
+    assert result is expected_plan
+    agent.reasoning.plan.assert_called_once()
+    plan_kwargs = agent.reasoning.plan.call_args.kwargs
+    assert plan_kwargs["prompt"] == "Create a read-only plan."
+    assert plan_kwargs["obs"] is obs
+    assert plan_kwargs["ttl"] == 2
+    assert plan_kwargs["tools"] == [workflow_plan_tool]
+    assert plan_kwargs["tool_calls"] == "required"
+    if "selected_tools" in plan_kwargs:
+        assert plan_kwargs["selected_tools"] is _TOOLS_UNSET
+    assert "actions" not in agent.reasoning.plan.call_args.kwargs
+    agent.choose_action.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent._action_manager.get_actions_schema.assert_not_called()
+
+
+def test_act_calls_public_wrappers_in_order_and_returns_act_result():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    choice = ActionChoice(
+        name="wait", arguments={}, rationale="No state change needed."
+    )
+    calls = []
+
+    def fake_choose_action(
+        prompt,
+        actions=_ACTIONS_UNSET,
+        system_prompt=None,
+    ):
+        calls.append(("choose_action", prompt, actions, system_prompt))
+        return choice
+
+    def fake_execute_action(action_choice, actions=_ACTIONS_UNSET):
+        calls.append(("execute_action", action_choice, actions))
+        return "waited"
+
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.choose_action = fake_choose_action
+    agent.execute_action = fake_execute_action
+
+    result = agent.act("Take one turn.")
+
+    assert [call[0] for call in calls] == ["choose_action", "execute_action"]
+    assert calls[0] == (
+        "choose_action",
+        "Take one turn.",
+        _ACTIONS_UNSET,
+        None,
+    )
+    assert calls[1] == ("execute_action", choice, _ACTIONS_UNSET)
+    agent.plan.assert_not_called()
+    assert result.__class__.__name__ == "ActResult"
+    assert result.action is choice
+    assert result.result == "waited"
+    assert not hasattr(result, "plan")
+    assert not hasattr(result, "success")
+
+
+def test_act_preserves_explicit_action_selector():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    choice = ActionChoice(name="wait", arguments={})
+    calls = []
+
+    def fake_choose_action(
+        prompt,
+        actions=_ACTIONS_UNSET,
+        system_prompt=None,
+    ):
+        calls.append(("choose_action", actions))
+        return choice
+
+    def fake_execute_action(action_choice, actions=_ACTIONS_UNSET):
+        calls.append(("execute_action", actions))
+        return "waited"
+
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.choose_action = fake_choose_action
+    agent.execute_action = fake_execute_action
+
+    result = agent.act("Take one turn.", actions=[wait])
+
+    assert result.result == "waited"
+    assert calls == [
+        ("choose_action", [wait]),
+        ("execute_action", [wait]),
+    ]
+    agent.plan.assert_not_called()
+
+
+def test_plan_then_act_composition_passes_plan_through_prompt():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    plan = Plan(step=1, llm_plan="planned")
+    choice = ActionChoice(name="wait", arguments={})
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.choose_action = Mock(return_value=choice)
+    agent.execute_action = Mock(return_value="waited")
+
+    prompt = f"Use this plan: {plan}"
+    result = agent.act(prompt=prompt)
+
+    assert result.action is choice
+    assert result.result == "waited"
+    agent.plan.assert_not_called()
+    agent.choose_action.assert_called_once_with(
+        prompt,
+        actions=_ACTIONS_UNSET,
+        system_prompt=None,
+    )
+    agent.execute_action.assert_called_once_with(choice, actions=_ACTIONS_UNSET)
+
+
+def test_act_fails_fast_when_explicit_actions_expose_no_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.execute_action = Mock()
+    agent.llm.generate = Mock()
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="No actions are available"):
+            agent.act("Take one turn.", actions=no_actions)
+
+    agent.plan.assert_not_called()
+    agent.llm.generate.assert_not_called()
+    agent.execute_action.assert_not_called()
+
+
+def test_execute_action_records_successful_action_event_after_execution():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def recorded_action(agent, amount: int) -> str:
+        """Recorded action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.counter += amount
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[recorded_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+
+    result = agent.execute_action(
+        ActionChoice(name="recorded_action", arguments={"amount": 3}),
+    )
+
+    assert result == "recorded"
+    assert agent.counter == 3
+    expected_content = {
+        "action": {
+            "name": "recorded_action",
+            "arguments": {"amount": 3},
+            "rationale": None,
+        },
+        "result": "recorded",
+    }
+    actions = agent.memory.step_content["action"]
+    assert actions == [expected_content]
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+def test_execute_action_does_not_record_successful_event_for_failures():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def failing_action(agent, amount: int) -> str:
+        """Failing action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Never returns.
+        """
+        del agent, amount
+        raise RuntimeError("action failed")
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[failing_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        agent.execute_action(ActionChoice(name="failing_action", arguments={}))
+
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="action failed"):
+        agent.execute_action(
+            ActionChoice(name="failing_action", arguments={"amount": 1}),
+        )
+
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
 
 
 def test_llm_agent_tool_manager_property_is_deprecated():

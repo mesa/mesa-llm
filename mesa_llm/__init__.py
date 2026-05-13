@@ -4,6 +4,7 @@ import mesa_llm.tools.inbuilt_tools  # noqa: F401, to register inbuilt tools
 
 from .actions.action_decorator import ActionMetadata, action
 from .actions.action_manager import ActionChoice, ActionManager
+from .actions.action_result import ActResult
 from .actions.defaults import default_actions
 from .actions.inbuilt_actions import wait
 from .parallel_stepping import (
@@ -28,6 +29,7 @@ from .tools.tool_manager import ToolManager
 enable_automatic_parallel_stepping()
 
 __all__ = [
+    "ActResult",
     "ActionChoice",
     "ActionManager",
     "ActionMetadata",
