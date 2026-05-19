@@ -1,15 +1,15 @@
 from typing import TYPE_CHECKING
 
-from mesa_llm.tools.tool_decorator import tool
+from mesa_llm.actions import action
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
 
 
-@tool
+@action
 def buy_product(agent: "LLMAgent", chosen_product: str, chosen_price: int) -> str:
     """
-    A tool to set the brand of choice of the buyer agent. The product must be one of:
+    An action to set the brand of choice of the buyer agent. The product must be one of:
     ["Brand A Shoes", "Brand A Track Suit", "Brand B Shoes", "Brand B Track Suit"].
 
     Args:

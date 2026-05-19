@@ -24,8 +24,6 @@ warnings.filterwarnings(
 # Also suppress through logging
 logging.getLogger("pydantic").setLevel(logging.ERROR)
 
-# enable_automatic_parallel_stepping(mode="threading")
-
 load_dotenv()
 
 

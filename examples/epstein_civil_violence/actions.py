@@ -2,13 +2,13 @@ import random
 from typing import TYPE_CHECKING
 
 from examples.epstein_civil_violence.agents import CitizenState
-from mesa_llm.tools.tool_decorator import tool
+from mesa_llm.actions import action
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
 
 
-@tool
+@action
 def change_state(agent: "LLMAgent", state: str) -> str:
     """
     Change the state of the agent. The state can be "QUIET" or "ACTIVE"
@@ -30,7 +30,7 @@ def change_state(agent: "LLMAgent", state: str) -> str:
     return f"agent {agent.unique_id} changed state to {state}."
 
 
-@tool
+@action
 def arrest_citizen(agent: "LLMAgent", citizen_id: int) -> str:
     """
     Arrest a citizen (only if they are active).
@@ -46,5 +46,5 @@ def arrest_citizen(agent: "LLMAgent", citizen_id: int) -> str:
         (agent for agent in agent.model.agents if agent.unique_id == citizen_id), None
     )
     citizen.state = CitizenState.ARRESTED
-    citizen.jail_senttence_left = random.randint(1, agent.max_jail_term)
+    citizen.jail_sentence_left = random.randint(1, agent.max_jail_term)
     return f"agent {citizen_id} arrested by {agent.unique_id}."

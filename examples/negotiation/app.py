@@ -12,7 +12,6 @@ from mesa.visualization import (
 
 from examples.negotiation.agents import BuyerAgent, SellerAgent
 from examples.negotiation.model import NegotiationModel
-from mesa_llm.parallel_stepping import enable_automatic_parallel_stepping
 from mesa_llm.reasoning.react import ReActReasoning
 
 # Suppress Pydantic serialization warnings
@@ -25,7 +24,6 @@ warnings.filterwarnings(
 
 # Also suppress through logging
 logging.getLogger("pydantic").setLevel(logging.ERROR)
-enable_automatic_parallel_stepping(mode="threading")
 
 load_dotenv()
 

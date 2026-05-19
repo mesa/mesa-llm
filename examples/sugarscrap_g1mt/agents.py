@@ -29,7 +29,7 @@ class Trader(LLMAgent, mesa.discrete_space.CellAgent):
             internal_state=internal_state,
             step_prompt=step_prompt,
             api_base=api_base,
-            tools=["move_to_best_resource", "propose_trade"],
+            actions=["move_to_best_resource", "propose_trade"],
         )
         self.sugar = sugar
         self.spice = spice
@@ -110,12 +110,10 @@ class Trader(LLMAgent, mesa.discrete_space.CellAgent):
 
         observation = self.generate_obs()
 
-        plan = self.reasoning.plan(
-            obs=observation,
-            tools=["move_to_best_resource", "propose_trade"],
+        self.act(
+            prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
+            actions=["move_to_best_resource", "propose_trade"],
         )
-
-        self.apply_plan(plan)
 
     async def astep(self):
         self.sugar -= self.metabolism_sugar
@@ -129,11 +127,10 @@ class Trader(LLMAgent, mesa.discrete_space.CellAgent):
         self.update_internal_metrics()
         observation = self.generate_obs()
 
-        plan = await self.reasoning.aplan(
-            obs=observation,
-            tools=["move_to_best_resource", "propose_trade"],
+        await self.aact(
+            prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
+            actions=["move_to_best_resource", "propose_trade"],
         )
-        self.apply_plan(plan)
 
 
 class Resource(mesa.discrete_space.CellAgent):

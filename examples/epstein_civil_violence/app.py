@@ -11,7 +11,6 @@ from mesa.visualization import (
 
 from examples.epstein_civil_violence.agents import Citizen, CitizenState, Cop
 from examples.epstein_civil_violence.model import EpsteinModel
-from mesa_llm.parallel_stepping import enable_automatic_parallel_stepping
 from mesa_llm.reasoning.react import ReActReasoning
 
 # Suppress Pydantic serialization warnings
@@ -24,8 +23,6 @@ warnings.filterwarnings(
 
 # Also suppress through logging
 logging.getLogger("pydantic").setLevel(logging.ERROR)
-
-enable_automatic_parallel_stepping(mode="threading")
 
 load_dotenv()
 
@@ -48,10 +45,10 @@ model_params = {
     "width": 10,
     "height": 10,
     "reasoning": ReActReasoning,
-    "llm_model": "openai/gpt-4o-mini",
+    "llm_model": "ollama/llama3.2",
     "api_base": None,
     "vision": 5,
-    "parallel_stepping": True,
+    "parallel_stepping": False,
 }
 
 

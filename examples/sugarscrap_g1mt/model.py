@@ -39,7 +39,7 @@ class SugarScapeModel(Model):
         llm_model: str,
         vision: int,
         api_base: str | None = None,
-        parallel_stepping=True,
+        parallel_stepping=False,
         seed=None,
     ):
         super().__init__(seed=seed)

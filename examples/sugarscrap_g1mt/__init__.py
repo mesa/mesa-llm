@@ -1,1 +1,1 @@
-import examples.sugarscrap_g1mt.tools  # noqa: F401, to register tools
+import examples.sugarscrap_g1mt.actions  # noqa: F401, to register actions

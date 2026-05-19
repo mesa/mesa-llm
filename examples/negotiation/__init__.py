@@ -1,1 +1,1 @@
-import examples.negotiation.tools  # noqa: F401, to register tools
+import examples.negotiation.actions  # noqa: F401, to register actions

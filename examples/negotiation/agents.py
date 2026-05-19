@@ -1,5 +1,5 @@
+from mesa_llm.actions import social_actions, teleport_to_location
 from mesa_llm.llm_agent import LLMAgent
-from mesa_llm.tools.defaults import legacy_tools
 
 
 def get_dialogue_history(agent, max_messages: int = 5) -> str:
@@ -46,7 +46,7 @@ def get_dialogue_history(agent, max_messages: int = 5) -> str:
                     # sender is an agent object (from send_message())
                     sender_name = f"{type(sender).__name__} {sender.unique_id}"
                 elif isinstance(sender, int):
-                    # sender is an ID (from speak_to tool)
+                    # sender is an ID (from speak_to action)
                     # Try to find the agent by ID to get its type
                     try:
                         agent_obj = next(
@@ -84,7 +84,7 @@ class SellerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            tools=legacy_tools(),
+            actions=social_actions(),
         )
 
         self.sales = 0
@@ -97,13 +97,15 @@ class SellerAgent(LLMAgent):
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
             "Don't move around. If there are any buyers in your cell or in the neighboring cells, "
-            "pitch them your product using the speak_to tool. "
+            "pitch them your product using the speak_to action. "
             "Talk to them until they agree or definitely refuse to buy your product. "
             "Use the dialogue history to inform your next response (e.g., if you already offered a price, stick to it or negotiate)."
         )
 
-        plan = self.reasoning.plan(prompt=prompt, obs=observation, tools=["speak_to"])
-        self.apply_plan(plan)
+        self.act(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=["speak_to"],
+        )
 
     async def astep(self):
         observation = self.generate_obs()
@@ -113,15 +115,15 @@ class SellerAgent(LLMAgent):
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
             "Don't move around. If there are any buyers in your cell or in the neighboring cells, "
-            "pitch them your product using the speak_to tool. "
+            "pitch them your product using the speak_to action. "
             "Talk to them until they agree or definitely refuse to buy your product. "
             "Use the dialogue history to inform your next response."
         )
 
-        plan = await self.reasoning.aplan(
-            prompt=prompt, obs=observation, tools=["speak_to"]
+        await self.aact(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=["speak_to"],
         )
-        self.apply_plan(plan)
 
 
 class BuyerAgent(LLMAgent):
@@ -144,49 +146,82 @@ class BuyerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            tools=[*legacy_tools(), "buy_product"],
+            actions=[teleport_to_location, *social_actions(), "buy_product"],
         )
         self.budget = budget
         self.products = []
 
-    def step(self):
-        observation = self.generate_obs()
-        dialogue_history = get_dialogue_history(self)
+    def _buyer_step_prompt_and_actions(self, observation, dialogue_history):
+        visible_sellers = [
+            agent_label
+            for agent_label in observation.local_state
+            if agent_label.startswith("SellerAgent ")
+        ]
+        has_dialogue = dialogue_history != "No recent dialogue."
 
-        prompt = (
+        base_prompt = (
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
             f"Your budget is ${self.budget}. "
-            f"Move around by using the teleport_to_location tool if you are not talking to a seller, "
-            f"grid dimensions are {self.model.grid.width} x {self.model.grid.height}. "
-            "Seller agents around you might try to pitch their product by sending you messages, get as much information as possible. "
-            "When you have enough information, decide what to buy the product. "
-            "Refer to the dialogue history to recall previous prices offered."
+            "Seller agents around you might try to pitch their product by "
+            "sending you messages; get as much information as possible. "
+            "When you have enough information, decide what product to buy. "
+            "Refer to the dialogue history to recall previous prices offered. "
         )
-        plan = self.reasoning.plan(
-            prompt=prompt,
-            obs=observation,
-            tools=["teleport_to_location", "speak_to", "buy_product"],
+
+        if visible_sellers or has_dialogue:
+            seller_context = (
+                f"Visible sellers: {', '.join(visible_sellers)}. "
+                if visible_sellers
+                else ""
+            )
+            next_action_instruction = (
+                "Use speak_to to ask or answer sellers, or use buy_product if "
+                "you are ready to purchase."
+                if has_dialogue
+                else "Use speak_to to ask a visible seller about their products and prices."
+            )
+            actions = ["speak_to", "buy_product"] if has_dialogue else ["speak_to"]
+            prompt = (
+                base_prompt
+                + seller_context
+                + "A seller or recent seller dialogue is available, so do not "
+                f"move this turn. {next_action_instruction}"
+            )
+            return prompt, actions
+
+        target_x = int(self.model.rng.integers(0, self.model.grid.width))
+        target_y = int(self.model.rng.integers(0, self.model.grid.height))
+        prompt = (
+            base_prompt
+            + "No seller is visible yet, so you may explore with teleport_to_location. "
+            f"Grid dimensions are {self.model.grid.width} x {self.model.grid.height}; "
+            "coordinates must be inside the grid with 0 <= x < width and "
+            "0 <= y < height. If you choose teleport_to_location, set "
+            f"target_coordinates to exactly [{target_x}, {target_y}]. "
+            "Never use null, None, an empty value, or an omitted "
+            "target_coordinates value."
         )
-        self.apply_plan(plan)
+        return prompt, ["teleport_to_location"]
+
+    def step(self):
+        observation = self.generate_obs()
+        dialogue_history = get_dialogue_history(self)
+        prompt, actions = self._buyer_step_prompt_and_actions(
+            observation, dialogue_history
+        )
+        self.act(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=actions,
+        )
 
     async def astep(self):
         observation = self.generate_obs()
         dialogue_history = get_dialogue_history(self)
-
-        prompt = (
-            f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
-            "INSTRUCTIONS:\n"
-            f"Your budget is ${self.budget}. "
-            f"Move around by using the teleport_to_location tool if you are not talking to a seller, "
-            f"grid dimensions are {self.model.grid.width} x {self.model.grid.height}. "
-            "Seller agents around you might try to pitch their product by sending you messages, get as much information as possible. "
-            "When you have enough information, decide what to buy the product. "
-            "Refer to the dialogue history to recall previous prices offered."
+        prompt, actions = self._buyer_step_prompt_and_actions(
+            observation, dialogue_history
         )
-        plan = await self.reasoning.aplan(
-            prompt=prompt,
-            obs=observation,
-            tools=["teleport_to_location", "speak_to", "buy_product"],
+        await self.aact(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=actions,
         )
-        self.apply_plan(plan)

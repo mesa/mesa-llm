@@ -6,7 +6,7 @@ This model is based on Epstein & Axtell's classic "Sugarscape" simulation from G
 
 The model generates emergent economic dynamics through decentralized interactions. Traders must constantly harvest resources to satisfy their metabolic needs; if they run out of either sugar or spice, they starve. Crucially, agents can trade with neighbors. Decisions are governed by the Marginal Rate of Substitution (MRS); agents rich in sugar but poor in spice will trade sugar to acquire spice, and vice versa. Over time, this decentralized trading allows for the emergence of a price equilibrium and wealth distribution patterns.
 
-This model is implemented using Mesa-LLM, unlike the original deterministic versions. All Trader agents use Large Language Models to "think" about their survival. They observe their internal inventory and MRS, then autonomously decide to use tools to move to high-value resource tiles or propose trades to neighbors to ensure their continued existence.
+This model is implemented using Mesa-LLM, unlike the original deterministic versions. All Trader agents use Large Language Models to "think" about their survival. They observe their internal inventory and MRS, then autonomously choose actions to move to high-value resource tiles or propose trades to neighbors to ensure their continued existence.
 
 ## Technical Details
 
@@ -22,7 +22,7 @@ This model is implemented using Mesa-LLM, unlike the original deterministic vers
 
 - `Resource (CellAgent):` A passive environmental agent that acts as a container for resources. It regenerates its current_amount by 1 unit per step up to a max_capacity.
 
-### Tools
+### Actions
 
 - `move_to_best_resource:`
 
@@ -39,7 +39,7 @@ This model is implemented using Mesa-LLM, unlike the original deterministic vers
 
 ### Movement Rule (Rule M)
 
-A Trader agent moves to a new location and harvests resources if the following logic, executed by the *move_to_best_resource tool*, is satisfied:
+A Trader agent moves to a new location and harvests resources if the following logic, executed by the *move_to_best_resource action*, is satisfied:
 
 Scan: The agent inspects all cells within its *vision range* (von Neumann neighborhood).
 
@@ -49,7 +49,7 @@ Harvest: The agent moves to that cell, sets the resource's amount to 0, and adds
 
 ### Trade Rule (Rule T)
 
-Agents determine whether to trade based on their Marginal Rate of Substitution (MRS). A trade is proposed via the propose_trade tool and accepted if it is mutually beneficial:
+Agents determine whether to trade based on their Marginal Rate of Substitution (MRS). A trade is proposed via the propose_trade action and accepted if it is mutually beneficial:
 
 ```
 Trade occurs if: Partner_MRS > Agent_MRS
@@ -81,15 +81,15 @@ Resource Agents represent the landscape. They are passive agents that regenerate
 
 Both Traders and the simulation logic are driven by LLM-powered agents, meaning:
 
--    Their actions (e.g., `move_to_best_resource`, `propose_trade`) are determined by a ReAct reasoning module.
+-    Their actions (e.g., `move_to_best_resource`, `propose_trade`) are selected by an action workflow.
 
--    This module takes as input:
+-    This workflow takes as input:
 
         The agent’s internal state (current inventory, metabolic warnings, and calculated MRS).
 
         Local observations of the grid.
 
--        A set of available tools defined in `tools.py`.
+-        A set of available actions registered by the example.
 
 
 
@@ -112,7 +112,7 @@ Once you have configured `.env` and `llm_model`, run the following command from 
 * ``model.py``: Core model code.
 * ``agents.py``: Agent classes.
 * ``app.py``: Sets up the interactive visualization.
-* ``tools.py``: Tools for the llm-agents to use.
+* ``actions.py``: Custom actions for the llm-agents to use.
 
 
 ## Further Reading

@@ -3,9 +3,9 @@ from enum import Enum
 
 import mesa
 
+from mesa_llm.actions import move_one_step
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.memory.st_lt_memory import STLTMemory
-from mesa_llm.tools.defaults import legacy_tools
 
 
 class CitizenState(Enum):
@@ -61,7 +61,7 @@ class Citizen(LLMAgent, mesa.discrete_space.CellAgent):
             internal_state=internal_state,
             step_prompt=step_prompt,
             api_base=api_base,
-            tools=[*legacy_tools(), "change_state"],
+            actions=[move_one_step, "change_state"],
         )
 
         self.hardship = self.random.random()
@@ -133,11 +133,10 @@ class Citizen(LLMAgent, mesa.discrete_space.CellAgent):
         if self.jail_sentence_left == 0:
             self.update_estimated_arrest_probability()
             observation = self.generate_obs()
-            plan = self.reasoning.plan(
-                obs=observation,
-                tools=["change_state", "move_one_step"],
+            self.act(
+                prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
+                actions=["change_state", "move_one_step"],
             )
-            self.apply_plan(plan)
         else:
             self.jail_sentence_left -= 0.1
 
@@ -145,11 +144,10 @@ class Citizen(LLMAgent, mesa.discrete_space.CellAgent):
         if self.jail_sentence_left == 0:
             self.update_estimated_arrest_probability()
             observation = self.generate_obs()
-            plan = await self.reasoning.aplan(
-                obs=observation,
-                tools=["change_state", "move_one_step"],
+            await self.aact(
+                prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
+                actions=["change_state", "move_one_step"],
             )
-            self.apply_plan(plan)
         else:
             self.jail_sentence_left -= 0.1
 
@@ -195,7 +193,7 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
             internal_state=internal_state,
             step_prompt=step_prompt,
             api_base=api_base,
-            tools=[*legacy_tools(), "arrest_citizen"],
+            actions=[move_one_step, "arrest_citizen"],
         )
         self.max_jail_term = max_jail_term
         self.system_prompt = "You are a cop in a country that is experiencing civil violence. You are a member of the police force and your job is to arrest active citizens. You can arrest a citizen ONLY if they are active. You can move one step in a nearby cell or arrest a citizen."
@@ -213,11 +211,10 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
         applicable.
         """
         observation = self.generate_obs()
-        plan = self.reasoning.plan(
-            obs=observation,
-            tools=["move_one_step", "arrest_citizen"],
+        self.act(
+            prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
+            actions=["move_one_step", "arrest_citizen"],
         )
-        self.apply_plan(plan)
 
     async def astep(self):
         """
@@ -225,8 +222,7 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
         applicable.
         """
         observation = self.generate_obs()
-        plan = await self.reasoning.aplan(
-            obs=observation,
-            tools=["move_one_step", "arrest_citizen"],
+        await self.aact(
+            prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
+            actions=["move_one_step", "arrest_citizen"],
         )
-        self.apply_plan(plan)
