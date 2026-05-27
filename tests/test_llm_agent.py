@@ -330,10 +330,197 @@ def test_execute_action_respects_omitted_explicit_and_narrowed_actions():
     assert agent.unconfigured == 0
 
 
-def _action_choice_response(content):
-    message = SimpleNamespace(content=content)
+def _action_choice_response(content, reasoning_content=None):
+    message = SimpleNamespace(content=content, reasoning_content=reasoning_content)
     choice = SimpleNamespace(message=message)
     return SimpleNamespace(choices=[choice])
+
+
+def _make_local_action_choice_agent():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def local_increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[local_increment_counter],
+    )
+    agent.counter = 0
+    return agent, local_increment_counter
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_rationale"),
+    [
+        (
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "3"},
+                    "rationale": "Plain local JSON.",
+                },
+            ),
+            "Plain local JSON.",
+        ),
+        (
+            "```json\n"
+            + json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "4"},
+                    "rationale": "Fenced local JSON.",
+                },
+            )
+            + "\n```",
+            "Fenced local JSON.",
+        ),
+        (
+            "I will commit to this action:\n"
+            + json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "5"},
+                    "rationale": "Embedded local JSON.",
+                },
+            )
+            + "\nNo tools are needed.",
+            "Embedded local JSON.",
+        ),
+    ],
+)
+def test_choose_action_parses_local_json_fallbacks_and_validates_choice(
+    content,
+    expected_rationale,
+):
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.generate = Mock(return_value=_action_choice_response(content))
+
+    choice = agent.choose_action("Choose one local action.")
+
+    assert choice.name == "local_increment_counter"
+    assert isinstance(choice.arguments["amount"], int)
+    assert choice.rationale == expected_rationale
+    assert agent.counter == 0
+
+    call_kwargs = agent.llm.generate.call_args.kwargs
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"name": "local_increment_counter", "arguments": {"amount":',
+        json.dumps({"name": "local_increment_counter"}),
+        json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": 1},
+            },
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": 2},
+            },
+        ),
+    ],
+)
+def test_choose_action_rejects_invalid_or_ambiguous_local_output_before_mutation(
+    content,
+):
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.generate = Mock(return_value=_action_choice_response(content))
+    agent.execute_action = Mock(side_effect=AssertionError("must not execute"))
+
+    with pytest.raises(ValueError):
+        agent.choose_action("Choose one local action.")
+
+    assert agent.counter == 0
+    agent.execute_action.assert_not_called()
+
+
+def test_choose_action_prefers_final_content_over_reasoning_json():
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "8"},
+                    "rationale": "Use final content.",
+                },
+            ),
+            reasoning_content=(
+                "Reasoning considered another object: "
+                '{"name": "local_increment_counter", "arguments": {"amount": 1}}'
+            ),
+        ),
+    )
+
+    choice = agent.choose_action("Choose one local action.")
+
+    assert choice.name == "local_increment_counter"
+    assert choice.arguments == {"amount": 8}
+    assert choice.rationale == "Use final content."
+    assert agent.counter == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```json\n"
+        + json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": "6"},
+                "rationale": "Async fenced local JSON.",
+            },
+        )
+        + "\n```",
+        "The selected action is "
+        + json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": "7"},
+                "rationale": "Async embedded local JSON.",
+            },
+        ),
+    ],
+)
+async def test_achoose_action_parses_local_json_fallbacks_without_tools(content):
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.agenerate = AsyncMock(return_value=_action_choice_response(content))
+
+    choice = await agent.achoose_action("Choose one async local action.")
+
+    assert choice.name == "local_increment_counter"
+    assert isinstance(choice.arguments["amount"], int)
+    assert agent.counter == 0
+
+    call_kwargs = agent.llm.agenerate.call_args.kwargs
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["suppress_thinking"] is True
 
 
 def test_choose_action_uses_structured_output_context_and_does_not_execute():
@@ -388,6 +575,7 @@ def test_choose_action_uses_structured_output_context_and_does_not_execute():
     assert call_kwargs["tool_schema"] is None
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["system_prompt"] == "system action prompt"
+    assert call_kwargs["suppress_thinking"] is True
 
     action_context = call_kwargs["prompt"][0]
     assert "Available actions:" in action_context
@@ -583,6 +771,7 @@ async def test_achoose_action_uses_structured_output_context_and_does_not_execut
     assert call_kwargs["tool_schema"] is None
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["system_prompt"] == "async system action prompt"
+    assert call_kwargs["suppress_thinking"] is True
 
     action_context = call_kwargs["prompt"][0]
     assert "Available actions:" in action_context

@@ -192,6 +192,7 @@ class ModuleLLM:
         tool_choice: str = "auto",
         response_format: dict | object | None = None,
         system_prompt: str | None = None,
+        suppress_thinking: bool = False,
     ) -> str:
         """
         Generate a response from the LLM using litellm based on the prompt
@@ -202,6 +203,8 @@ class ModuleLLM:
             tool_choice: The choice of tool to use
             response_format: The format of the response
             system_prompt: Optional system prompt scoped to this call only.
+            suppress_thinking: Ask providers that support hidden reasoning
+                controls to return only final response content for this call.
 
         Returns:
             The response from the LLM
@@ -216,6 +219,8 @@ class ModuleLLM:
             "tool_choice": tool_choice if tool_schema else None,
             "response_format": response_format,
         }
+        if suppress_thinking:
+            completion_kwargs.update({"think": False, "drop_params": True})
         if self.api_base:
             completion_kwargs["api_base"] = self.api_base
 
@@ -239,6 +244,7 @@ class ModuleLLM:
         tool_choice: str = "auto",
         response_format: dict | object | None = None,
         system_prompt: str | None = None,
+        suppress_thinking: bool = False,
     ) -> str:
         """
         Asynchronous version of generate() method for parallel LLM calls.
@@ -257,6 +263,8 @@ class ModuleLLM:
                     "tool_choice": tool_choice if tool_schema else None,
                     "response_format": response_format,
                 }
+                if suppress_thinking:
+                    completion_kwargs.update({"think": False, "drop_params": True})
                 if self.api_base:
                     completion_kwargs["api_base"] = self.api_base
 

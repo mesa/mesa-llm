@@ -40,6 +40,11 @@ from mesa_llm.tools.tool_manager import ToolManager
 
 logger = logging.getLogger(__name__)
 
+
+class _AmbiguousActionChoiceJSONError(ValueError):
+    """Raised when an LLM response contains more than one action JSON object."""
+
+
 if TYPE_CHECKING:  # pragma: no cover
     from mesa_llm.recording.simulation_recorder import SimulationRecorder
 
@@ -239,12 +244,14 @@ class LLMAgent(Agent):
                 "the agent or pass a non-empty configured action selector."
             )
 
+        action_prompt = self._build_action_choice_prompt(prompt, action_schemas)
         response = self.llm.generate(
-            prompt=self._build_action_choice_prompt(prompt, action_schemas),
+            prompt=action_prompt,
             tool_schema=None,
             tool_choice="none",
             response_format=ActionChoice,
             system_prompt=system_prompt,
+            suppress_thinking=True,
         )
         action_choice = self._parse_action_choice_response(response)
         return self._action_manager.validate(self, action_choice, actions=actions)
@@ -266,12 +273,14 @@ class LLMAgent(Agent):
                 "the agent or pass a non-empty configured action selector."
             )
 
+        action_prompt = self._build_action_choice_prompt(prompt, action_schemas)
         response = await self.llm.agenerate(
-            prompt=self._build_action_choice_prompt(prompt, action_schemas),
+            prompt=action_prompt,
             tool_schema=None,
             tool_choice="none",
             response_format=ActionChoice,
             system_prompt=system_prompt,
+            suppress_thinking=True,
         )
         action_choice = self._parse_action_choice_response(response)
         return self._action_manager.validate(self, action_choice, actions=actions)
@@ -283,15 +292,24 @@ class LLMAgent(Agent):
     ) -> list[str]:
         action_context = (
             "Choose exactly one action from the available action specs below. "
-            "Return only a JSON object matching this shape: "
+            "Return exactly one JSON object matching this shape: "
             '{"name": str, "arguments": object, "rationale": str | null}. '
+            "The `name` value must be one of the listed action names. "
+            "The `arguments` value must be a JSON object for that action. "
+            "Start your response with `{` and end it with `}`. "
+            "Do not include any other JSON objects. "
+            "Do not include Markdown fences, prose, or hidden reasoning. "
             "Do not call tools and do not execute the action.\n\n"
             f"Available actions:\n{json.dumps(action_schemas, indent=2)}"
         )
+        output_contract = (
+            "Respond now with exactly one JSON object and nothing else. "
+            "Required keys: `name`, `arguments`, `rationale`."
+        )
         if isinstance(prompt, str):
-            return [action_context, prompt]
+            return [action_context, prompt, output_contract]
         if isinstance(prompt, list):
-            return [action_context, *prompt]
+            return [action_context, *prompt, output_contract]
         raise TypeError(
             f"Invalid prompt type '{type(prompt).__name__}'. Expected str or list[str]."
         )
@@ -312,25 +330,91 @@ class LLMAgent(Agent):
             return content
         if isinstance(content, dict):
             return ActionChoice(**content)
+
         if isinstance(content, str):
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    "LLM action choice response must be valid JSON matching "
-                    "ActionChoice."
-                ) from exc
-            if not isinstance(data, dict):
-                raise ValueError(
-                    "LLM action choice response must be a JSON object matching "
-                    "ActionChoice."
-                )
+            data = self._extract_single_action_choice_json(content)
             return ActionChoice(**data)
 
         raise TypeError(
             "LLM action choice response must be an ActionChoice, dict, or JSON "
             f"object string, got {type(content).__name__}."
         )
+
+    def _extract_single_action_choice_json(
+        self,
+        content: str,
+    ) -> dict[str, Any]:
+        candidates = self._action_choice_json_candidates(content)
+
+        if not candidates:
+            raise ValueError(
+                "LLM action choice response did not include a JSON object matching "
+                "ActionChoice."
+            )
+        if len(candidates) > 1:
+            raise _AmbiguousActionChoiceJSONError(
+                "LLM action choice response must include exactly one JSON object "
+                "matching ActionChoice."
+            )
+        return candidates[0]
+
+    def _action_choice_json_candidates(self, content: str) -> list[dict[str, Any]]:
+        stripped_content = content.strip()
+        if not stripped_content:
+            return []
+
+        try:
+            data = json.loads(stripped_content)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "LLM action choice response must be a JSON object matching "
+                    "ActionChoice."
+                )
+            return [data]
+
+        candidates: list[dict[str, Any]] = []
+        for object_text in self._iter_json_object_strings(stripped_content):
+            try:
+                data = json.loads(object_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                candidates.append(data)
+        return candidates
+
+    def _iter_json_object_strings(self, content: str) -> list[str]:
+        objects: list[str] = []
+        start: int | None = None
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index, char in enumerate(content):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif char == "}" and depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objects.append(content[start : index + 1])
+                    start = None
+
+        return objects
 
     def _record_successful_action_event(
         self,
