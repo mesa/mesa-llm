@@ -104,6 +104,41 @@ def test_action_omits_agent_parameter_from_schema_by_default():
     assert manager_params["required"] == ["direction"]
 
 
+def test_action_schema_marks_only_non_default_non_agent_parameters_required():
+    @action
+    def send_message(
+        agent,
+        recipient_id: int,
+        message: str,
+        priority: int = 1,
+        channel: str = "local",
+    ) -> str:
+        """Send a message.
+
+        Args:
+            recipient_id: Recipient agent id.
+            message: Message body.
+            priority: Delivery priority.
+            channel: Delivery channel.
+
+        Returns:
+            Message confirmation.
+        """
+        del agent, priority, channel
+        return message
+
+    params = send_message.__action_schema__["parameters"]
+
+    assert set(params["properties"]) == {
+        "recipient_id",
+        "message",
+        "priority",
+        "channel",
+    }
+    assert params["required"] == ["recipient_id", "message"]
+    assert send_message.__action_metadata__.required == ["recipient_id", "message"]
+
+
 def test_action_ignore_agent_false_is_disabled_with_clear_error():
     with pytest.raises(ValueError, match=r"ignore_agent=False.*not supported"):
 
@@ -233,6 +268,136 @@ def test_action_schema_ignores_string_llm_agent_parameter_annotation():
     assert set(params["properties"]) == {"note"}
     assert params["required"] == ["note"]
     assert "agent" not in inspect_agent.__action_metadata__.parameters
+
+
+def test_action_rejects_non_agent_positional_only_parameter():
+    with pytest.raises(ValueError) as exc_info:
+
+        @action
+        def target_position(position: str, /, speed: int) -> str:
+            """Target a position.
+
+            Args:
+                position: Position to target.
+                speed: Movement speed.
+
+            Returns:
+                Target confirmation.
+            """
+            return f"{position}:{speed}"
+
+    message = str(exc_info.value)
+
+    assert "target_position" in message
+    assert "position" in message
+    assert "positional-only" in message
+
+
+def test_action_rejects_non_agent_varargs_parameter():
+    with pytest.raises(ValueError) as exc_info:
+
+        @action
+        def collect_items(agent, *items: str) -> str:
+            """Collect items.
+
+            Args:
+                items: Items to collect.
+
+            Returns:
+                Collection confirmation.
+            """
+            del agent
+            return ",".join(items)
+
+    message = str(exc_info.value)
+
+    assert "collect_items" in message
+    assert "items" in message
+    assert "*args" in message or "variadic positional" in message
+
+
+def test_action_rejects_non_agent_varkwargs_parameter():
+    with pytest.raises(ValueError) as exc_info:
+
+        @action
+        def configure_agent(agent, **options: str) -> str:
+            """Configure an agent.
+
+            Args:
+                options: Configuration options.
+
+            Returns:
+                Configuration confirmation.
+            """
+            del agent
+            return ",".join(sorted(options))
+
+    message = str(exc_info.value)
+
+    assert "configure_agent" in message
+    assert "options" in message
+    assert "**kwargs" in message or "variadic keyword" in message
+
+
+def test_action_rejects_positional_only_agent_parameter():
+    with pytest.raises(ValueError) as exc_info:
+
+        @action
+        def inspect_agent(agent, /, note: str) -> str:
+            """Inspect an agent.
+
+            Args:
+                note: Inspection note.
+
+            Returns:
+                Inspection confirmation.
+            """
+            del agent
+            return note
+
+    message = str(exc_info.value)
+
+    assert "inspect_agent" in message
+    assert "agent" in message
+    assert "positional-only" in message
+
+
+def test_action_rejects_varargs_agent_parameter():
+    with pytest.raises(ValueError) as exc_info:
+
+        @action
+        def capture_agent_args(*agent) -> str:
+            """Capture variadic agent arguments.
+
+            Returns:
+                Capture confirmation.
+            """
+            return repr(agent)
+
+    message = str(exc_info.value)
+
+    assert "capture_agent_args" in message
+    assert "agent" in message
+    assert "*args" in message or "variadic positional" in message
+
+
+def test_action_rejects_varkwargs_agent_parameter():
+    with pytest.raises(ValueError) as exc_info:
+
+        @action
+        def capture_agent_kwargs(**agent) -> str:
+            """Capture variadic agent keyword arguments.
+
+            Returns:
+                Capture confirmation.
+            """
+            return repr(agent)
+
+    message = str(exc_info.value)
+
+    assert "capture_agent_kwargs" in message
+    assert "agent" in message
+    assert "**kwargs" in message or "variadic keyword" in message
 
 
 def test_empty_action_managers_expose_no_actions():

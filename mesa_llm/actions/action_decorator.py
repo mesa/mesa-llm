@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 import inspect
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, get_type_hints
 
@@ -31,6 +31,10 @@ _ACTION_ANNOTATION_GLOBALS.update(
 
 class ActionAnnotationResolutionError(ValueError):
     """Raised when a non-agent action parameter annotation cannot be resolved."""
+
+
+class ActionSignatureError(ValueError):
+    """Raised when an action signature cannot be exposed as JSON arguments."""
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,71 @@ def _get_action_annotation_globalns(func: Callable) -> dict[str, Any]:
     return globalns
 
 
+def _get_action_parameters(
+    func: Callable,
+    signature: inspect.Signature | None = None,
+) -> dict[str, inspect.Parameter]:
+    """Return non-agent action parameters, rejecting unsupported signatures."""
+    signature = signature or inspect.signature(func)
+    action_params: dict[str, inspect.Parameter] = {}
+    unsupported_params = []
+
+    for param_name, param in signature.parameters.items():
+        if param_name.lower() == "agent" and _is_keyword_injectable_parameter(param):
+            continue
+        if param.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        }:
+            unsupported_params.append(_format_unsupported_action_parameter(param))
+            continue
+        action_params[param_name] = param
+
+    if unsupported_params:
+        raise ActionSignatureError(
+            "Unsupported parameter(s) for action "
+            f"{getattr(func, '__name__', repr(func))!r}: "
+            f"{unsupported_params}. Action parameters exposed to the model and "
+            "the injected 'agent' parameter must be keyword-compatible named "
+            "parameters because action arguments are passed as keyword "
+            "arguments. Positional-only parameters, *args, and **kwargs are "
+            "not supported."
+        )
+
+    return action_params
+
+
+def _is_keyword_injectable_parameter(param: inspect.Parameter) -> bool:
+    return param.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _get_required_action_parameter_names(
+    action_params: Mapping[str, inspect.Parameter],
+) -> list[str]:
+    """Return schema-required non-agent parameters in signature order."""
+    return [
+        param_name
+        for param_name, param in action_params.items()
+        if param.default is inspect.Parameter.empty
+    ]
+
+
+def _format_unsupported_action_parameter(param: inspect.Parameter) -> str:
+    if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+        kind = "positional-only"
+    elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+        kind = "*args"
+    elif param.kind is inspect.Parameter.VAR_KEYWORD:
+        kind = "**kwargs"
+    else:
+        kind = str(param.kind)
+    return f"{param.name!r} ({kind})"
+
+
 def action(
     fn: Callable | None = None,
     *,
@@ -140,15 +209,12 @@ def action(
 
     def decorator(func: Callable):
         name = func.__name__
+        sig = inspect.signature(func)
+        action_params = _get_action_parameters(func, sig)
         description, arg_docs, return_docs = _parse_docstring(func, ignore_agent=True)
 
-        sig = inspect.signature(func)
-        action_params = {
-            param_name: param
-            for param_name, param in sig.parameters.items()
-            if param_name.lower() != "agent"
-        }
         type_hints = _get_action_type_hints(func, parameter_names=action_params)
+        required_params = _get_required_action_parameter_names(action_params)
 
         properties = {}
         for param_name in action_params:
@@ -162,7 +228,7 @@ def action(
             name=name,
             description=description,
             parameters=properties,
-            required=list(action_params),
+            required=list(required_params),
             return_description=return_docs,
         )
         schema = {
@@ -171,7 +237,7 @@ def action(
             "parameters": {
                 "type": "object",
                 "properties": properties,
-                "required": list(action_params),
+                "required": list(required_params),
             },
         }
         if return_docs:

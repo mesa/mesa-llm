@@ -22,7 +22,10 @@ from terminal_style import style
 
 from mesa_llm.actions.action_decorator import (
     _GLOBAL_ACTION_REGISTRY,
+    _get_action_parameters,
     _get_action_type_hints,
+    _get_required_action_parameter_names,
+    _is_keyword_injectable_parameter,
 )
 
 _UNSET = object()
@@ -738,7 +741,6 @@ class ActionManager:
     def _get_action_argument_contract(self, action_fn: Callable) -> dict[str, Any]:
         signature_allowed: set[str] = set()
         signature_required: set[str] = set()
-        accepts_extra_arguments = False
         signature_available = False
 
         try:
@@ -747,18 +749,11 @@ class ActionManager:
             signature = None
         if signature is not None:
             signature_available = True
-            for param_name, param in signature.parameters.items():
-                if param.kind is inspect.Parameter.VAR_KEYWORD:
-                    accepts_extra_arguments = True
-                    continue
-                if param.kind is inspect.Parameter.VAR_POSITIONAL:
-                    continue
-                if param_name.lower() == "agent":
-                    continue
-
-                signature_allowed.add(param_name)
-                if param.default is inspect.Parameter.empty:
-                    signature_required.add(param_name)
+            action_params = _get_action_parameters(action_fn, signature)
+            signature_allowed = set(action_params)
+            signature_required = set(
+                _get_required_action_parameter_names(action_params)
+            )
 
         schema = getattr(action_fn, "__action_schema__", None)
         schema_allowed: set[str] = set()
@@ -778,7 +773,7 @@ class ActionManager:
             "required": (
                 signature_required if signature_available else schema_required
             ),
-            "accepts_extra_arguments": accepts_extra_arguments,
+            "accepts_extra_arguments": False,
         }
 
     def _get_agent_parameter_name(self, action_fn: Callable) -> str | None:
@@ -790,11 +785,7 @@ class ActionManager:
         for param_name, param in signature.parameters.items():
             if param_name.lower() != "agent":
                 continue
-            if param.kind in {
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.VAR_POSITIONAL,
-            }:
-                continue
-            return param_name
+            if _is_keyword_injectable_parameter(param):
+                return param_name
 
         return None

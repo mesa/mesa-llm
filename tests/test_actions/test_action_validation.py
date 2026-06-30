@@ -159,6 +159,34 @@ def test_validate_rejects_missing_required_arguments():
         )
 
 
+def test_validate_and_execute_allow_omitted_default_arguments():
+    @action
+    def repeat_message(agent, message: str, times: int = 2, suffix: str = "!") -> str:
+        """Repeat a message.
+
+        Args:
+            message: Message to repeat.
+            times: Number of repetitions.
+            suffix: Suffix appended to each repetition.
+
+        Returns:
+            Repeated message.
+        """
+        agent.calls.append((message, times, suffix))
+        return (message + suffix) * times
+
+    agent = SimpleNamespace(calls=[])
+    manager = ActionManager(actions=[repeat_message])
+    choice = ActionChoice(name="repeat_message", arguments={"message": "go"})
+
+    validated = manager.validate(agent, choice)
+    result = manager.execute(agent, choice)
+
+    assert validated.arguments == {"message": "go"}
+    assert result == "go!go!"
+    assert agent.calls == [("go", 2, "!")]
+
+
 def test_validate_rejects_unexpected_extra_arguments():
     @action
     def speak(agent, message: str) -> str:
@@ -729,6 +757,39 @@ def test_execute_injects_agent_when_action_accepts_agent_parameter():
         ActionChoice(name="capture_agent", arguments={"message": "hello"}),
     )
 
+    assert result == "agent-1:hello"
+    assert agent.messages == ["hello"]
+
+
+def test_action_schema_omits_injected_agent_and_execute_still_injects_it():
+    @action
+    def capture_agent_identity(agent: LLMAgent, message: str) -> str:
+        """Capture the injected agent.
+
+        Args:
+            message: Message to capture.
+
+        Returns:
+            Agent identity confirmation.
+        """
+        agent.messages.append(message)
+        return f"{agent.name}:{message}"
+
+    params = capture_agent_identity.__action_schema__["parameters"]
+    agent = SimpleNamespace(name="agent-1", messages=[])
+    manager = ActionManager(actions=[capture_agent_identity])
+
+    result = manager.execute(
+        agent,
+        ActionChoice(
+            name="capture_agent_identity",
+            arguments={"message": "hello"},
+        ),
+    )
+
+    assert set(params["properties"]) == {"message"}
+    assert params["required"] == ["message"]
+    assert "agent" not in capture_agent_identity.__action_metadata__.parameters
     assert result == "agent-1:hello"
     assert agent.messages == ["hello"]
 
