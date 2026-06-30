@@ -1,9 +1,18 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
 from mesa_llm.actions import ActionChoice, ActionManager, action
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
+
+if TYPE_CHECKING:
+    from mesa_llm.llm_agent import LLMAgent
+
+    class MissingPayloadType:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -200,6 +209,109 @@ def test_validate_rejects_llm_supplied_agent_argument_before_mutation():
         )
 
     assert agent.called is False
+
+
+def test_execute_rejects_postponed_list_annotation_non_list_string_before_mutation():
+    @action
+    def notify_agents(agent: LLMAgent, listener_agent_ids: list[int]) -> str:
+        """Notify agents by id.
+
+        Args:
+            listener_agent_ids: Agent ids to notify.
+
+        Returns:
+            Notification confirmation.
+        """
+        agent.notified_ids.extend(listener_agent_ids)
+        return "notified"
+
+    agent = SimpleNamespace(notified_ids=[])
+    manager = ActionManager(actions=[notify_agents])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*listener_agent_ids.*list\[int\]",
+    ):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="notify_agents",
+                arguments={"listener_agent_ids": "not a list"},
+            ),
+        )
+
+    assert agent.notified_ids == []
+
+
+def test_validate_resolves_postponed_optional_int_annotation():
+    @action
+    def set_cooldown(agent: LLMAgent, cooldown: int | None) -> int | None:
+        """Set an optional cooldown.
+
+        Args:
+            cooldown: Optional cooldown duration.
+
+        Returns:
+            The normalized cooldown.
+        """
+        del agent
+        return cooldown
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[set_cooldown])
+
+    none_choice = manager.validate(
+        agent,
+        ActionChoice(name="set_cooldown", arguments={"cooldown": None}),
+    )
+    int_choice = manager.validate(
+        agent,
+        ActionChoice(name="set_cooldown", arguments={"cooldown": "4"}),
+    )
+
+    assert none_choice.arguments == {"cooldown": None}
+    assert int_choice.arguments == {"cooldown": 4}
+    assert isinstance(int_choice.arguments["cooldown"], int)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*cooldown.*int.*None",
+    ):
+        manager.validate(
+            agent,
+            ActionChoice(name="set_cooldown", arguments={"cooldown": "later"}),
+        )
+
+
+def test_execute_unresolved_postponed_non_agent_annotation_fails_closed_before_mutation():
+    def apply_payload(agent: LLMAgent, payload: MissingPayloadType) -> str:
+        """Apply a typed payload.
+
+        Args:
+            payload: Payload to apply.
+
+        Returns:
+            Payload confirmation.
+        """
+        agent.applied_payloads.append(payload)
+        return "applied"
+
+    agent = SimpleNamespace(applied_payloads=[])
+    manager = ActionManager(actions=[apply_payload])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Could not resolve annotation.*payload.*MissingPayloadType",
+    ):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="apply_payload",
+                arguments={"payload": {"value": 1}},
+            ),
+        )
+
+    assert agent.applied_payloads == []
 
 
 def test_validate_does_not_execute_action_or_mutate_state():

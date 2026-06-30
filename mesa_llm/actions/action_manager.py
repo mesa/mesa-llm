@@ -15,13 +15,15 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    get_type_hints,
 )
 
 from pydantic import BaseModel, Field
 from terminal_style import style
 
-from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
+from mesa_llm.actions.action_decorator import (
+    _GLOBAL_ACTION_REGISTRY,
+    _get_action_type_hints,
+)
 
 _UNSET = object()
 _EMBEDDED_NUMBER_PATTERN = re.compile(
@@ -337,10 +339,10 @@ class ActionManager:
         arguments: dict[str, Any],
         contract: dict[str, Any],
     ) -> dict[str, Any]:
-        try:
-            type_hints = get_type_hints(action_fn)
-        except (NameError, AttributeError, TypeError):
-            type_hints = getattr(action_fn, "__annotations__", {})
+        type_hints = _get_action_type_hints(
+            action_fn,
+            parameter_names=contract["allowed"],
+        )
 
         if not type_hints:
             return arguments

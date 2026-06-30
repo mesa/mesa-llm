@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pytest
 
 from mesa_llm.actions import (
@@ -8,6 +12,9 @@ from mesa_llm.actions import (
     wait,
 )
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
+
+if TYPE_CHECKING:
+    from mesa_llm.llm_agent import LLMAgent
 
 
 @pytest.fixture(autouse=True)
@@ -170,6 +177,62 @@ def test_action_manager_argument_registers_directly_with_that_manager():
     assert manager.get_actions_schema(actions="direct_action") == [expected_schema]
     assert direct_action.__action_schema__ == expected_schema
     assert "direct_action" not in _GLOBAL_ACTION_REGISTRY
+
+
+def test_action_schema_resolves_postponed_annotations_with_type_checking_agent_import():
+    @action
+    def notify_neighbor(
+        agent: LLMAgent,
+        listener_agent_ids: list[int],
+        message: str,
+    ) -> str:
+        """Notify a neighboring agent.
+
+        Args:
+            listener_agent_ids: Listener ids.
+            message: Message body.
+
+        Returns:
+            Notification confirmation.
+        """
+        del agent
+        return message
+
+    params = notify_neighbor.__action_schema__["parameters"]
+
+    assert set(params["properties"]) == {"listener_agent_ids", "message"}
+    assert params["required"] == ["listener_agent_ids", "message"]
+    assert params["properties"]["listener_agent_ids"] == {
+        "type": "array",
+        "items": {"type": "integer"},
+        "description": "Listener ids.",
+    }
+    assert params["properties"]["message"] == {
+        "type": "string",
+        "description": "Message body.",
+    }
+    assert "agent" not in notify_neighbor.__action_metadata__.parameters
+
+
+def test_action_schema_ignores_string_llm_agent_parameter_annotation():
+    @action
+    def inspect_agent(agent: LLMAgent, note: str) -> str:
+        """Inspect the injected agent safely.
+
+        Args:
+            note: Inspection note.
+
+        Returns:
+            Inspection confirmation.
+        """
+        del agent
+        return note
+
+    params = inspect_agent.__action_schema__["parameters"]
+
+    assert set(params["properties"]) == {"note"}
+    assert params["required"] == ["note"]
+    assert "agent" not in inspect_agent.__action_metadata__.parameters
 
 
 def test_empty_action_managers_expose_no_actions():

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 import inspect
-from collections.abc import Callable
+import typing
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, get_type_hints
 
@@ -12,6 +14,23 @@ if TYPE_CHECKING:
 
 
 _GLOBAL_ACTION_REGISTRY: dict[str, Callable] = {}
+_ACTION_ANNOTATION_GLOBALS: dict[str, Any] = {
+    name: getattr(typing, name)
+    for name in getattr(typing, "__all__", ())
+    if hasattr(typing, name)
+}
+_ACTION_ANNOTATION_GLOBALS.update(
+    {
+        "Any": Any,
+        "NoneType": type(None),
+        "any": Any,
+        "typing": typing,
+    }
+)
+
+
+class ActionAnnotationResolutionError(ValueError):
+    """Raised when a non-agent action parameter annotation cannot be resolved."""
 
 
 @dataclass(frozen=True)
@@ -23,6 +42,66 @@ class ActionMetadata:
     parameters: dict[str, Any]
     required: list[str]
     return_description: str | None = None
+
+
+def _get_action_type_hints(
+    func: Callable,
+    parameter_names: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve type hints for non-agent action parameters only."""
+    annotations = getattr(func, "__annotations__", {})
+    if not annotations:
+        return {}
+
+    allowed_names = set(parameter_names) if parameter_names is not None else None
+    type_hints = {}
+    for param_name, annotation in annotations.items():
+        if param_name == "return" or param_name.lower() == "agent":
+            continue
+        if allowed_names is not None and param_name not in allowed_names:
+            continue
+        type_hints[param_name] = _resolve_action_annotation(
+            func,
+            param_name,
+            annotation,
+        )
+    return type_hints
+
+
+def _resolve_action_annotation(
+    func: Callable,
+    param_name: str,
+    annotation: Any,
+) -> Any:
+    def annotation_holder():
+        pass
+
+    annotation_holder.__annotations__ = {"value": annotation}
+    annotation_holder.__module__ = getattr(func, "__module__", None)
+
+    try:
+        return get_type_hints(
+            annotation_holder,
+            globalns=_get_action_annotation_globalns(func),
+        )["value"]
+    except (AttributeError, NameError, SyntaxError, TypeError, ValueError) as exc:
+        raise ActionAnnotationResolutionError(
+            "Could not resolve annotation for action "
+            f"{getattr(func, '__name__', repr(func))!r} parameter "
+            f"{param_name!r}: {annotation!r}. Action parameter annotations "
+            "must be importable at runtime or use built-in/typing types. "
+            "The injected 'agent' parameter is ignored and does not need to "
+            "be importable."
+        ) from exc
+
+
+def _get_action_annotation_globalns(func: Callable) -> dict[str, Any]:
+    globalns = dict(_ACTION_ANNOTATION_GLOBALS)
+    func_globals = getattr(func, "__globals__", None)
+    if func_globals is not None:
+        globalns.update(func_globals)
+    globalns.setdefault("__builtins__", builtins.__dict__)
+    return globalns
 
 
 def action(
@@ -64,16 +143,12 @@ def action(
         description, arg_docs, return_docs = _parse_docstring(func, ignore_agent=True)
 
         sig = inspect.signature(func)
-        try:
-            type_hints = get_type_hints(func)
-        except (NameError, AttributeError, TypeError):
-            type_hints = getattr(func, "__annotations__", {})
-
         action_params = {
             param_name: param
             for param_name, param in sig.parameters.items()
             if param_name.lower() != "agent"
         }
+        type_hints = _get_action_type_hints(func, parameter_names=action_params)
 
         properties = {}
         for param_name in action_params:
