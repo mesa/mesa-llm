@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -62,6 +63,37 @@ def _get_agent_position(agent: Any) -> Any:
     raise ValueError(
         "Could not infer agent position from `cell`, `pos`, or `position`."
     )
+
+
+def _normalize_discrete_grid_coordinates(
+    target_coordinates: tuple[Any, ...],
+) -> tuple[int, ...]:
+    """Normalize coordinates that Mesa discrete grids can index safely."""
+    normalized_coordinates = []
+    for coordinate in target_coordinates:
+        if isinstance(coordinate, bool):
+            raise ValueError(
+                "Discrete grid coordinates must be finite integers; "
+                f"got {target_coordinates}."
+            )
+
+        if isinstance(coordinate, int):
+            normalized_coordinates.append(coordinate)
+            continue
+
+        if not (
+            isinstance(coordinate, float)
+            and math.isfinite(coordinate)
+            and coordinate.is_integer()
+        ):
+            raise ValueError(
+                "Discrete grid coordinates must be finite integers; "
+                f"got {target_coordinates}."
+            )
+
+        normalized_coordinates.append(int(coordinate))
+
+    return tuple(normalized_coordinates)
 
 
 @action
@@ -188,6 +220,7 @@ def teleport_to_location(
     space = getattr(agent.model, "space", None)
 
     if isinstance(grid, SingleGrid | MultiGrid):
+        target_coordinates = _normalize_discrete_grid_coordinates(target_coordinates)
         if grid.torus:
             target_coordinates = grid.torus_adj(target_coordinates)
         elif grid.out_of_bounds(target_coordinates):

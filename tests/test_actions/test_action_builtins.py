@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -50,6 +51,22 @@ def _execute_social(agent, arguments: dict):
 def _validate_spatial(agent, name: str, arguments: dict):
     manager = ActionManager(actions=spatial_actions())
     return manager.validate(agent, ActionChoice(name=name, arguments=arguments))
+
+
+def _discrete_grid_agent(grid_type, start=(1, 1), unique_id=101):
+    model = DummyModel()
+    model.grid = grid_type(width=4, height=4, torus=False)
+
+    agent = DummyAgent(unique_id=unique_id, model=model)
+    model.agents.append(agent)
+    model.grid.place_agent(agent, start)
+
+    return model, agent
+
+
+def _assert_discrete_grid_agent_unchanged(model, agent, position):
+    assert agent.pos == position
+    assert agent in model.grid.get_cell_list_contents([position])
 
 
 def test_builtin_action_factories_are_explicit_immutable_tuples():
@@ -129,6 +146,106 @@ def test_teleport_to_location_on_multigrid():
 
     assert agent.pos == (3, 2)
     assert out == "agent 7 moved to (3, 2)."
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+def test_teleport_to_location_discrete_grids_accept_valid_integer_coordinates(
+    grid_type,
+):
+    model, agent = _discrete_grid_agent(grid_type, unique_id=102)
+
+    out = _execute_spatial(
+        agent,
+        "teleport_to_location",
+        {"target_coordinates": [3, 2]},
+    )
+
+    assert agent.pos == (3, 2)
+    assert agent in model.grid.get_cell_list_contents([(3, 2)])
+    assert agent not in model.grid.get_cell_list_contents([(1, 1)])
+    assert out == "agent 102 moved to (3, 2)."
+
+
+def test_teleport_to_location_multigrid_rejects_fractional_coordinate_before_mutation():
+    model, agent = _discrete_grid_agent(MultiGrid, unique_id=103)
+
+    with pytest.raises(ValueError):
+        teleport_to_location(agent, [2.5, 2])
+
+    _assert_discrete_grid_agent_unchanged(model, agent, (1, 1))
+
+
+def test_teleport_to_location_singlegrid_rejects_fractional_coordinate_before_mutation():
+    model, agent = _discrete_grid_agent(SingleGrid, unique_id=104)
+
+    with pytest.raises(ValueError):
+        teleport_to_location(agent, [2, 2.5])
+
+    _assert_discrete_grid_agent_unchanged(model, agent, (1, 1))
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+@pytest.mark.parametrize("target_coordinates", [[True, 2], [2, False]])
+def test_teleport_to_location_discrete_grids_reject_boolean_coordinates(
+    grid_type,
+    target_coordinates,
+):
+    model, agent = _discrete_grid_agent(grid_type, unique_id=105)
+
+    with pytest.raises(ValueError):
+        teleport_to_location(agent, target_coordinates)
+
+    _assert_discrete_grid_agent_unchanged(model, agent, (1, 1))
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+@pytest.mark.parametrize(
+    "target_coordinates",
+    [
+        [math.nan, 2],
+        [2, math.nan],
+        [math.inf, 2],
+        [-math.inf, 2],
+    ],
+)
+def test_teleport_to_location_discrete_grids_reject_non_finite_coordinates(
+    grid_type,
+    target_coordinates,
+):
+    model, agent = _discrete_grid_agent(grid_type, unique_id=106)
+
+    with pytest.raises(ValueError):
+        teleport_to_location(agent, target_coordinates)
+
+    _assert_discrete_grid_agent_unchanged(model, agent, (1, 1))
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+def test_teleport_to_location_discrete_grids_large_integer_out_of_bounds_no_mutation(
+    grid_type,
+):
+    model, agent = _discrete_grid_agent(grid_type, unique_id=109)
+    huge_coordinate = 10**400
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        teleport_to_location(agent, [huge_coordinate, 2])
+
+    _assert_discrete_grid_agent_unchanged(model, agent, (1, 1))
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+def test_teleport_to_location_discrete_grids_handle_int_like_float_coordinates_safely(
+    grid_type,
+):
+    model, agent = _discrete_grid_agent(grid_type, unique_id=107)
+
+    out = teleport_to_location(agent, [2.0, 3.0])
+
+    assert agent.pos == (2, 3)
+    assert all(type(coordinate) is int for coordinate in agent.pos)
+    assert agent in model.grid.get_cell_list_contents([(2, 3)])
+    assert agent not in model.grid.get_cell_list_contents([(1, 1)])
+    assert out == "agent 107 moved to (2, 3)."
 
 
 def test_teleport_to_location_on_orthogonal_grid_without_constructor():
@@ -418,6 +535,24 @@ def test_teleport_to_location_on_continuousspace_without_grid_attribute():
 
     assert agent.pos == (4.5, 6.5)
     assert out == "agent 39 moved to (4.5, 6.5)."
+
+
+def test_teleport_to_location_continuousspace_accepts_finite_float_coordinates():
+    model = DummyModel()
+    model.space = ContinuousSpace(x_max=10.0, y_max=10.0, torus=False)
+
+    agent = DummyAgent(unique_id=108, model=model)
+    model.agents.append(agent)
+    model.space.place_agent(agent, (1.0, 1.0))
+
+    out = _execute_spatial(
+        agent,
+        "teleport_to_location",
+        {"target_coordinates": [2.5, 3.75]},
+    )
+
+    assert agent.pos == (2.5, 3.75)
+    assert out == "agent 108 moved to (2.5, 3.75)."
 
 
 def test_teleport_to_location_singlegrid_occupied_target_raises_before_mutation():
