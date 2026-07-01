@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -369,6 +370,67 @@ def test_validate_does_not_execute_action_or_mutate_state():
     assert validated.name == "mutating_action"
     assert agent.called is False
     assert model.counter == 0
+
+
+@pytest.mark.asyncio
+async def test_aexecute_awaits_async_action_body_and_applies_side_effect():
+    @action
+    async def async_mutating_action(agent, amount: int) -> str:
+        """Mutate state asynchronously.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        await asyncio.sleep(0)
+        agent.counter += amount
+        agent.awaited = True
+        return "async mutated"
+
+    agent = SimpleNamespace(counter=0, awaited=False)
+    manager = ActionManager(actions=[async_mutating_action])
+
+    result = await manager.aexecute(
+        agent,
+        ActionChoice(
+            name="async_mutating_action",
+            arguments={"amount": "4"},
+        ),
+    )
+
+    assert result == "async mutated"
+    assert agent.counter == 4
+    assert agent.awaited is True
+
+
+@pytest.mark.asyncio
+async def test_aexecute_validation_failure_happens_before_async_execution():
+    @action
+    async def async_mutating_action(agent, amount: int) -> str:
+        """Mutate state asynchronously.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        await asyncio.sleep(0)
+        agent.counter += amount
+        return "async mutated"
+
+    agent = SimpleNamespace(counter=0)
+    manager = ActionManager(actions=[async_mutating_action])
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await manager.aexecute(
+            agent,
+            ActionChoice(name="async_mutating_action", arguments={}),
+        )
+
+    assert agent.counter == 0
 
 
 def test_validate_coerces_exact_numeric_string_arguments():

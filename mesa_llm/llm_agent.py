@@ -209,7 +209,7 @@ class LLMAgent(Agent):
             actions=actions,
             system_prompt=system_prompt,
         )
-        result = self.execute_action(action_choice, actions=actions)
+        result = await self.aexecute_action(action_choice, actions=actions)
         return ActResult(action=action_choice, result=result)
 
     def execute_action(
@@ -224,6 +224,25 @@ class LLMAgent(Agent):
             actions=actions,
         )
         result = self._action_manager.execute(self, validated_choice, actions=actions)
+        self._record_successful_action_event(validated_choice, result)
+        return result
+
+    async def aexecute_action(
+        self,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+    ) -> Any:
+        """Validate and asynchronously execute one configured action locally."""
+        validated_choice = self._action_manager.validate(
+            self,
+            action_choice,
+            actions=actions,
+        )
+        result = await self._action_manager.aexecute(
+            self,
+            validated_choice,
+            actions=actions,
+        )
         self._record_successful_action_event(validated_choice, result)
         return result
 

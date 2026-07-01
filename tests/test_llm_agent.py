@@ -1,5 +1,6 @@
 # tests/test_llm_agent.py
 
+import asyncio
 import json
 import logging
 import warnings
@@ -1155,7 +1156,10 @@ async def test_aact_awaits_action_choice_executes_once_and_returns_act_result():
         side_effect=AssertionError("aact() must not call aplan()")
     )
     agent.achoose_action = AsyncMock(return_value=choice)
-    agent.execute_action = Mock(return_value="waited")
+    agent.execute_action = Mock(
+        side_effect=AssertionError("aact() must not call sync execute_action()")
+    )
+    agent.aexecute_action = AsyncMock(return_value="waited")
 
     result = await agent.aact(
         "Take one async turn.",
@@ -1168,7 +1172,8 @@ async def test_aact_awaits_action_choice_executes_once_and_returns_act_result():
         actions=[wait],
         system_prompt="async action system prompt",
     )
-    agent.execute_action.assert_called_once_with(choice, actions=[wait])
+    agent.aexecute_action.assert_awaited_once_with(choice, actions=[wait])
+    agent.execute_action.assert_not_called()
     agent.plan.assert_not_called()
     agent.reasoning.aplan.assert_not_called()
     assert result.__class__.__name__ == "ActResult"
@@ -1185,7 +1190,7 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
             super().__init__(rng=42)
 
     @action(action_manager=ActionManager())
-    def recorded_async_action(agent, amount: int) -> str:
+    async def recorded_async_action(agent, amount: int) -> str:
         """Recorded async action.
 
         Args:
@@ -1194,7 +1199,10 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
         Returns:
             Execution result.
         """
+        await asyncio.sleep(0)
+        assert "action" not in agent.memory.step_content
         agent.counter += amount
+        agent.awaited = True
         return "recorded"
 
     successful_agent = LLMAgent(
@@ -1209,6 +1217,7 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
     )
     successful_agent.recorder = Mock()
     successful_agent.counter = 0
+    successful_agent.awaited = False
     successful_agent.llm.agenerate = AsyncMock(
         return_value=_action_choice_response(
             json.dumps(
@@ -1226,6 +1235,7 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
     assert result.action.arguments == {"amount": 3}
     assert result.result == "recorded"
     assert successful_agent.counter == 3
+    assert successful_agent.awaited is True
     expected_content = {
         "action": {
             "name": "recorded_async_action",
@@ -1244,7 +1254,7 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
     )
 
     @action(action_manager=ActionManager())
-    def failing_async_action(agent, amount: int) -> str:
+    async def failing_async_action(agent, amount: int) -> str:
         """Failing async action.
 
         Args:
@@ -1253,7 +1263,9 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
         Returns:
             Never returns.
         """
-        del agent, amount
+        await asyncio.sleep(0)
+        agent.started = True
+        del amount
         raise RuntimeError("async action failed")
 
     failing_agent = LLMAgent(
@@ -1263,6 +1275,7 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
     )
     failing_agent.memory = ShortTermMemory(agent=failing_agent, n=5, display=False)
     failing_agent.recorder = Mock()
+    failing_agent.started = False
     failing_agent.llm.agenerate = AsyncMock(
         return_value=_action_choice_response(
             json.dumps(
@@ -1277,8 +1290,51 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
     with pytest.raises(RuntimeError, match="async action failed"):
         await failing_agent.aact("Take one failing async action.")
 
+    assert failing_agent.started is True
     assert "action" not in failing_agent.memory.step_content
     failing_agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_validates_before_async_execution_and_recording():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def async_recorded_action(agent, amount: int) -> str:
+        """Recorded async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        await asyncio.sleep(0)
+        agent.counter += amount
+        agent.started = True
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[async_recorded_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+    agent.started = False
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await agent.aexecute_action(
+            ActionChoice(name="async_recorded_action", arguments={}),
+        )
+
+    assert agent.counter == 0
+    assert agent.started is False
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
 
 
 def test_execute_action_records_successful_action_event_after_execution():

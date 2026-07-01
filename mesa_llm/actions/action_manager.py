@@ -269,6 +269,18 @@ class ActionManager:
 
         return action_fn(**call_arguments)
 
+    async def aexecute(
+        self,
+        agent: Any,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _UNSET,
+    ) -> Any:
+        """Validate and asynchronously execute one configured action locally."""
+        result = self.execute(agent, action_choice, actions=actions)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     def _coerce_action_choice(
         self,
         action_choice: ActionChoice | dict[str, Any],
