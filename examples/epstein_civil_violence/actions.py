@@ -1,4 +1,3 @@
-import random
 from typing import TYPE_CHECKING
 
 from examples.epstein_civil_violence.agents import CitizenState
@@ -46,5 +45,5 @@ def arrest_citizen(agent: "LLMAgent", citizen_id: int) -> str:
         (agent for agent in agent.model.agents if agent.unique_id == citizen_id), None
     )
     citizen.state = CitizenState.ARRESTED
-    citizen.jail_sentence_left = random.randint(1, agent.max_jail_term)
+    citizen.jail_sentence_left = agent.random.randint(1, agent.max_jail_term)
     return f"agent {citizen_id} arrested by {agent.unique_id}."

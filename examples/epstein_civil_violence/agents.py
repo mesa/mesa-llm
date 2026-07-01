@@ -7,6 +7,9 @@ from mesa_llm.actions import move_one_step
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.memory.st_lt_memory import STLTMemory
 
+_JAIL_SENTENCE_STEP = 0.1
+_JAIL_SENTENCE_EPSILON = 1e-9
+
 
 class CitizenState(Enum):
     QUIET = 1
@@ -130,7 +133,7 @@ class Citizen(LLMAgent, mesa.discrete_space.CellAgent):
         )
 
     def step(self):
-        if self.jail_sentence_left == 0:
+        if self.jail_sentence_left <= 0:
             self.update_estimated_arrest_probability()
             observation = self.generate_obs()
             self.act(
@@ -138,10 +141,10 @@ class Citizen(LLMAgent, mesa.discrete_space.CellAgent):
                 actions=["change_state", "move_one_step"],
             )
         else:
-            self.jail_sentence_left -= 0.1
+            self._serve_jail_step()
 
     async def astep(self):
-        if self.jail_sentence_left == 0:
+        if self.jail_sentence_left <= 0:
             self.update_estimated_arrest_probability()
             observation = self.generate_obs()
             await self.aact(
@@ -149,7 +152,12 @@ class Citizen(LLMAgent, mesa.discrete_space.CellAgent):
                 actions=["change_state", "move_one_step"],
             )
         else:
-            self.jail_sentence_left -= 0.1
+            self._serve_jail_step()
+
+    def _serve_jail_step(self):
+        self.jail_sentence_left -= _JAIL_SENTENCE_STEP
+        if self.jail_sentence_left <= _JAIL_SENTENCE_EPSILON:
+            self.jail_sentence_left = 0
 
 
 class Cop(LLMAgent, mesa.discrete_space.CellAgent):
