@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from collections.abc import Callable
+from numbers import Integral
 from typing import Any
 
 from mesa.discrete_space import (
@@ -77,8 +78,8 @@ def _normalize_discrete_grid_coordinates(
                 f"got {target_coordinates}."
             )
 
-        if isinstance(coordinate, int):
-            normalized_coordinates.append(coordinate)
+        if isinstance(coordinate, Integral):
+            normalized_coordinates.append(int(coordinate))
             continue
 
         if not (

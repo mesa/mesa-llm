@@ -4,6 +4,7 @@ import logging
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from mesa.discrete_space import OrthogonalMooreGrid, OrthogonalVonNeumannGrid
 from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
@@ -164,6 +165,42 @@ def test_teleport_to_location_discrete_grids_accept_valid_integer_coordinates(
     assert agent in model.grid.get_cell_list_contents([(3, 2)])
     assert agent not in model.grid.get_cell_list_contents([(1, 1)])
     assert out == "agent 102 moved to (3, 2)."
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+def test_teleport_to_location_discrete_grids_accept_numpy_integer_coordinates(
+    grid_type,
+):
+    model, agent = _discrete_grid_agent(
+        grid_type,
+        start=(np.int64(1), np.int64(1)),
+        unique_id=110,
+    )
+
+    out = teleport_to_location(agent, [np.int64(2), np.int64(3)])
+
+    assert agent.pos == (2, 3)
+    assert all(type(coordinate) is int for coordinate in agent.pos)
+    assert agent in model.grid.get_cell_list_contents([(2, 3)])
+    assert agent not in model.grid.get_cell_list_contents([(1, 1)])
+    assert out == "agent 110 moved to (2, 3)."
+
+
+@pytest.mark.parametrize("grid_type", [SingleGrid, MultiGrid])
+def test_move_one_step_discrete_grids_accept_numpy_integer_positions(grid_type):
+    model, agent = _discrete_grid_agent(
+        grid_type,
+        start=(np.int64(1), np.int64(1)),
+        unique_id=111,
+    )
+
+    out = _execute_spatial(agent, "move_one_step", {"direction": "North"})
+
+    assert agent.pos == (1, 2)
+    assert all(type(coordinate) is int for coordinate in agent.pos)
+    assert agent in model.grid.get_cell_list_contents([(1, 2)])
+    assert agent not in model.grid.get_cell_list_contents([(1, 1)])
+    assert out == "agent 111 moved to (1, 2)."
 
 
 def test_teleport_to_location_multigrid_rejects_fractional_coordinate_before_mutation():
