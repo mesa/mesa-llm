@@ -31,9 +31,6 @@ from .tools import (
     spatial_tools,
 )
 
-# Enable automatic parallel stepping when mesa_llm is imported
-enable_automatic_parallel_stepping()
-
 __all__ = [
     "ActResult",
     "ActionChoice",

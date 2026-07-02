@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -75,6 +76,8 @@ def step_agents_parallel_sync(agents: list[Agent | LLMAgent]) -> None:
 
 # Patch Mesa's shuffle_do for automatic parallel detection
 _original_shuffle_do = AgentSet.shuffle_do
+_original_do_async = getattr(AgentSet, "do_async", None)
+_original_do_async_exists = hasattr(AgentSet, "do_async")
 
 
 def _enhanced_shuffle_do(self, method: str, *args, **kwargs):
@@ -94,11 +97,17 @@ def enable_automatic_parallel_stepping(mode: str = "asyncio"):
         raise ValueError("mode must be either 'asyncio' or 'threading'")
     _PARALLEL_STEPPING_MODE = mode
     AgentSet.shuffle_do = _enhanced_shuffle_do
+    AgentSet.do_async = _agentset_do_async
 
 
 def disable_automatic_parallel_stepping():
     """Restore original shuffle_do behavior."""
     AgentSet.shuffle_do = _original_shuffle_do
+    if _original_do_async_exists:
+        AgentSet.do_async = _original_do_async
+    else:
+        with contextlib.suppress(AttributeError):
+            delattr(AgentSet, "do_async")
 
 
 # --- Monkey-patch AgentSet with do_async for async parallel method calls ---
@@ -124,6 +133,3 @@ def _agentset_do_async(self, method: str, *args, **kwargs):
         return await asyncio.gather(*tasks)
 
     return _run()
-
-
-AgentSet.do_async = _agentset_do_async
