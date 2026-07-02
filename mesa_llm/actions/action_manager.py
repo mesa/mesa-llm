@@ -259,6 +259,30 @@ class ActionManager:
         actions: ActionSelection | object = _UNSET,
     ) -> Any:
         """Validate and execute one configured action locally."""
+        choice, result = self._call_validated_action(
+            agent,
+            action_choice,
+            actions=actions,
+        )
+        if inspect.isawaitable(result):
+            self._close_awaitable_if_safe(result)
+            raise TypeError(
+                style(
+                    f"Action {choice.name!r} returned an awaitable result during "
+                    "synchronous ActionManager.execute(...). Async actions require "
+                    "ActionManager.aexecute(...), LLMAgent.aexecute_action(...), "
+                    "or LLMAgent.aact(...).",
+                    color="red",
+                )
+            )
+        return result
+
+    def _call_validated_action(
+        self,
+        agent: Any,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _UNSET,
+    ) -> tuple[ActionChoice, Any]:
         choice = self.validate(agent, action_choice, actions=actions)
         action_fn = self.available_actions(agent=agent, actions=actions)[choice.name]
 
@@ -267,7 +291,11 @@ class ActionManager:
         if agent_parameter is not None:
             call_arguments[agent_parameter] = agent
 
-        return action_fn(**call_arguments)
+        return choice, action_fn(**call_arguments)
+
+    def _close_awaitable_if_safe(self, result: Any) -> None:
+        if inspect.iscoroutine(result):
+            result.close()
 
     async def aexecute(
         self,
@@ -276,7 +304,7 @@ class ActionManager:
         actions: ActionSelection | object = _UNSET,
     ) -> Any:
         """Validate and asynchronously execute one configured action locally."""
-        result = self.execute(agent, action_choice, actions=actions)
+        _, result = self._call_validated_action(agent, action_choice, actions=actions)
         if inspect.isawaitable(result):
             return await result
         return result

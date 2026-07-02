@@ -1,6 +1,7 @@
 # tests/test_llm_agent.py
 
 import asyncio
+import gc
 import json
 import logging
 import warnings
@@ -335,6 +336,37 @@ def _action_choice_response(content, reasoning_content=None):
     message = SimpleNamespace(content=content, reasoning_content=reasoning_content)
     choice = SimpleNamespace(message=message)
     return SimpleNamespace(choices=[choice])
+
+
+def _close_possible_coroutine(result):
+    possible_coroutine = getattr(result, "result", result)
+    if asyncio.iscoroutine(possible_coroutine):
+        possible_coroutine.close()
+
+
+def _assert_rejects_async_action_without_unawaited_warning(call):
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always", RuntimeWarning)
+        result = None
+        try:
+            result = call()
+        except TypeError as exc:
+            message = str(exc).lower()
+            assert any(term in message for term in ("async", "await", "coroutine"))
+        else:
+            _close_possible_coroutine(result)
+            pytest.fail("Expected sync execution to reject an async action.")
+        finally:
+            result = None
+            gc.collect()
+
+    unawaited_warnings = [
+        warning
+        for warning in caught_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and "was never awaited" in str(warning.message)
+    ]
+    assert unawaited_warnings == []
 
 
 def _make_local_action_choice_agent():
@@ -1427,6 +1459,124 @@ def test_execute_action_does_not_record_successful_event_for_failures():
 
     assert "action" not in agent.memory.step_content
     agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_action_rejects_async_action_without_recording_and_aexecute_records():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def async_recorded_action(agent, amount: int) -> str:
+        """Recorded async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.started = True
+        await asyncio.sleep(0)
+        agent.counter += amount
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[async_recorded_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+    agent.started = False
+
+    choice = ActionChoice(
+        name="async_recorded_action",
+        arguments={"amount": 3},
+    )
+
+    _assert_rejects_async_action_without_unawaited_warning(
+        lambda: agent.execute_action(choice),
+    )
+
+    assert agent.counter == 0
+    assert agent.started is False
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+
+    result = await agent.aexecute_action(choice)
+
+    assert result == "recorded"
+    assert agent.counter == 3
+    assert agent.started is True
+    expected_content = {
+        "action": {
+            "name": "async_recorded_action",
+            "arguments": {"amount": 3},
+            "rationale": None,
+        },
+        "result": "recorded",
+    }
+    assert agent.memory.step_content["action"] == [expected_content]
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+def test_act_rejects_async_action_without_recording_success_or_warning():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def async_act_action(agent, amount: int) -> str:
+        """Async act action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.started = True
+        await asyncio.sleep(0)
+        agent.counter += amount
+        return "acted"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[async_act_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+    agent.started = False
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "async_act_action",
+                    "arguments": {"amount": 2},
+                },
+            ),
+        ),
+    )
+
+    _assert_rejects_async_action_without_unawaited_warning(
+        lambda: agent.act("Take one async action."),
+    )
+
+    assert agent.counter == 0
+    assert agent.started is False
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+    agent.llm.generate.assert_called_once()
 
 
 def test_llm_agent_tool_manager_property_is_deprecated():

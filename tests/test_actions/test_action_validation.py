@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -370,6 +371,75 @@ def test_validate_does_not_execute_action_or_mutate_state():
     assert validated.name == "mutating_action"
     assert agent.called is False
     assert model.counter == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_async_action_without_body_or_warning_and_aexecute_runs(
+    recwarn,
+):
+    @action
+    async def async_increment_counter(agent, amount: int) -> str:
+        """Increment asynchronously.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.body_started = True
+        await asyncio.sleep(0)
+        agent.counter += amount
+        return "async incremented"
+
+    agent = SimpleNamespace(counter=0, body_started=False)
+    manager = ActionManager(actions=[async_increment_counter])
+    choice = ActionChoice(
+        name="async_increment_counter",
+        arguments={"amount": "4"},
+    )
+
+    with pytest.raises(TypeError, match="Async actions require"):
+        manager.execute(agent, choice)
+
+    assert agent.body_started is False
+    assert agent.counter == 0
+    gc.collect()
+    assert not [
+        warning for warning in recwarn if "was never awaited" in str(warning.message)
+    ]
+
+    result = await manager.aexecute(agent, choice)
+
+    assert result == "async incremented"
+    assert agent.body_started is True
+    assert agent.counter == 4
+
+
+def test_execute_still_runs_sync_action_after_async_rejection_guard():
+    @action
+    def increment_counter(agent, amount: int) -> str:
+        """Increment synchronously.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "sync incremented"
+
+    agent = SimpleNamespace(counter=1)
+    manager = ActionManager(actions=[increment_counter])
+
+    result = manager.execute(
+        agent,
+        ActionChoice(name="increment_counter", arguments={"amount": "2"}),
+    )
+
+    assert result == "sync incremented"
+    assert agent.counter == 3
 
 
 @pytest.mark.asyncio
