@@ -63,6 +63,30 @@ class AgentViewer:
 
         return dict(agent_events)
 
+    @staticmethod
+    def _format_action_event(content):
+        """Format current and legacy action event content."""
+        if not isinstance(content, dict):
+            return f"ACTION: {content}"
+
+        if "action" not in content:
+            action = content.get("action_type", content.get("data", ""))
+            return f"ACTION: {action}"
+
+        action = content["action"]
+        if isinstance(action, dict):
+            name = action.get("name")
+            lines = [f"ACTION: {name}" if name else "ACTION: Unknown action"]
+            if "arguments" in action:
+                lines.append(f"Arguments: {action['arguments']}")
+        else:
+            lines = [f"ACTION: {action}" if action else "ACTION: Unknown action"]
+
+        if "result" in content:
+            lines.append(f"Result: {content['result']}")
+
+        return "\n".join(lines)
+
     def _format_event(self, event):
         """Format event content for rich display."""
         try:
@@ -117,11 +141,7 @@ class AgentViewer:
                 return "\n".join(lines)
 
             elif event_type == "action":
-                if isinstance(content, dict):
-                    action = content.get("action_type", content.get("data", ""))
-                else:
-                    action = str(content)
-                return f"ACTION: {action}"
+                return self._format_action_event(content)
 
             elif event_type == "state_change":
                 lines = ["STATE CHANGE"]

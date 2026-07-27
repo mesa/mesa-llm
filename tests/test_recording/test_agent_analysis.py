@@ -112,6 +112,110 @@ class TestAgentViewer:
 
         assert "ACTION: move" in formatted
 
+    @pytest.mark.parametrize("rationale", [None, "The listener is nearby."])
+    def test_format_event_action_with_structured_choice(
+        self, temp_recording_file, rationale
+    ):
+        """Test formatting the structured action events recorded by LLMAgent."""
+        json_path, _ = temp_recording_file
+        viewer = AgentViewer(str(json_path))
+        action = {
+            "name": "speak_to",
+            "arguments": {
+                "listener_agents_unique_ids": [456],
+                "message": "Hello, neighbor!",
+            },
+        }
+        if rationale is not None:
+            action["rationale"] = rationale
+        event = {
+            "event_type": "action",
+            "content": {
+                "action": action,
+                "result": {"delivered": True},
+            },
+        }
+
+        formatted = viewer._format_event(event)
+        normalized = " ".join(formatted.split())
+
+        assert "speak_to" in normalized
+        assert "listener_agents_unique_ids" in normalized
+        assert "456" in normalized
+        assert "message" in normalized
+        assert "Hello, neighbor!" in normalized
+        assert "delivered" in normalized
+        assert "True" in normalized
+        assert formatted.strip() not in {"ACTION", "ACTION:"}
+
+    def test_format_event_action_with_legacy_data(self, temp_recording_file):
+        """Test that legacy data-based action events remain readable."""
+        json_path, _ = temp_recording_file
+        viewer = AgentViewer(str(json_path))
+        event = {
+            "event_type": "action",
+            "content": {"data": {"direction": "north"}},
+        }
+
+        formatted = viewer._format_event(event)
+
+        assert "ACTION" in formatted
+        assert "direction" in formatted
+        assert "north" in formatted
+
+    @pytest.mark.parametrize("content", ["wait", 42, None])
+    def test_format_event_action_with_non_dict_content(
+        self, temp_recording_file, content
+    ):
+        """Test that non-dictionary action content remains readable."""
+        json_path, _ = temp_recording_file
+        viewer = AgentViewer(str(json_path))
+
+        formatted = viewer._format_event({"event_type": "action", "content": content})
+
+        assert "ACTION" in formatted
+        assert str(content) in formatted
+        assert "ERROR formatting" not in formatted
+
+    @pytest.mark.parametrize(
+        ("content", "expected_fragment"),
+        [
+            (
+                {
+                    "action": {"arguments": {"distance": 2}},
+                    "result": "moved",
+                },
+                "moved",
+            ),
+            ({"action": "wait", "result": "finished"}, "wait"),
+            ({"action": None, "result": "not executed"}, "not executed"),
+            (
+                {
+                    "action": {
+                        "name": "move_one_step",
+                        "arguments": object(),
+                    },
+                    "result": object(),
+                },
+                "move_one_step",
+            ),
+            ({"action": {}}, "Unknown action"),
+        ],
+    )
+    def test_format_event_action_with_partial_or_malformed_content(
+        self, temp_recording_file, content, expected_fragment
+    ):
+        """Test that partial action structures degrade without raising."""
+        json_path, _ = temp_recording_file
+        viewer = AgentViewer(str(json_path))
+
+        formatted = viewer._format_event({"event_type": "action", "content": content})
+
+        assert "ACTION" in formatted
+        assert expected_fragment in formatted
+        assert "ERROR formatting" not in formatted
+        assert formatted.strip() not in {"ACTION", "ACTION:"}
+
     def test_format_event_state_change(self, temp_recording_file):
         """Test formatting state_change events."""
         json_path, _ = temp_recording_file
