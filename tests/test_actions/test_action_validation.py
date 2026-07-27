@@ -23,11 +23,9 @@ if TYPE_CHECKING:
 def restore_global_action_registry():
     """Keep bare @action registrations local to each test."""
     original_registry = dict(_GLOBAL_ACTION_REGISTRY)
-    ActionManager.instances.clear()
     yield
     _GLOBAL_ACTION_REGISTRY.clear()
     _GLOBAL_ACTION_REGISTRY.update(original_registry)
-    ActionManager.instances.clear()
 
 
 def test_action_choice_constructs_with_default_rationale():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from typing import TYPE_CHECKING, Literal
 
 import pytest
@@ -21,11 +23,9 @@ if TYPE_CHECKING:
 def restore_global_action_registry():
     """Keep bare @action registrations local to each test."""
     original_registry = dict(_GLOBAL_ACTION_REGISTRY)
-    ActionManager.instances.clear()
     yield
     _GLOBAL_ACTION_REGISTRY.clear()
     _GLOBAL_ACTION_REGISTRY.update(original_registry)
-    ActionManager.instances.clear()
 
 
 def test_action_generates_metadata_and_schema_from_type_hints_and_docstring():
@@ -260,6 +260,41 @@ def test_action_manager_argument_registers_directly_with_that_manager():
     assert manager.get_actions_schema(actions="direct_action") == [expected_schema]
     assert direct_action.__action_schema__ == expected_schema
     assert "direct_action" not in _GLOBAL_ACTION_REGISTRY
+
+
+def test_action_manager_and_exclusively_owned_callable_can_be_garbage_collected():
+    class ActionState:
+        value = "performed"
+
+    def register_owned_action(manager):
+        state = ActionState()
+
+        @action(action_manager=manager)
+        def owned_action(agent) -> str:
+            """Use state owned exclusively by this action.
+
+            Returns:
+                The owned state value.
+            """
+            del agent
+            return state.value
+
+        return weakref.ref(owned_action), weakref.ref(state)
+
+    manager = ActionManager()
+    action_ref, state_ref = register_owned_action(manager)
+    manager_ref = weakref.ref(manager)
+
+    assert manager.available_actions()["owned_action"](None) == "performed"
+    assert action_ref() is manager.actions["owned_action"]
+    assert state_ref() is not None
+
+    del manager
+    gc.collect()
+
+    assert manager_ref() is None
+    assert action_ref() is None
+    assert state_ref() is None
 
 
 def test_action_schema_resolves_postponed_annotations_with_type_checking_agent_import():

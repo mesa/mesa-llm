@@ -11,7 +11,6 @@ from types import UnionType
 from typing import (
     Annotated,
     Any,
-    ClassVar,
     Literal,
     Union,
     get_args,
@@ -62,13 +61,10 @@ class ActionManager:
     selectors are constrained to the manager's configured actions.
     """
 
-    instances: ClassVar[list[ActionManager]] = []
-
     def __init__(
         self,
         actions: list[ActionRef] | tuple[ActionRef, ...] | None = None,
     ):
-        ActionManager.instances.append(self)
         self.actions: dict[str, Callable] = {}
 
         if actions is not None:
