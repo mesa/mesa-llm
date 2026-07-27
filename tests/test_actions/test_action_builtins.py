@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from random import Random
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,6 +37,26 @@ class DummyAgent:
         self.pos = None
 
 
+class _CellAwareDummyAgent(DummyAgent):
+    def __init__(self, unique_id: int, model: DummyModel):
+        super().__init__(unique_id, model)
+        self._cell = None
+
+    @property
+    def cell(self):
+        return self._cell
+
+    @cell.setter
+    def cell(self, cell):
+        if self._cell is cell:
+            return
+        if self._cell is not None:
+            self._cell.remove_agent(self)
+        self._cell = cell
+        if cell is not None:
+            cell.add_agent(self)
+
+
 def _execute(agent, name: str, arguments: dict, actions):
     manager = ActionManager(actions=actions)
     return manager.execute(agent, ActionChoice(name=name, arguments=arguments))
@@ -68,6 +89,41 @@ def _discrete_grid_agent(grid_type, start=(1, 1), unique_id=101):
 def _assert_discrete_grid_agent_unchanged(model, agent, position):
     assert agent.pos == position
     assert agent in model.grid.get_cell_list_contents([position])
+
+
+def _orthogonal_grid_agent(grid_type, start=(0, 0), unique_id=112):
+    model = DummyModel()
+    model.grid = grid_type(dimensions=(4, 4), torus=False, random=Random(0))
+
+    agent = _CellAwareDummyAgent(unique_id=unique_id, model=model)
+    model.agents.append(agent)
+    agent.cell = model.grid._cells[start]
+
+    return model, agent
+
+
+def _assert_orthogonal_grid_agent_unchanged(model, agent, start_cell):
+    assert agent.cell is start_cell
+    assert agent in start_cell.agents
+    assert sum(agent in cell.agents for cell in model.grid._cells.values()) == 1
+
+
+def _continuous_space_agent(torus, start=(1.25, 2.5), unique_id=113):
+    model = DummyModel()
+    model.space = ContinuousSpace(x_max=10.0, y_max=10.0, torus=torus)
+
+    agent = DummyAgent(unique_id=unique_id, model=model)
+    model.agents.append(agent)
+    model.space.place_agent(agent, start)
+    model.space.get_neighbors(start, radius=0)
+
+    return model, agent
+
+
+def _assert_continuous_space_agent_unchanged(model, agent, start):
+    assert agent.pos == start
+    assert agent in model.space._agent_to_index
+    assert agent in model.space.get_neighbors(start, radius=0)
 
 
 def test_builtin_action_factories_are_explicit_immutable_tuples():
@@ -283,6 +339,74 @@ def test_teleport_to_location_discrete_grids_handle_int_like_float_coordinates_s
     assert agent in model.grid.get_cell_list_contents([(2, 3)])
     assert agent not in model.grid.get_cell_list_contents([(1, 1)])
     assert out == "agent 107 moved to (2, 3)."
+
+
+@pytest.mark.parametrize(
+    "grid_type",
+    [OrthogonalMooreGrid, OrthogonalVonNeumannGrid],
+)
+@pytest.mark.parametrize(
+    "target_coordinates",
+    [
+        [True, 1],
+        [1, False],
+        [1.5, 1],
+        [1, 1.5],
+        [math.nan, 1],
+        [1, math.inf],
+        [-math.inf, 1],
+    ],
+    ids=[
+        "boolean-row",
+        "boolean-column",
+        "fractional-row",
+        "fractional-column",
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+    ],
+)
+def test_teleport_to_location_orthogonal_grids_reject_invalid_coordinates_before_mutation(
+    grid_type,
+    target_coordinates,
+):
+    model, agent = _orthogonal_grid_agent(grid_type)
+    start_cell = agent.cell
+
+    with pytest.raises(ValueError):
+        teleport_to_location(agent, target_coordinates)
+
+    _assert_orthogonal_grid_agent_unchanged(model, agent, start_cell)
+
+
+@pytest.mark.parametrize(
+    "grid_type",
+    [OrthogonalMooreGrid, OrthogonalVonNeumannGrid],
+)
+@pytest.mark.parametrize(
+    ("target_coordinates", "expected_coordinates"),
+    [
+        ([2, 3], (2, 3)),
+        ([np.int64(2), np.int32(3)], (2, 3)),
+        ([2.0, 3.0], (2, 3)),
+    ],
+    ids=["python-integers", "numpy-integers", "integer-valued-floats"],
+)
+def test_teleport_to_location_orthogonal_grids_normalize_valid_coordinates(
+    grid_type,
+    target_coordinates,
+    expected_coordinates,
+):
+    model, agent = _orthogonal_grid_agent(grid_type, unique_id=114)
+    start_cell = agent.cell
+    target_cell = model.grid._cells[expected_coordinates]
+
+    out = teleport_to_location(agent, target_coordinates)
+
+    assert agent.cell is target_cell
+    assert agent in target_cell.agents
+    assert agent not in start_cell.agents
+    assert out == f"agent 114 moved to {expected_coordinates}."
 
 
 def test_teleport_to_location_on_orthogonal_grid_without_constructor():
@@ -590,6 +714,108 @@ def test_teleport_to_location_continuousspace_accepts_finite_float_coordinates()
 
     assert agent.pos == (2.5, 3.75)
     assert out == "agent 108 moved to (2.5, 3.75)."
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["direct", "managed"])
+@pytest.mark.parametrize("torus", [False, True], ids=["non-torus", "torus"])
+@pytest.mark.parametrize(
+    "target_coordinates",
+    [
+        (math.nan, 2.0),
+        (2.0, math.nan),
+        (math.inf, 2.0),
+        (-math.inf, 2.0),
+    ],
+    ids=[
+        "nan-x",
+        "nan-y",
+        "positive-infinity",
+        "negative-infinity",
+    ],
+)
+def test_teleport_to_location_continuousspace_rejects_non_finite_coordinates_before_mutation(
+    managed,
+    torus,
+    target_coordinates,
+):
+    start = (1.25, 2.5)
+    model, agent = _continuous_space_agent(torus, start=start)
+
+    with pytest.raises(ValueError):
+        if managed:
+            _execute_spatial(
+                agent,
+                "teleport_to_location",
+                {"target_coordinates": target_coordinates},
+            )
+        else:
+            teleport_to_location(agent, target_coordinates)
+
+    _assert_continuous_space_agent_unchanged(model, agent, start)
+
+
+@pytest.mark.parametrize("torus", [False, True], ids=["non-torus", "torus"])
+def test_teleport_to_location_continuousspace_rejects_non_numeric_coordinates_before_mutation(
+    torus,
+):
+    start = (1.25, 2.5)
+    model, agent = _continuous_space_agent(torus, start=start)
+
+    with pytest.raises(ValueError):
+        teleport_to_location(agent, ("not-a-number", 2.0))
+
+    _assert_continuous_space_agent_unchanged(model, agent, start)
+
+
+@pytest.mark.parametrize(
+    "target_coordinates",
+    [
+        (2, 3),
+        (2.5, 3.75),
+        (np.float32(2.5), np.float32(3.75)),
+        (np.float64(2.5), np.float64(3.75)),
+    ],
+    ids=[
+        "python-integers",
+        "python-floats",
+        "numpy-float32",
+        "numpy-float64",
+    ],
+)
+def test_teleport_to_location_continuousspace_accepts_finite_numeric_coordinates(
+    target_coordinates,
+):
+    model, agent = _continuous_space_agent(False, unique_id=115)
+
+    out = teleport_to_location(agent, target_coordinates)
+
+    assert agent.pos == target_coordinates
+    assert agent in model.space._agent_to_index
+    assert agent in model.space.get_neighbors(target_coordinates, radius=0)
+    assert out.startswith("agent 115 moved to ")
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["direct", "managed"])
+def test_teleport_to_location_continuousspace_wraps_valid_finite_coordinates(
+    managed,
+):
+    model, agent = _continuous_space_agent(True, unique_id=116)
+    target_coordinates = (12.5, -1.25)
+
+    if managed:
+        out = _execute_spatial(
+            agent,
+            "teleport_to_location",
+            {"target_coordinates": target_coordinates},
+        )
+    else:
+        out = teleport_to_location(agent, target_coordinates)
+
+    expected_coordinates = (2.5, 8.75)
+    assert agent.pos == expected_coordinates
+    assert agent in model.space._agent_to_index
+    assert agent in model.space.get_neighbors(expected_coordinates, radius=0)
+    assert out == f"agent 116 moved to {expected_coordinates}."
 
 
 def test_teleport_to_location_singlegrid_occupied_target_raises_before_mutation():

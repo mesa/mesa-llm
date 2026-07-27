@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import math
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -532,6 +533,80 @@ def test_validate_coerces_exact_numeric_string_arguments():
     assert validated.arguments == {"amount": 4, "ratio": 2.5}
     assert isinstance(validated.arguments["amount"], int)
     assert isinstance(validated.arguments["ratio"], float)
+
+
+@pytest.mark.parametrize(
+    "non_finite_value",
+    [math.inf, -math.inf],
+    ids=["positive-infinity", "negative-infinity"],
+)
+def test_validate_int_float_union_preserves_infinity_for_domain_validation(
+    non_finite_value,
+):
+    @action
+    def set_coordinate(agent, coordinate: int | float) -> str:
+        """Set a finite coordinate.
+
+        Args:
+            coordinate: Coordinate to set.
+
+        Returns:
+            Coordinate update confirmation.
+        """
+        if not math.isfinite(coordinate):
+            raise ValueError("coordinate must be finite")
+        agent.coordinate = coordinate
+        return "coordinate set"
+
+    agent = SimpleNamespace(coordinate=1.0)
+    manager = ActionManager(actions=[set_coordinate])
+    choice = ActionChoice(
+        name="set_coordinate",
+        arguments={"coordinate": non_finite_value},
+    )
+
+    validated = manager.validate(agent, choice)
+
+    assert validated.arguments == {"coordinate": non_finite_value}
+    with pytest.raises(ValueError, match="coordinate must be finite"):
+        manager.execute(agent, choice)
+    assert agent.coordinate == 1.0
+
+
+@pytest.mark.parametrize(
+    "non_finite_value",
+    [math.inf, -math.inf],
+    ids=["positive-infinity", "negative-infinity"],
+)
+def test_execute_int_only_rejects_infinity_with_standard_error_before_mutation(
+    non_finite_value,
+):
+    @action
+    def increment_counter(agent, amount: int) -> str:
+        """Increment a counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Counter update confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = SimpleNamespace(counter=0)
+    manager = ActionManager(actions=[increment_counter])
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*amount.*int"):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="increment_counter",
+                arguments={"amount": non_finite_value},
+            ),
+        )
+
+    assert agent.counter == 0
 
 
 def test_execute_rejects_embedded_float_text_before_mutation():

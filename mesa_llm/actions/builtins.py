@@ -4,7 +4,7 @@ import json
 import logging
 import math
 from collections.abc import Callable
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any
 
 from mesa.discrete_space import (
@@ -95,6 +95,34 @@ def _normalize_discrete_grid_coordinates(
         normalized_coordinates.append(int(coordinate))
 
     return tuple(normalized_coordinates)
+
+
+def _validate_continuous_space_coordinates(
+    target_coordinates: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Reject coordinates that cannot safely represent a continuous position."""
+    for coordinate in target_coordinates:
+        if not isinstance(coordinate, Real):
+            raise ValueError(
+                "Continuous space coordinates must be finite real numbers; "
+                f"got {target_coordinates}."
+            )
+
+        if isinstance(coordinate, Integral):
+            continue
+
+        try:
+            is_finite = math.isfinite(coordinate)
+        except (OverflowError, TypeError, ValueError):
+            is_finite = False
+
+        if not is_finite:
+            raise ValueError(
+                "Continuous space coordinates must be finite real numbers; "
+                f"got {target_coordinates}."
+            )
+
+    return target_coordinates
 
 
 @action
@@ -244,6 +272,7 @@ def teleport_to_location(
         grid.move_agent(agent, target_coordinates)
 
     elif isinstance(grid, OrthogonalMooreGrid | OrthogonalVonNeumannGrid):
+        target_coordinates = _normalize_discrete_grid_coordinates(target_coordinates)
         target_cell = grid._cells.get(target_coordinates)
         if target_cell is None:
             raise ValueError(
@@ -257,6 +286,7 @@ def teleport_to_location(
         agent.cell = target_cell
 
     elif isinstance(space, ContinuousSpace):
+        target_coordinates = _validate_continuous_space_coordinates(target_coordinates)
         if space.torus:
             target_coordinates = space.torus_adj(target_coordinates)
         elif space.out_of_bounds(target_coordinates):

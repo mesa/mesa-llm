@@ -675,7 +675,7 @@ class ActionManager:
         if self._is_valid_numeric_action_value(value, expected_type):
             return value
 
-        with contextlib.suppress(ValueError, TypeError):
+        with contextlib.suppress(OverflowError, ValueError, TypeError):
             coerced_value = expected_type(value)
             if expected_type is int and not self._is_lossless_int_coercion(
                 value, coerced_value
