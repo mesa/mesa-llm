@@ -5,7 +5,7 @@ import gc
 import math
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
@@ -313,6 +313,140 @@ def test_validate_resolves_postponed_optional_int_annotation():
             agent,
             ActionChoice(name="set_cooldown", arguments={"cooldown": "later"}),
         )
+
+
+def test_execute_accepts_declared_literal_and_rejects_undeclared_before_mutation():
+    @action
+    def set_mode(agent, mode: Literal["a", "b"]) -> str:
+        """Set the agent mode.
+
+        Args:
+            mode: Mode to apply.
+
+        Returns:
+            Applied mode.
+        """
+        agent.mode = mode
+        return mode
+
+    agent = SimpleNamespace(mode=None)
+    manager = ActionManager(actions=[set_mode])
+
+    result = manager.execute(
+        agent,
+        ActionChoice(name="set_mode", arguments={"mode": "b"}),
+    )
+
+    assert result == "b"
+    assert agent.mode == "b"
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*mode.*one of"):
+        manager.execute(
+            agent,
+            ActionChoice(name="set_mode", arguments={"mode": "c"}),
+        )
+
+    assert agent.mode == "b"
+
+
+def test_execute_literal_validation_requires_exact_type_and_value_before_mutation():
+    @action
+    def set_integer(agent, value: Literal[1]) -> int:
+        """Set an integer literal.
+
+        Args:
+            value: Integer literal to apply.
+
+        Returns:
+            Applied integer.
+        """
+        agent.values.append(value)
+        return value
+
+    @action
+    def set_boolean(agent, value: Literal[True]) -> bool:
+        """Set a Boolean literal.
+
+        Args:
+            value: Boolean literal to apply.
+
+        Returns:
+            Applied Boolean.
+        """
+        agent.values.append(value)
+        return value
+
+    agent = SimpleNamespace(values=[])
+    manager = ActionManager(actions=[set_integer, set_boolean])
+
+    assert (
+        manager.execute(
+            agent,
+            ActionChoice(name="set_integer", arguments={"value": 1}),
+        )
+        == 1
+    )
+    assert agent.values == [1]
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*value.*one of"):
+        manager.execute(
+            agent,
+            ActionChoice(name="set_integer", arguments={"value": True}),
+        )
+    assert agent.values == [1]
+
+    assert (
+        manager.execute(
+            agent,
+            ActionChoice(name="set_boolean", arguments={"value": True}),
+        )
+        is True
+    )
+    assert agent.values == [1, True]
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*value.*one of"):
+        manager.execute(
+            agent,
+            ActionChoice(name="set_boolean", arguments={"value": 1}),
+        )
+    assert agent.values == [1, True]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (4, 4),
+        ("ready", "ready"),
+        (None, None),
+    ],
+)
+def test_validate_accepts_every_nullable_union_member(value, expected):
+    @action
+    def set_value(agent, selected_value: int | str | None) -> str:
+        """Set an optional typed value.
+
+        Args:
+            selected_value: Value to apply.
+
+        Returns:
+            Value confirmation.
+        """
+        agent.value = selected_value
+        return "set"
+
+    agent = SimpleNamespace(value="unchanged")
+    manager = ActionManager(actions=[set_value])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(
+            name="set_value",
+            arguments={"selected_value": value},
+        ),
+    )
+
+    assert validated.arguments == {"selected_value": expected}
+    assert agent.value == "unchanged"
 
 
 def test_execute_unresolved_postponed_non_agent_annotation_fails_closed_before_mutation():

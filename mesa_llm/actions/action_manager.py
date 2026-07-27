@@ -452,7 +452,10 @@ class ActionManager:
             )
 
         if origin is Literal:
-            if value in args:
+            if any(
+                type(value) is type(candidate) and value == candidate
+                for candidate in args
+            ):
                 return value
             raise self._invalid_action_argument_type_error(
                 action_name,

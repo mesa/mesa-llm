@@ -1,3 +1,7 @@
+import math
+from enum import Enum
+from typing import Literal
+
 import pytest
 
 from mesa_llm.tools.tool_decorator import (
@@ -7,6 +11,10 @@ from mesa_llm.tools.tool_decorator import (
     _python_to_json_type,
     tool,
 )
+
+
+class _ExampleLiteralEnum(Enum):
+    VALUE = "value"
 
 
 class TestToolDecoractor:
@@ -55,16 +63,29 @@ class TestToolDecoractor:
             "items": {"type": "integer"},
         }
 
-        # Tuple with mixed types yields anyOf
-        tuple_schema = _python_to_json_type(tuple[str, int])
-        assert tuple_schema.get("type") == "array"
-        assert "anyOf" in tuple_schema.get("items", {})
-        item_types = {t.get("type") for t in tuple_schema["items"]["anyOf"]}
-        assert {"string", "integer"} == item_types
+        # Tuple with mixed types yields ordered anyOf
+        assert _python_to_json_type(tuple[str, int]) == {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                ]
+            },
+        }
 
         # Optional type (int | None) includes null
-        optional_schema = _python_to_json_type(int | None)
-        assert set(optional_schema.get("type", [])) == {"integer", "null"}
+        assert _python_to_json_type(int | None) == {
+            "type": ["integer", "null"],
+        }
+
+        # Non-null unions preserve declaration order
+        assert _python_to_json_type(int | str) == {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "string"},
+            ]
+        }
 
         # Dict with value types
         dict_schema = _python_to_json_type(dict[str, int])
@@ -74,6 +95,133 @@ class TestToolDecoractor:
         # Set maps to array
         set_schema = _python_to_json_type(set[str])
         assert set_schema == {"type": "array", "items": {"type": "string"}}
+
+    def test_python_to_json_type_literal_and_nullable_union_schemas(self):
+        assert _python_to_json_type(Literal["a", "b"]) == {
+            "type": "string",
+            "enum": ["a", "b"],
+        }
+        assert _python_to_json_type(Literal["b", "a"]) == {
+            "type": "string",
+            "enum": ["b", "a"],
+        }
+        assert _python_to_json_type(int | str | None) == {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        }
+        assert _python_to_json_type(Literal["a", "b"] | None) == {
+            "anyOf": [
+                {
+                    "type": "string",
+                    "enum": ["a", "b"],
+                },
+                {"type": "null"},
+            ]
+        }
+
+    def test_python_to_json_type_homogeneous_literal_schemas(self):
+        assert _python_to_json_type(Literal[1, 2]) == {
+            "type": "integer",
+            "enum": [1, 2],
+        }
+        assert _python_to_json_type(Literal[True, False]) == {
+            "type": "boolean",
+            "enum": [True, False],
+        }
+        assert _python_to_json_type(Literal[1.5, 2.5]) == {
+            "type": "number",
+            "enum": [1.5, 2.5],
+        }
+
+    def test_python_to_json_type_heterogeneous_json_literal_omits_type(self):
+        assert _python_to_json_type(Literal["a", 2, False, None, 1.5]) == {
+            "enum": ["a", 2, False, None, 1.5],
+        }
+
+    @pytest.mark.parametrize(
+        "literal_value",
+        [
+            b"bytes",
+            _ExampleLiteralEnum.VALUE,
+            1 + 2j,
+            math.nan,
+            math.inf,
+            -math.inf,
+        ],
+        ids=[
+            "bytes",
+            "enum-member",
+            "complex",
+            "nan",
+            "positive-infinity",
+            "negative-infinity",
+        ],
+    )
+    def test_python_to_json_type_rejects_non_json_literal_values(
+        self,
+        literal_value,
+    ):
+        with pytest.raises(
+            TypeError,
+            match="Literal schemas support only finite JSON scalar values",
+        ):
+            _python_to_json_type(Literal[literal_value])
+
+    def test_tool_schema_exposes_literal_and_nullable_union(self):
+        @tool
+        def select_value(
+            agent,
+            mode: Literal["a", "b"],
+            optional_mode: Literal["a", "b"] | None,
+            value: int | str | None,
+        ) -> str:
+            """Select a typed value.
+
+            Args:
+                agent: The agent making the request.
+                mode: Selection mode.
+                optional_mode: Optional selection mode.
+                value: Optional selected value.
+
+            Returns:
+                Selection confirmation.
+            """
+            del agent, optional_mode, value
+            return mode
+
+        try:
+            properties = select_value.__tool_schema__["function"]["parameters"][
+                "properties"
+            ]
+
+            assert properties["mode"] == {
+                "type": "string",
+                "enum": ["a", "b"],
+                "description": "Selection mode.",
+            }
+            assert properties["optional_mode"] == {
+                "anyOf": [
+                    {
+                        "type": "string",
+                        "enum": ["a", "b"],
+                    },
+                    {"type": "null"},
+                ],
+                "description": "Optional selection mode.",
+            }
+            assert properties["value"] == {
+                "anyOf": [
+                    {"type": "integer"},
+                    {"type": "string"},
+                    {"type": "null"},
+                ],
+                "description": "Optional selected value.",
+            }
+        finally:
+            _GLOBAL_TOOL_REGISTRY.pop("select_value", None)
 
     def test_tool(self):
         _GLOBAL_TOOL_REGISTRY.clear()

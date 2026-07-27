@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import inspect
+import math
 import re
 import textwrap
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 try:  # Python 3.10+ provides UnionType for PEP 604 unions (e.g., int | str)
     from types import UnionType  # type: ignore[attr-defined]
@@ -48,6 +57,7 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     - Basic types: int, str, float, bool
     - Collections: list, tuple, set
     - Generics: list[int], tuple[int, int], etc.
+    - Literal types: Literal["a", "b"]
     - Union types: Union[int, str], int | str
     - Optional types: Optional[int], int | None
     - Nested types: list[tuple[int, str]]
@@ -119,6 +129,32 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     origin = get_origin(py_type)
     args = get_args(py_type)
 
+    # Handle Literal before the generic fallback treats it as an object.
+    if origin is Literal:
+        literal_type_mapping = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            type(None): "null",
+        }
+        literal_types = []
+        for value in args:
+            value_type = type(value)
+            if value_type not in literal_type_mapping or (
+                value_type is float and not math.isfinite(value)
+            ):
+                raise TypeError(
+                    "Literal schemas support only finite JSON scalar values; "
+                    f"got {value!r}."
+                )
+            literal_types.append(literal_type_mapping[value_type])
+
+        schema: dict[str, Any] = {"enum": list(args)}
+        if literal_types and len(set(literal_types)) == 1:
+            schema = {"type": literal_types[0], **schema}
+        return schema
+
     # Handle Union types (including Optional which is Union[T, None])
     if origin is Union or (UnionType is not None and origin is UnionType):
         # Check if it's Optional (Union with None)
@@ -127,6 +163,8 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
         if len(non_none_args) == 1 and type(None) in args:
             # This is Optional[T] - handle the non-None type but allow null
             base_schema = _python_to_json_type(non_none_args[0])
+            if "enum" in base_schema:
+                return {"anyOf": [base_schema, {"type": "null"}]}
             # Add null as an allowed type
             if "type" in base_schema:
                 if isinstance(base_schema["type"], list):
@@ -139,13 +177,7 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
 
         elif len(non_none_args) > 1:
             # Multiple non-None types - create anyOf schema
-            return {
-                "anyOf": [
-                    _python_to_json_type(arg)
-                    for arg in non_none_args
-                    if arg is not type(None)
-                ]
-            }
+            return {"anyOf": [_python_to_json_type(arg) for arg in args]}
         else:
             # Only None type
             return {"type": "null"}

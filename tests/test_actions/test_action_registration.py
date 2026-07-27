@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
@@ -74,6 +74,54 @@ def test_action_generates_metadata_and_schema_from_type_hints_and_docstring():
             "required": ["location", "duration", "tags"],
         },
         "returns": "Visit confirmation.",
+    }
+
+
+def test_action_schema_exposes_literal_and_nullable_union():
+    @action
+    def select_value(
+        agent,
+        mode: Literal["a", "b"],
+        optional_mode: Literal["a", "b"] | None,
+        value: int | str | None,
+    ) -> str:
+        """Select a typed value.
+
+        Args:
+            mode: Selection mode.
+            optional_mode: Optional selection mode.
+            value: Optional selected value.
+
+        Returns:
+            Selection confirmation.
+        """
+        del agent, optional_mode, value
+        return mode
+
+    properties = select_value.__action_schema__["parameters"]["properties"]
+
+    assert properties["mode"] == {
+        "type": "string",
+        "enum": ["a", "b"],
+        "description": "Selection mode.",
+    }
+    assert properties["optional_mode"] == {
+        "anyOf": [
+            {
+                "type": "string",
+                "enum": ["a", "b"],
+            },
+            {"type": "null"},
+        ],
+        "description": "Optional selection mode.",
+    }
+    assert properties["value"] == {
+        "anyOf": [
+            {"type": "integer"},
+            {"type": "string"},
+            {"type": "null"},
+        ],
+        "description": "Optional selected value.",
     }
 
 
