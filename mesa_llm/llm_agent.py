@@ -243,7 +243,7 @@ class LLMAgent(Agent):
             validated_choice,
             actions=actions,
         )
-        self._record_successful_action_event(validated_choice, result)
+        await self._arecord_successful_action_event(validated_choice, result)
         return result
 
     def choose_action(
@@ -445,6 +445,24 @@ class LLMAgent(Agent):
             "result": result,
         }
         self.memory.add_to_memory(type="action", content=content)
+        if self.recorder is not None:
+            self.recorder.record_event(
+                "action",
+                content=content,
+                agent_id=self.unique_id,
+                metadata={"source": "LLMAgent.execute_action"},
+            )
+
+    async def _arecord_successful_action_event(
+        self,
+        action_choice: ActionChoice,
+        result: Any,
+    ) -> None:
+        content = {
+            "action": action_choice.model_dump(),
+            "result": result,
+        }
+        await self.memory.aadd_to_memory(type="action", content=content)
         if self.recorder is not None:
             self.recorder.record_event(
                 "action",

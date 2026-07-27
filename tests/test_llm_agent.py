@@ -19,6 +19,7 @@ from mesa_llm.actions import ActionChoice, ActionManager, action, wait
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
 from mesa_llm.actions.action_manager import _UNSET as _ACTIONS_UNSET
 from mesa_llm.llm_agent import LLMAgent
+from mesa_llm.memory.episodic_memory import EpisodicMemory
 from mesa_llm.memory.st_memory import ShortTermMemory
 from mesa_llm.reasoning.react import ReActReasoning
 from mesa_llm.reasoning.reasoning import _UNSET as _TOOLS_UNSET
@@ -1367,6 +1368,237 @@ async def test_aexecute_action_validates_before_async_execution_and_recording():
     assert agent.started is False
     assert "action" not in agent.memory.step_content
     agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_awaits_memory_before_recording_success():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    timeline = []
+
+    @action(action_manager=ActionManager())
+    async def ordered_async_action(agent, amount: int) -> dict[str, int]:
+        """Apply an amount after yielding to the event loop.
+
+        Args:
+            amount: Amount to apply.
+
+        Returns:
+            Applied amount.
+        """
+        await asyncio.sleep(0)
+        agent.counter += amount
+        timeline.append("action-complete")
+        return {"applied": amount}
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[ordered_async_action],
+    )
+    agent.counter = 0
+    choice = ActionChoice(
+        name="ordered_async_action",
+        arguments={"amount": 3},
+        rationale="Apply the requested amount.",
+    )
+    expected_result = {"applied": 3}
+    expected_content = {
+        "action": choice.model_dump(),
+        "result": expected_result,
+    }
+
+    async def record_memory(*, type, content):
+        assert type == "action"
+        assert content == expected_content
+        assert agent.counter == 3
+        timeline.append("memory-start")
+        await asyncio.sleep(0)
+        timeline.append("memory-complete")
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(
+            side_effect=AssertionError("async execution must not record synchronously")
+        ),
+        aadd_to_memory=AsyncMock(side_effect=record_memory),
+    )
+    agent.recorder = Mock()
+    agent.recorder.record_event.side_effect = lambda *args, **kwargs: timeline.append(
+        "recorder"
+    )
+
+    result = await agent.aexecute_action(choice)
+
+    assert result == expected_result
+    assert timeline == [
+        "action-complete",
+        "memory-start",
+        "memory-complete",
+        "recorder",
+    ]
+    agent.memory.aadd_to_memory.assert_awaited_once_with(
+        type="action",
+        content=expected_content,
+    )
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_does_not_record_validation_or_execution_failures():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def failing_async_action(agent, amount: int) -> None:
+        """Raise after asynchronous execution begins.
+
+        Args:
+            amount: Required amount.
+        """
+        await asyncio.sleep(0)
+        agent.started = True
+        del amount
+        raise RuntimeError("action failed")
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[failing_async_action],
+    )
+    agent.started = False
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(),
+    )
+    agent.recorder = Mock()
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await agent.aexecute_action(
+            ActionChoice(name="failing_async_action", arguments={})
+        )
+
+    assert agent.started is False
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="action failed"):
+        await agent.aexecute_action(
+            ActionChoice(name="failing_async_action", arguments={"amount": 1})
+        )
+
+    assert agent.started is True
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_execute_action_keeps_synchronous_memory_recording():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def synchronous_recording_action(agent, amount: int) -> str:
+        """Apply an amount synchronously.
+
+        Args:
+            amount: Amount to apply.
+
+        Returns:
+            Completion status.
+        """
+        agent.counter += amount
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[synchronous_recording_action],
+    )
+    agent.counter = 0
+    choice = ActionChoice(
+        name="synchronous_recording_action",
+        arguments={"amount": 2},
+    )
+    expected_content = {
+        "action": choice.model_dump(),
+        "result": "recorded",
+    }
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(
+            side_effect=AssertionError("sync execution must not use async memory")
+        ),
+    )
+    agent.recorder = None
+
+    result = agent.execute_action(choice)
+
+    assert result == "recorded"
+    assert agent.counter == 2
+    agent.memory.add_to_memory.assert_called_once_with(
+        type="action",
+        content=expected_content,
+    )
+    agent.memory.aadd_to_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_uses_episodic_memory_async_importance_grading():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def episodic_async_action(agent) -> str:
+        """Return after yielding to the event loop."""
+        del agent
+        await asyncio.sleep(0)
+        return "remembered"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[episodic_async_action],
+    )
+    memory = EpisodicMemory(agent=agent, llm_model="provider/test_model")
+    memory.agrade_event_importance = AsyncMock(return_value=4)
+    memory.grade_event_importance = Mock(
+        side_effect=AssertionError("async recording must not grade synchronously")
+    )
+    agent.memory = memory
+    agent.recorder = None
+    choice = ActionChoice(name="episodic_async_action", arguments={})
+    expected_content = {
+        "action": choice.model_dump(),
+        "result": "remembered",
+    }
+
+    result = await agent.aexecute_action(choice)
+
+    assert result == "remembered"
+    memory.agrade_event_importance.assert_awaited_once_with(
+        "action",
+        expected_content,
+    )
+    memory.grade_event_importance.assert_not_called()
+    assert len(memory.memory_entries) == 1
+    assert memory.memory_entries[0].content == {
+        "action": {
+            **expected_content,
+            "importance": 4,
+        }
+    }
 
 
 def test_execute_action_records_successful_action_event_after_execution():
