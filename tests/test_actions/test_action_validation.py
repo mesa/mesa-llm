@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import math
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -502,6 +503,230 @@ async def test_aexecute_validation_failure_happens_before_async_execution():
         )
 
     assert agent.counter == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_closes_native_coroutine_returned_by_sync_action_without_warning(
+    recwarn,
+):
+    async def deferred_mutation(agent) -> str:
+        agent.body_started = True
+        await asyncio.sleep(0)
+        agent.counter += 1
+        return "mutated"
+
+    @action
+    def return_coroutine(agent):
+        """Return a native coroutine from a synchronous action."""
+        coroutine = deferred_mutation(agent)
+        agent.coroutine = coroutine
+        return coroutine
+
+    agent = SimpleNamespace(counter=0, body_started=False, coroutine=None)
+    manager = ActionManager(actions=[return_coroutine])
+
+    try:
+        with pytest.raises(TypeError, match="Async actions require"):
+            manager.execute(
+                agent,
+                ActionChoice(name="return_coroutine", arguments={}),
+            )
+
+        assert agent.coroutine.cr_frame is None
+        await asyncio.sleep(0)
+        assert agent.body_started is False
+        assert agent.counter == 0
+    finally:
+        if agent.coroutine is not None and agent.coroutine.cr_frame is not None:
+            agent.coroutine.close()
+
+    gc.collect()
+    assert not [
+        warning for warning in recwarn if "was never awaited" in str(warning.message)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_cancels_returned_task_before_deferred_mutation():
+    @action
+    def schedule_mutation(agent, amount: int):
+        """Schedule a deferred mutation.
+
+        Args:
+            amount: Amount to add.
+        """
+
+        async def mutate_later() -> str:
+            await asyncio.sleep(0)
+            agent.counter += amount
+            return "mutated"
+
+        task = asyncio.create_task(mutate_later())
+        agent.task = task
+        return task
+
+    agent = SimpleNamespace(counter=0, task=None)
+    manager = ActionManager(actions=[schedule_mutation])
+
+    try:
+        with pytest.raises(TypeError, match="Async actions require"):
+            manager.execute(
+                agent,
+                ActionChoice(
+                    name="schedule_mutation",
+                    arguments={"amount": 3},
+                ),
+            )
+
+        assert agent.task.cancelling() > 0
+        with pytest.raises(asyncio.CancelledError):
+            await agent.task
+        await asyncio.sleep(0)
+        assert agent.task.cancelled()
+        assert agent.counter == 0
+    finally:
+        if agent.task is not None:
+            if not agent.task.done():
+                agent.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await agent.task
+
+
+@pytest.mark.asyncio
+async def test_execute_cancels_returned_future():
+    @action
+    def return_future(agent):
+        """Return a pending Future from a synchronous action."""
+        future = asyncio.get_running_loop().create_future()
+        agent.future = future
+        return future
+
+    agent = SimpleNamespace(future=None)
+    manager = ActionManager(actions=[return_future])
+
+    try:
+        with pytest.raises(TypeError, match="Async actions require"):
+            manager.execute(
+                agent,
+                ActionChoice(name="return_future", arguments={}),
+            )
+
+        assert agent.future.cancelled()
+    finally:
+        if agent.future is not None:
+            if not agent.future.done():
+                agent.future.cancel()
+            with suppress(asyncio.CancelledError):
+                await agent.future
+
+
+def test_execute_validation_failure_prevents_task_creation():
+    @action
+    def schedule_mutation(agent, amount: int):
+        """Schedule a deferred mutation.
+
+        Args:
+            amount: Amount to add.
+        """
+        agent.invocations += 1
+        agent.task = asyncio.create_task(asyncio.sleep(0))
+        return agent.task
+
+    agent = SimpleNamespace(invocations=0, task=None)
+    manager = ActionManager(actions=[schedule_mutation])
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        manager.execute(
+            agent,
+            ActionChoice(name="schedule_mutation", arguments={}),
+        )
+
+    assert agent.invocations == 0
+    assert agent.task is None
+
+
+@pytest.mark.asyncio
+async def test_aexecute_awaits_task_returned_by_sync_action():
+    @action
+    def schedule_mutation(agent, amount: int):
+        """Schedule a deferred mutation.
+
+        Args:
+            amount: Amount to add.
+        """
+
+        async def mutate_later() -> str:
+            await asyncio.sleep(0)
+            agent.counter += amount
+            return "task completed"
+
+        task = asyncio.create_task(mutate_later())
+        agent.task = task
+        return task
+
+    agent = SimpleNamespace(counter=0, task=None)
+    manager = ActionManager(actions=[schedule_mutation])
+
+    try:
+        result = await manager.aexecute(
+            agent,
+            ActionChoice(
+                name="schedule_mutation",
+                arguments={"amount": 4},
+            ),
+        )
+
+        assert result == "task completed"
+        assert agent.task.done()
+        assert agent.counter == 4
+    finally:
+        if agent.task is not None and not agent.task.done():
+            agent.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await agent.task
+
+
+@pytest.mark.asyncio
+async def test_aexecute_awaits_future_returned_by_sync_action():
+    @action
+    def schedule_future_completion(agent, amount: int):
+        """Schedule a Future completion.
+
+        Args:
+            amount: Amount to add.
+        """
+        future = asyncio.get_running_loop().create_future()
+        agent.future = future
+
+        def complete_future():
+            if future.cancelled():
+                return
+            agent.counter += amount
+            future.set_result("future completed")
+
+        asyncio.get_running_loop().call_soon(complete_future)
+        return future
+
+    agent = SimpleNamespace(counter=0, future=None)
+    manager = ActionManager(actions=[schedule_future_completion])
+
+    try:
+        result = await manager.aexecute(
+            agent,
+            ActionChoice(
+                name="schedule_future_completion",
+                arguments={"amount": 5},
+            ),
+        )
+
+        assert result == "future completed"
+        assert agent.future.done()
+        assert agent.counter == 5
+    finally:
+        if agent.future is not None and not agent.future.done():
+            agent.future.cancel()
+            with suppress(asyncio.CancelledError):
+                await agent.future
 
 
 def test_validate_coerces_exact_numeric_string_arguments():

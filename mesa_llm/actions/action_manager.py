@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import inspect
@@ -263,18 +264,11 @@ class ActionManager:
             agent,
             action_choice,
             actions=actions,
+            reject_async_callable=True,
         )
         if inspect.isawaitable(result):
             self._close_awaitable_if_safe(result)
-            raise TypeError(
-                style(
-                    f"Action {choice.name!r} returned an awaitable result during "
-                    "synchronous ActionManager.execute(...). Async actions require "
-                    "ActionManager.aexecute(...), LLMAgent.aexecute_action(...), "
-                    "or LLMAgent.aact(...).",
-                    color="red",
-                )
-            )
+            raise self._synchronous_awaitable_error(choice.name)
         return result
 
     def _call_validated_action(
@@ -282,9 +276,13 @@ class ActionManager:
         agent: Any,
         action_choice: ActionChoice | dict[str, Any],
         actions: ActionSelection | object = _UNSET,
+        *,
+        reject_async_callable: bool = False,
     ) -> tuple[ActionChoice, Any]:
         choice = self.validate(agent, action_choice, actions=actions)
         action_fn = self.available_actions(agent=agent, actions=actions)[choice.name]
+        if reject_async_callable and inspect.iscoroutinefunction(action_fn):
+            raise self._synchronous_awaitable_error(choice.name)
 
         call_arguments = dict(choice.arguments)
         agent_parameter = self._get_agent_parameter_name(action_fn)
@@ -294,8 +292,21 @@ class ActionManager:
         return choice, action_fn(**call_arguments)
 
     def _close_awaitable_if_safe(self, result: Any) -> None:
-        if inspect.iscoroutine(result):
+        if isinstance(result, asyncio.Future):
+            result.cancel()
+        elif inspect.iscoroutine(result):
             result.close()
+
+    def _synchronous_awaitable_error(self, action_name: str) -> TypeError:
+        return TypeError(
+            style(
+                f"Action {action_name!r} requires asynchronous execution but was "
+                "passed to synchronous ActionManager.execute(...). Async actions "
+                "require ActionManager.aexecute(...), "
+                "LLMAgent.aexecute_action(...), or LLMAgent.aact(...).",
+                color="red",
+            )
+        )
 
     async def aexecute(
         self,
