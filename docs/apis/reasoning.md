@@ -2,7 +2,7 @@
 
 The reasoning system in Mesa-LLM provides different cognitive strategies for agents to analyze situations, make decisions, and plan next steps. It forms the core intelligence layer that transforms observations and memory context into structured deliberation through different cognitive frameworks.
 
-Use `tools=` for read-only deliberation helpers, such as inspecting local state or computing derived context for the LLM. Committed state-changing behavior should be modeled as actions and executed through `act(...)`, `choose_action(...)`, or `execute_action(...)`, not as provider tool calls.
+Use `tools=` for read-only deliberation helpers, such as inspecting local state or computing derived context for the LLM. Committed state-changing behavior should be modeled as actions, not as provider tool calls. Use `choose_action(...)` as an inspection or veto point to select and validate one action without mutation, `execute_action(...)` to execute a selected action locally, or `act(...)` to choose and execute one action in a single call.
 
 ## Usage in Mesa Simulations
 
