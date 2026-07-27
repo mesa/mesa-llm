@@ -41,7 +41,6 @@ model_params = {
     "llm_model": "gemini/gemini-2.5-flash",
     "api_base": None,
     "vision": 5,
-    "parallel_stepping": False,
 }
 
 model = SugarScapeModel(
@@ -54,7 +53,6 @@ model = SugarScapeModel(
     vision=model_params["vision"],
     api_base=model_params["api_base"],
     seed=model_params["seed"]["value"],
-    parallel_stepping=model_params["parallel_stepping"],
 )
 
 

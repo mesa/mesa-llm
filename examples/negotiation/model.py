@@ -31,12 +31,10 @@ class NegotiationModel(Model):
         vision: int,
         api_base: str | None = None,
         seed=None,
-        parallel_stepping=False,
     ):
         super().__init__(seed=seed)
         self.width = width
         self.height = height
-        self.parallel_stepping = parallel_stepping
         self.grid = MultiGrid(self.height, self.width, torus=False)
 
         # ---------------------Create the buyer agents---------------------
