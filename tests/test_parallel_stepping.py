@@ -18,6 +18,8 @@ from mesa_llm.parallel_stepping import (
     step_agents_parallel_sync,
 )
 
+_CHILD_PROCESS_BASE_ENV = os.environ.copy()
+
 
 @pytest.fixture(autouse=True)
 def restore_shuffle_do():
@@ -54,7 +56,8 @@ def _run_import_side_effect_check(import_statement: str) -> dict[str, bool]:
         )
         """
     )
-    env = os.environ.copy()
+    env = _CHILD_PROCESS_BASE_ENV.copy()
+    env.update(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -62,7 +65,13 @@ def _run_import_side_effect_check(import_statement: str) -> dict[str, bool]:
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "Import side-effect child process failed.\n"
+        f"return code: {result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
     )
     return json.loads(result.stdout.splitlines()[-1])
 
@@ -111,6 +120,19 @@ def test_public_from_imports_do_not_patch_shuffle_do():
 
     assert result["shuffle_do_unchanged"]
     assert result["do_async_unchanged"]
+
+
+def test_import_side_effect_check_reports_child_output():
+    with pytest.raises(AssertionError) as exc_info:
+        _run_import_side_effect_check(
+            'print("child stdout sentinel"); '
+            'raise RuntimeError("child stderr sentinel")'
+        )
+
+    message = str(exc_info.value)
+    assert "return code:" in message
+    assert "child stdout sentinel" in message
+    assert "child stderr sentinel" in message
 
 
 @pytest.mark.asyncio
