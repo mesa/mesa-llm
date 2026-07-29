@@ -7,6 +7,7 @@ from contextlib import suppress
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Literal
 
+import numpy as np
 import pytest
 
 from mesa_llm.actions import ActionChoice, ActionManager, action
@@ -1097,11 +1098,262 @@ def test_validate_coerces_exact_numeric_string_arguments():
 
 
 @pytest.mark.parametrize(
-    "non_finite_value",
-    [math.inf, -math.inf],
-    ids=["positive-infinity", "negative-infinity"],
+    ("amount", "expected"),
+    [
+        (12, 12),
+        (12.0, 12),
+        ("12", 12),
+        ("-12", -12),
+        ("+3", 3),
+    ],
 )
-def test_validate_int_float_union_preserves_infinity_for_domain_validation(
+def test_validate_accepts_exact_lossless_integer_values(amount, expected):
+    @action
+    def record_amount(agent, amount: int) -> int:
+        """Record an integer amount.
+
+        Args:
+            amount: Integer amount to record.
+
+        Returns:
+            The normalized amount.
+        """
+        del agent
+        return amount
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[record_amount])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(name="record_amount", arguments={"amount": amount}),
+    )
+
+    assert validated.arguments == {"amount": expected}
+    assert type(validated.arguments["amount"]) is int
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected"),
+    [
+        (2.5, 2.5),
+        (2, 2),
+        ("2.5", 2.5),
+        ("-1", -1.0),
+        ("1e3", 1000.0),
+    ],
+)
+def test_validate_accepts_finite_float_values_and_exact_strings(ratio, expected):
+    @action
+    def record_ratio(agent, ratio: float) -> float:
+        """Record a floating point ratio.
+
+        Args:
+            ratio: Ratio to record.
+
+        Returns:
+            The normalized ratio.
+        """
+        del agent
+        return ratio
+
+    agent = SimpleNamespace()
+    manager = ActionManager(actions=[record_ratio])
+
+    validated = manager.validate(
+        agent,
+        ActionChoice(name="record_ratio", arguments={"ratio": ratio}),
+    )
+
+    assert validated.arguments == {"ratio": expected}
+    assert math.isfinite(validated.arguments["ratio"])
+
+
+def test_execute_accepts_numpy_numeric_scalars_across_nested_contracts():
+    @action
+    def record_values(
+        agent,
+        count: int,
+        ratio: float,
+        measurement: int | float,
+        batches: list[list[int | float]],
+    ) -> tuple[int, float, int | float, list[list[int | float]]]:
+        """Record NumPy numeric values after validation.
+
+        Args:
+            count: Integer count.
+            ratio: Floating point ratio.
+            measurement: Numeric measurement.
+            batches: Nested numeric batches.
+
+        Returns:
+            The normalized values.
+        """
+        normalized = (count, ratio, measurement, batches)
+        agent.recorded.append(normalized)
+        return normalized
+
+    agent = SimpleNamespace(recorded=[])
+    manager = ActionManager(actions=[record_values])
+
+    result = manager.execute(
+        agent,
+        ActionChoice(
+            name="record_values",
+            arguments={
+                "count": np.int64(12),
+                "ratio": np.float64(2.5),
+                "measurement": np.float32(1.25),
+                "batches": [[np.int32(2), np.float32(3.5)]],
+            },
+        ),
+    )
+
+    assert result == (12, 2.5, 1.25, [[2, 3.5]])
+    assert type(result[0]) is int
+    assert isinstance(result[1], float | np.floating)
+    assert math.isfinite(result[1])
+    assert isinstance(result[2], float | np.floating)
+    assert math.isfinite(result[2])
+    assert type(result[3][0][0]) is int
+    assert isinstance(result[3][0][1], float | np.floating)
+    assert math.isfinite(result[3][0][1])
+    assert agent.recorded == [result]
+
+
+@pytest.mark.parametrize("numpy_boolean", [np.bool_(True), np.bool_(False)])
+def test_execute_rejects_numpy_boolean_for_int_before_mutation(numpy_boolean):
+    @action
+    def increment_counter(agent, amount: int) -> str:
+        """Increment a counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = SimpleNamespace(counter=0)
+    manager = ActionManager(actions=[increment_counter])
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*amount.*int"):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="increment_counter",
+                arguments={"amount": numpy_boolean},
+            ),
+        )
+
+    assert agent.counter == 0
+
+
+@pytest.mark.parametrize("numpy_boolean", [np.bool_(True), np.bool_(False)])
+def test_execute_rejects_numpy_boolean_for_float_before_mutation(numpy_boolean):
+    @action
+    def scale_total(agent, ratio: float) -> str:
+        """Scale a total.
+
+        Args:
+            ratio: Floating point multiplier.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.total *= ratio
+        return "scaled"
+
+    agent = SimpleNamespace(total=10.0)
+    manager = ActionManager(actions=[scale_total])
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*ratio.*float"):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="scale_total",
+                arguments={"ratio": numpy_boolean},
+            ),
+        )
+
+    assert agent.total == 10.0
+
+
+@pytest.mark.parametrize("numpy_boolean", [np.bool_(True), np.bool_(False)])
+def test_execute_rejects_numpy_boolean_for_numeric_union_before_mutation(
+    numpy_boolean,
+):
+    @action
+    def record_measurement(agent, measurement: int | float) -> str:
+        """Record a numeric measurement.
+
+        Args:
+            measurement: Numeric measurement.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.measurements.append(measurement)
+        return "recorded"
+
+    agent = SimpleNamespace(measurements=[])
+    manager = ActionManager(actions=[record_measurement])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*measurement.*int \| float",
+    ):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="record_measurement",
+                arguments={"measurement": numpy_boolean},
+            ),
+        )
+
+    assert agent.measurements == []
+
+
+@pytest.mark.parametrize("numpy_boolean", [np.bool_(True), np.bool_(False)])
+def test_execute_rejects_numpy_boolean_in_nested_sequence_before_mutation(
+    numpy_boolean,
+):
+    @action
+    def record_batches(agent, batches: list[list[int | float]]) -> str:
+        """Record nested numeric batches.
+
+        Args:
+            batches: Nested numeric batches.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.batches.extend(batches)
+        return "recorded"
+
+    agent = SimpleNamespace(batches=[])
+    manager = ActionManager(actions=[record_batches])
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*batches"):
+        manager.execute(
+            agent,
+            ActionChoice(
+                name="record_batches",
+                arguments={"batches": [[1, numpy_boolean]]},
+            ),
+        )
+
+    assert agent.batches == []
+
+
+@pytest.mark.parametrize(
+    "non_finite_value",
+    [math.nan, math.inf, -math.inf],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_execute_int_float_union_rejects_non_finite_before_mutation(
     non_finite_value,
 ):
     @action
@@ -1126,11 +1378,12 @@ def test_validate_int_float_union_preserves_infinity_for_domain_validation(
         arguments={"coordinate": non_finite_value},
     )
 
-    validated = manager.validate(agent, choice)
-
-    assert validated.arguments == {"coordinate": non_finite_value}
-    with pytest.raises(ValueError, match="coordinate must be finite"):
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*coordinate.*int \| float",
+    ):
         manager.execute(agent, choice)
+
     assert agent.coordinate == 1.0
 
 
@@ -1170,7 +1423,23 @@ def test_execute_int_only_rejects_infinity_with_standard_error_before_mutation(
     assert agent.counter == 0
 
 
-def test_execute_rejects_embedded_float_text_before_mutation():
+@pytest.mark.parametrize(
+    "invalid_ratio",
+    [
+        True,
+        math.nan,
+        math.inf,
+        -math.inf,
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "Infinity",
+        "-Infinity",
+        "ratio 2.5",
+    ],
+)
+def test_execute_rejects_non_finite_or_prose_float_before_mutation(invalid_ratio):
     @action
     def scale_total(agent, ratio: float) -> str:
         """Scale the live agent total.
@@ -1192,14 +1461,26 @@ def test_execute_rejects_embedded_float_text_before_mutation():
             agent,
             ActionChoice(
                 name="scale_total",
-                arguments={"ratio": "ratio 2.5"},
+                arguments={"ratio": invalid_ratio},
             ),
         )
 
     assert agent.total == 10.0
 
 
-def test_validate_coerces_single_embedded_integer_from_llm_text():
+@pytest.mark.parametrize(
+    "invalid_citizen_id",
+    [
+        "Agent 2",
+        "Citizen 3",
+        "ID is 4",
+        "Do not arrest Agent 12",
+        "Citizens 12 and 13",
+    ],
+)
+def test_execute_rejects_integer_labels_and_prose_before_mutation(
+    invalid_citizen_id,
+):
     @action
     def arrest_citizen(agent, citizen_id: int) -> int:
         """Arrest a citizen by id.
@@ -1210,52 +1491,36 @@ def test_validate_coerces_single_embedded_integer_from_llm_text():
         Returns:
             The normalized citizen id.
         """
-        del agent
+        agent.arrested_ids.append(citizen_id)
         return citizen_id
 
-    agent = SimpleNamespace()
-    manager = ActionManager(actions=[arrest_citizen])
-
-    validated = manager.validate(
-        agent,
-        ActionChoice(
-            name="arrest_citizen",
-            arguments={"citizen_id": "Citizen 12"},
-        ),
-    )
-
-    assert validated.arguments == {"citizen_id": 12}
-    assert isinstance(validated.arguments["citizen_id"], int)
-
-
-def test_validate_rejects_ambiguous_embedded_integers_for_scalar_int():
-    @action
-    def arrest_citizen(agent, citizen_id: int) -> int:
-        """Arrest a citizen by id.
-
-        Args:
-            citizen_id: Citizen id to arrest.
-
-        Returns:
-            The normalized citizen id.
-        """
-        del agent
-        return citizen_id
-
-    agent = SimpleNamespace()
+    agent = SimpleNamespace(arrested_ids=[])
     manager = ActionManager(actions=[arrest_citizen])
 
     with pytest.raises(ValueError, match=r"Invalid argument type.*citizen_id.*int"):
-        manager.validate(
+        manager.execute(
             agent,
             ActionChoice(
                 name="arrest_citizen",
-                arguments={"citizen_id": "Citizens 12 and 13"},
+                arguments={"citizen_id": invalid_citizen_id},
             ),
         )
 
+    assert agent.arrested_ids == []
 
-def test_validate_coerces_string_json_list_to_int_list():
+
+@pytest.mark.parametrize(
+    ("listener_agent_ids", "expected"),
+    [
+        ([12, 13], [12, 13]),
+        ("[12, 13]", [12, 13]),
+        ('["12", "13"]', [12, 13]),
+    ],
+)
+def test_validate_accepts_real_and_strict_json_int_lists(
+    listener_agent_ids,
+    expected,
+):
     @action
     def notify_agents(agent, listener_agent_ids: list[int]) -> list[int]:
         """Notify agents by id.
@@ -1276,42 +1541,27 @@ def test_validate_coerces_string_json_list_to_int_list():
         agent,
         ActionChoice(
             name="notify_agents",
-            arguments={"listener_agent_ids": "[12, 13]"},
+            arguments={"listener_agent_ids": listener_agent_ids},
         ),
     )
 
-    assert validated.arguments == {"listener_agent_ids": [12, 13]}
+    assert validated.arguments == {"listener_agent_ids": expected}
 
 
-def test_validate_coerces_single_free_text_id_to_int_list():
-    @action
-    def notify_agents(agent, listener_agent_ids: list[int]) -> list[int]:
-        """Notify agents by id.
-
-        Args:
-            listener_agent_ids: Agent ids to notify.
-
-        Returns:
-            The normalized agent ids.
-        """
-        del agent
-        return listener_agent_ids
-
-    agent = SimpleNamespace()
-    manager = ActionManager(actions=[notify_agents])
-
-    validated = manager.validate(
-        agent,
-        ActionChoice(
-            name="notify_agents",
-            arguments={"listener_agent_ids": "Agent 12"},
-        ),
-    )
-
-    assert validated.arguments == {"listener_agent_ids": [12]}
-
-
-def test_execute_rejects_multi_id_prose_int_list_before_mutation():
+@pytest.mark.parametrize(
+    "invalid_listener_agent_ids",
+    [
+        "Agent 2",
+        "Notify Agent 2",
+        "agents 1 and 2",
+        "[1, 2",
+        "[1,]",
+        '["Agent 2"]',
+    ],
+)
+def test_execute_rejects_non_json_or_labeled_int_lists_before_mutation(
+    invalid_listener_agent_ids,
+):
     @action
     def notify_agents(agent, listener_agent_ids: list[int]) -> str:
         """Notify agents by id.
@@ -1330,13 +1580,13 @@ def test_execute_rejects_multi_id_prose_int_list_before_mutation():
 
     with pytest.raises(
         ValueError,
-        match=r"Invalid argument type.*listener_agent_ids.*list\[int\]",
+        match=r"Invalid argument type.*listener_agent_ids",
     ):
         manager.execute(
             agent,
             ActionChoice(
                 name="notify_agents",
-                arguments={"listener_agent_ids": "agents 1 and 2"},
+                arguments={"listener_agent_ids": invalid_listener_agent_ids},
             ),
         )
 
@@ -1405,7 +1655,18 @@ def test_execute_rejects_prose_coordinate_tuple_before_mutation():
 
 @pytest.mark.parametrize(
     "invalid_amount",
-    ["bad", 2.9, "2.9", "Citizen 12.5", "agents 1 and 2"],
+    [
+        True,
+        2.9,
+        "2.9",
+        "bad",
+        "Agent 2",
+        "Citizen 3",
+        "ID is 4",
+        "Do not arrest Agent 12",
+        "Citizen 12.5",
+        "agents 1 and 2",
+    ],
 )
 def test_execute_invalid_int_args_fail_before_execution_and_mutation(invalid_amount):
     @action

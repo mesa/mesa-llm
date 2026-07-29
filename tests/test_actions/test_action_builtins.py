@@ -169,6 +169,19 @@ def test_migrated_action_schemas_omit_agent_and_keep_required_arguments():
     assert speak_properties["message"]["type"] == "string"
 
 
+def test_speak_to_schema_requires_integer_ids_instead_of_agent_labels():
+    manager = ActionManager(actions=[speak_to])
+    schema = manager.get_actions_schema()[0]
+    description = schema["parameters"]["properties"]["listener_agents_unique_ids"][
+        "description"
+    ]
+
+    assert "[1, 2]" in description
+    assert "integer IDs only" in description
+    assert '["BuyerAgent 1"]' in description
+    assert "never agent labels" in description
+
+
 def test_move_one_step_on_singlegrid():
     model = DummyModel()
     model.grid = SingleGrid(width=5, height=5, torus=False)
@@ -531,7 +544,7 @@ def test_speak_to_records_on_recipients(mocker):
     assert ret == "sent message 'Hello there' to [11, 12]"
 
 
-def test_speak_to_coerces_single_free_text_id_before_execution(mocker):
+def test_speak_to_rejects_single_free_text_id_before_execution(mocker):
     model = DummyModel()
 
     sender = DummyAgent(unique_id=1, model=model)
@@ -542,16 +555,19 @@ def test_speak_to_coerces_single_free_text_id_before_execution(mocker):
 
     model.agents = [sender, *recipients]
 
-    ret = _execute_social(
-        sender,
-        {
-            "listener_agents_unique_ids": "Agent 2",
-            "message": "ping",
-        },
-    )
+    with pytest.raises(
+        ValueError,
+        match=r"Invalid argument type.*listener_agents_unique_ids.*list\[int\]",
+    ):
+        _execute_social(
+            sender,
+            {
+                "listener_agents_unique_ids": "Agent 2",
+                "message": "ping",
+            },
+        )
 
-    recipients[0].memory.add_to_memory.assert_called_once()
-    assert ret == "sent message 'ping' to [2]"
+    recipients[0].memory.add_to_memory.assert_not_called()
 
 
 def test_teleport_to_location_coerces_string_json_coordinates_before_execution():

@@ -5,7 +5,7 @@ import contextlib
 import copy
 import inspect
 import json
-import re
+import math
 from collections.abc import Callable
 from types import UnionType
 from typing import (
@@ -31,11 +31,6 @@ from mesa_llm.actions.action_decorator import (
 )
 
 _UNSET = object()
-_EMBEDDED_NUMBER_PATTERN = re.compile(
-    r"(?<![\w.+-])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
-    r"(?![\w.+-])"
-)
-_INTEGER_TOKEN_PATTERN = re.compile(r"[-+]?\d+")
 ActionRef = Callable | str
 ActionSelection = ActionRef | list[ActionRef] | tuple[ActionRef, ...] | None
 
@@ -594,11 +589,7 @@ class ActionManager:
         container_type = origin or expected_type
         item_types = args
         if isinstance(value, str):
-            coerced_sequence = self._coerce_string_sequence_value(
-                value,
-                container_type,
-                item_types,
-            )
+            coerced_sequence = self._coerce_string_sequence_value(value)
             if coerced_sequence is not None:
                 value = coerced_sequence
 
@@ -656,8 +647,6 @@ class ActionManager:
     def _coerce_string_sequence_value(
         self,
         value: str,
-        container_type: Any,
-        item_types: tuple[Any, ...],
     ) -> list[Any] | None:
         value = value.strip()
         with contextlib.suppress(json.JSONDecodeError, TypeError):
@@ -665,21 +654,7 @@ class ActionManager:
             if isinstance(decoded, list):
                 return decoded
 
-        if self._can_coerce_single_embedded_int_list(container_type, item_types):
-            embedded_ints = self._extract_embedded_ints(value)
-            if embedded_ints is not None and len(embedded_ints) == 1:
-                return embedded_ints
-
         return None
-
-    def _can_coerce_single_embedded_int_list(
-        self,
-        container_type: Any,
-        item_types: tuple[Any, ...],
-    ) -> bool:
-        if container_type is not list or len(item_types) != 1:
-            return False
-        return self._is_int_annotation(item_types[0])
 
     def _validate_and_coerce_mapping_value(
         self,
@@ -715,7 +690,7 @@ class ActionManager:
         }
 
     def _coerce_numeric_action_value(self, value: Any, expected_type: type) -> Any:
-        if isinstance(value, bool):
+        if self._is_boolean_scalar(value):
             return value
         if self._is_valid_numeric_action_value(value, expected_type):
             return value
@@ -728,28 +703,7 @@ class ActionManager:
                 return value
             return coerced_value
 
-        if expected_type is int and isinstance(value, str):
-            embedded_ints = self._extract_embedded_ints(value)
-            if embedded_ints is not None and len(embedded_ints) == 1:
-                return embedded_ints[0]
-
         return value
-
-    def _extract_embedded_ints(self, value: str) -> list[int] | None:
-        number_tokens = _EMBEDDED_NUMBER_PATTERN.findall(value)
-        if not number_tokens:
-            return []
-        if not all(_INTEGER_TOKEN_PATTERN.fullmatch(token) for token in number_tokens):
-            return None
-        return [int(token) for token in number_tokens]
-
-    def _is_int_annotation(self, annotation: Any) -> bool:
-        annotation = self._normalize_action_annotation(annotation)
-        origin = get_origin(annotation)
-        args = get_args(annotation)
-        if origin is Annotated and args:
-            return self._is_int_annotation(args[0])
-        return annotation is int
 
     def _is_lossless_int_coercion(self, value: Any, coerced_value: int) -> bool:
         if isinstance(value, str):
@@ -757,13 +711,21 @@ class ActionManager:
         return coerced_value == value
 
     def _is_valid_numeric_action_value(self, value: Any, expected_type: type) -> bool:
-        if isinstance(value, bool):
+        if self._is_boolean_scalar(value):
             return False
         if expected_type is int:
             return isinstance(value, int)
         if expected_type is float:
-            return isinstance(value, int | float)
+            return isinstance(value, int) or (
+                isinstance(value, float) and math.isfinite(value)
+            )
         return False
+
+    @staticmethod
+    def _is_boolean_scalar(value: Any) -> bool:
+        if isinstance(value, bool):
+            return True
+        return getattr(getattr(value, "dtype", None), "kind", None) == "b"
 
     def _normalize_action_annotation(self, annotation: Any) -> Any:
         if not isinstance(annotation, str):

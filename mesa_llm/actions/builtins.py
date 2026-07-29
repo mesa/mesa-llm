@@ -316,8 +316,9 @@ def speak_to(agent: Any, listener_agents_unique_ids: list[int], message: str) ->
 
     Args:
         agent: Provided automatically.
-        listener_agents_unique_ids: The unique ids of the agents receiving the
-            message.
+        listener_agents_unique_ids: The recipients' integer unique IDs as a JSON
+            array, such as ``[1, 2]``. Use integer IDs only, never agent labels or
+            names such as ``["BuyerAgent 1"]``.
         message: The message to send.
 
     Returns:

@@ -1,5 +1,112 @@
+import json
+
 from mesa_llm.actions import social_actions, teleport_to_location
 from mesa_llm.llm_agent import LLMAgent
+
+
+def _memory_event_payloads(agent, event_type: str):
+    """Yield structured recent-memory payloads for one event type."""
+    memory = agent.memory
+    entries = getattr(memory, "short_term_memory", None)
+    if entries is None:
+        entries = getattr(memory, "memory_entries", ())
+
+    contents = [entry.content for entry in entries]
+    step_content = getattr(memory, "step_content", None)
+    if isinstance(step_content, dict):
+        contents.append(step_content)
+
+    for content in contents:
+        if not isinstance(content, dict) or event_type not in content:
+            continue
+        payloads = content[event_type]
+        if not isinstance(payloads, list):
+            payloads = [payloads]
+        yield from (payload for payload in payloads if isinstance(payload, dict))
+
+
+def _recent_dialogue_partner_ids(agent) -> set:
+    """Return structured sender/recipient IDs from recent dialogue events."""
+    partner_ids = set()
+
+    for message in _memory_event_payloads(agent, "message"):
+        sender = message.get("sender")
+        if hasattr(sender, "unique_id"):
+            sender = sender.unique_id
+        if sender is not None and not isinstance(sender, bool):
+            partner_ids.add(sender)
+
+        recipients = message.get("recipients", ())
+        if isinstance(recipients, list | tuple):
+            partner_ids.update(
+                recipient for recipient in recipients if not isinstance(recipient, bool)
+            )
+
+    for event in _memory_event_payloads(agent, "action"):
+        action_choice = event.get("action")
+        if (
+            not isinstance(action_choice, dict)
+            or action_choice.get("name") != "speak_to"
+        ):
+            continue
+        arguments = action_choice.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        recipients = arguments.get("listener_agents_unique_ids", ())
+        if isinstance(recipients, list | tuple):
+            partner_ids.update(
+                recipient for recipient in recipients if not isinstance(recipient, bool)
+            )
+
+    return partner_ids
+
+
+def get_eligible_recipients(agent, observation, recipient_type: str) -> list[dict]:
+    """Return visible and recent dialogue partners with explicit integer IDs."""
+    visible_labels = set(observation.local_state)
+    recent_partner_ids = _recent_dialogue_partner_ids(agent)
+    recipients = []
+
+    for candidate in agent.model.agents:
+        label = f"{type(candidate).__name__} {candidate.unique_id}"
+        is_visible = label in visible_labels
+        is_recent_partner = candidate.unique_id in recent_partner_ids
+        if (
+            candidate is agent
+            or type(candidate).__name__ != recipient_type
+            or not (is_visible or is_recent_partner)
+        ):
+            continue
+        recipients.append(
+            {
+                "label": label,
+                "unique_id": int(candidate.unique_id),
+                "currently_visible": is_visible,
+                "recent_dialogue_partner": is_recent_partner,
+            }
+        )
+
+    return sorted(recipients, key=lambda recipient: recipient["unique_id"])
+
+
+def get_recipient_prompt(recipients: list[dict]) -> str:
+    """Format visible identities and the strict speak_to argument contract."""
+    if not recipients:
+        return (
+            "Eligible speak_to recipients: []. No eligible recipient is available. "
+            "Do not invent a recipient ID. If speak_to is the only available action, "
+            "set listener_agents_unique_ids to []. "
+        )
+
+    example_recipient = recipients[0]
+    example_ids = json.dumps([example_recipient["unique_id"]])
+    return (
+        f"Eligible speak_to recipients: {json.dumps(recipients)}. "
+        "When using speak_to, set listener_agents_unique_ids to a JSON list "
+        "of the raw integer unique_id values shown above. For example, to target "
+        f"{example_recipient['label']}, use {example_ids}. "
+        "Never pass agent labels or names. "
+    )
 
 
 def get_dialogue_history(agent, max_messages: int = 5) -> str:
@@ -89,18 +196,22 @@ class SellerAgent(LLMAgent):
 
         self.sales = 0
 
-    def step(self):
-        observation = self.generate_obs()
-        dialogue_history = get_dialogue_history(self)
-
-        prompt = (
+    def _seller_step_prompt(self, observation, dialogue_history):
+        eligible_buyers = get_eligible_recipients(self, observation, "BuyerAgent")
+        return (
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
+            f"{get_recipient_prompt(eligible_buyers)}"
             "Don't move around. If there are any buyers in your cell or in the neighboring cells, "
             "pitch them your product using the speak_to action. "
             "Talk to them until they agree or definitely refuse to buy your product. "
             "Use the dialogue history to inform your next response (e.g., if you already offered a price, stick to it or negotiate)."
         )
+
+    def step(self):
+        observation = self.generate_obs()
+        dialogue_history = get_dialogue_history(self)
+        prompt = self._seller_step_prompt(observation, dialogue_history)
 
         self.act(
             prompt=[f"OBSERVATION:\n{observation}", prompt],
@@ -110,15 +221,7 @@ class SellerAgent(LLMAgent):
     async def astep(self):
         observation = self.generate_obs()
         dialogue_history = get_dialogue_history(self)
-
-        prompt = (
-            f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
-            "INSTRUCTIONS:\n"
-            "Don't move around. If there are any buyers in your cell or in the neighboring cells, "
-            "pitch them your product using the speak_to action. "
-            "Talk to them until they agree or definitely refuse to buy your product. "
-            "Use the dialogue history to inform your next response."
-        )
+        prompt = self._seller_step_prompt(observation, dialogue_history)
 
         await self.aact(
             prompt=[f"OBSERVATION:\n{observation}", prompt],
@@ -152,10 +255,9 @@ class BuyerAgent(LLMAgent):
         self.products = []
 
     def _buyer_step_prompt_and_actions(self, observation, dialogue_history):
+        eligible_sellers = get_eligible_recipients(self, observation, "SellerAgent")
         visible_sellers = [
-            agent_label
-            for agent_label in observation.local_state
-            if agent_label.startswith("SellerAgent ")
+            seller for seller in eligible_sellers if seller["currently_visible"]
         ]
         has_dialogue = dialogue_history != "No recent dialogue."
 
@@ -171,9 +273,9 @@ class BuyerAgent(LLMAgent):
 
         if visible_sellers or has_dialogue:
             seller_context = (
-                f"Visible sellers: {', '.join(visible_sellers)}. "
-                if visible_sellers
-                else ""
+                get_recipient_prompt(eligible_sellers)
+                if eligible_sellers
+                else get_recipient_prompt([])
             )
             next_action_instruction = (
                 "Use speak_to to ask or answer sellers, or use buy_product if "
