@@ -160,21 +160,9 @@ def move_one_step(agent: Any, direction: str) -> str:
 
     grid = getattr(agent.model, "grid", None)
     if isinstance(grid, OrthogonalMooreGrid | OrthogonalVonNeumannGrid):
-        row, col = _get_agent_position(agent)
-        drow, dcol = direction_map_row_col[direction]
-        new_pos = (row + drow, col + dcol)
-
-        if grid.torus:
-            dimensions = grid.dimensions
-            if len(dimensions) == len(new_pos):
-                new_pos = tuple(coord % dim for coord, dim in zip(new_pos, dimensions))
-        elif new_pos not in grid._cells:
-            return (
-                f"Agent {agent.unique_id} is at the boundary and cannot move "
-                f"{direction}. Try a different direction."
-            )
-
-        target_cell = grid._cells.get(new_pos)
+        current_cell = getattr(agent, "cell", None)
+        connections = getattr(current_cell, "connections", {})
+        target_cell = connections.get(direction_map_row_col[direction])
         if target_cell is None:
             return (
                 f"Agent {agent.unique_id} is at the boundary and cannot move "
@@ -188,7 +176,8 @@ def move_one_step(agent: Any, direction: str) -> str:
             )
 
         target_coordinates = tuple(target_cell.coordinate)
-        return teleport_to_location(agent, target_coordinates)
+        agent.cell = target_cell
+        return f"agent {agent.unique_id} moved to {target_coordinates}."
 
     space = getattr(agent.model, "space", None)
     grid_or_space = None
