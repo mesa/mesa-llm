@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 
@@ -17,6 +17,10 @@ from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
+
+
+class _UnsupportedActionPayload:
+    pass
 
 
 @pytest.fixture(autouse=True)
@@ -123,6 +127,165 @@ def test_action_schema_exposes_literal_and_nullable_union():
         ],
         "description": "Optional selected value.",
     }
+
+
+def test_action_schema_exposes_unambiguous_integral_numeric_literals():
+    @action
+    def select_numeric_value(
+        agent,
+        float_value: Literal[1.0],
+        integer_value: Literal[1],
+    ) -> tuple[float, int]:
+        """Select numeric literal values.
+
+        Args:
+            float_value: Float literal to select.
+            integer_value: Integer literal to select.
+
+        Returns:
+            The selected values.
+        """
+        del agent
+        return float_value, integer_value
+
+    properties = select_numeric_value.__action_schema__["parameters"]["properties"]
+
+    assert properties["float_value"] == {
+        "type": "number",
+        "enum": [1.0],
+        "description": "Float literal to select.",
+    }
+    assert properties["integer_value"] == {
+        "type": "integer",
+        "enum": [1],
+        "description": "Integer literal to select.",
+    }
+
+
+def test_action_schema_rejects_ambiguous_numeric_literal_without_registration():
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+
+        @action
+        def select_numeric_value(agent, value: Literal[1, 1.0]) -> int | float:
+            """Select a numeric value.
+
+            Args:
+                value: Numeric value to select.
+
+            Returns:
+                The selected value.
+            """
+            del agent
+            return value
+
+    assert "select_numeric_value" not in _GLOBAL_ACTION_REGISTRY
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        Literal[1] | Literal[1.0],
+        list[Literal[1] | Literal[1.0]],
+    ],
+    ids=["split-union", "nested-split-union"],
+)
+def test_action_schema_rejects_split_ambiguous_numeric_literal_without_registration(
+    annotation,
+):
+    def select_numeric_value(agent, value) -> int | float:
+        """Select a numeric value.
+
+        Args:
+            value: Numeric value to select.
+
+        Returns:
+            The selected value.
+        """
+        del agent
+        return value
+
+    select_numeric_value.__annotations__["value"] = annotation
+
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+        action(select_numeric_value)
+
+    assert "select_numeric_value" not in _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(select_numeric_value, "__action_metadata__")
+    assert not hasattr(select_numeric_value, "__action_schema__")
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        list[Literal[1]] | set[Literal[1.0]],
+        dict[str, list[Literal[1]]] | dict[str, set[Literal[1.0]]],
+    ],
+    ids=["collection-branches", "nested-dictionary-branches"],
+)
+def test_action_schema_rejects_structurally_ambiguous_literal_without_side_effects(
+    annotation,
+):
+    mutations = []
+
+    def select_numeric_value(agent, value) -> int | float:
+        """Select a numeric value.
+
+        Args:
+            value: Numeric value to select.
+
+        Returns:
+            The selected value.
+        """
+        mutations.append((agent, value))
+        return value
+
+    select_numeric_value.__annotations__["value"] = annotation
+
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+        action(select_numeric_value)
+
+    assert "select_numeric_value" not in _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(select_numeric_value, "__action_metadata__")
+    assert not hasattr(select_numeric_value, "__action_schema__")
+    assert mutations == []
+
+
+def test_action_rejects_empty_literal_without_registration_or_mutation():
+    mutations = []
+
+    def select_value(agent, value) -> str:
+        """Select a literal value.
+
+        Args:
+            value: Literal value to select.
+
+        Returns:
+            Selection confirmation.
+        """
+        mutations.append((agent, value))
+        return "selected"
+
+    select_value.__annotations__["value"] = Literal[()]
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(select_value)
+
+    message = str(exc_info.value)
+    assert "Literal" in message
+    assert "empty" in message.lower() or "at least one" in message.lower()
+    assert "select_value" not in _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(select_value, "__action_metadata__")
+    assert not hasattr(select_value, "__action_schema__")
+    assert mutations == []
 
 
 def test_action_omits_agent_parameter_from_schema_by_default():
@@ -351,6 +514,181 @@ def test_action_schema_ignores_string_llm_agent_parameter_annotation():
     assert set(params["properties"]) == {"note"}
     assert params["required"] == ["note"]
     assert "agent" not in inspect_agent.__action_metadata__.parameters
+
+
+def test_action_rejects_missing_exposed_parameter_annotation_without_registration():
+    def apply_payload(agent, payload) -> str:
+        """Apply a payload.
+
+        Args:
+            payload: Payload to apply.
+
+        Returns:
+            Payload confirmation.
+        """
+        del agent, payload
+        return "applied"
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(apply_payload)
+
+    message = str(exc_info.value)
+    assert "apply_payload" in message
+    assert "payload" in message
+    assert "annotation" in message.lower()
+    assert "apply_payload" not in _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(apply_payload, "__action_metadata__")
+    assert not hasattr(apply_payload, "__action_schema__")
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        Any,
+        object,
+        _UnsupportedActionPayload,
+        list[Any],
+        list[_UnsupportedActionPayload],
+        dict[str, object],
+        list,
+        dict,
+        tuple,
+        set,
+    ],
+    ids=[
+        "any",
+        "object",
+        "custom",
+        "nested-any",
+        "nested-custom",
+        "nested-object",
+        "bare-list",
+        "bare-dict",
+        "bare-tuple",
+        "bare-set",
+    ],
+)
+def test_action_rejects_unsupported_or_unconstrained_parameter_annotation(
+    annotation,
+):
+    def apply_payload(agent, payload) -> str:
+        """Apply a payload.
+
+        Args:
+            payload: Payload to apply.
+
+        Returns:
+            Payload confirmation.
+        """
+        del agent, payload
+        return "applied"
+
+    apply_payload.__annotations__["payload"] = annotation
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(apply_payload)
+
+    message = str(exc_info.value)
+    assert "apply_payload" in message
+    assert "payload" in message
+    assert "annotation" in message.lower()
+    assert "apply_payload" not in _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(apply_payload, "__action_metadata__")
+    assert not hasattr(apply_payload, "__action_schema__")
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        set[list[int]],
+        set[tuple[int, list[int]]],
+        set[set[int]],
+        set[dict[str, int]],
+    ],
+    ids=[
+        "list-element",
+        "nested-list-element",
+        "set-element",
+        "dict-element",
+    ],
+)
+def test_action_rejects_recursively_unhashable_set_element_annotation(
+    annotation,
+):
+    def apply_values(agent, values) -> str:
+        """Apply a set of values.
+
+        Args:
+            values: Values to apply.
+
+        Returns:
+            Application confirmation.
+        """
+        del agent, values
+        return "applied"
+
+    apply_values.__annotations__["values"] = annotation
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(apply_values)
+
+    message = str(exc_info.value)
+    assert "apply_values" in message
+    assert "values" in message
+    assert "hashable" in message.lower() or "set element" in message.lower()
+    assert "apply_values" not in _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(apply_values, "__action_metadata__")
+    assert not hasattr(apply_values, "__action_schema__")
+
+
+def test_action_exempts_injected_agent_and_return_annotations_from_contract():
+    @action
+    def inspect_payload(
+        agent: Any,
+        payload: list[int],
+    ) -> _UnsupportedActionPayload:
+        """Inspect a payload.
+
+        Args:
+            payload: Integer payload to inspect.
+
+        Returns:
+            Inspection result.
+        """
+        del agent, payload
+        return _UnsupportedActionPayload()
+
+    params = inspect_payload.__action_schema__["parameters"]
+
+    assert params["properties"] == {
+        "payload": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": "Integer payload to inspect.",
+        }
+    }
+    assert params["required"] == ["payload"]
+
+
+def test_action_preserves_supported_fixed_tuple_annotation():
+    @action
+    def move_to(agent, coordinates: tuple[int, int]) -> tuple[int, int]:
+        """Move to fixed coordinates.
+
+        Args:
+            coordinates: Coordinates to move to.
+
+        Returns:
+            The selected coordinates.
+        """
+        del agent
+        return coordinates
+
+    assert move_to.__action_schema__["parameters"]["properties"]["coordinates"] == {
+        "type": "array",
+        "items": {"type": "integer"},
+        "description": "Coordinates to move to.",
+    }
 
 
 def test_action_rejects_non_agent_positional_only_parameter():

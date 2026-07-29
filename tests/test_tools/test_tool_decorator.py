@@ -1,6 +1,6 @@
 import math
 from enum import Enum
-from typing import Literal
+from typing import ClassVar, Final, Literal
 
 import pytest
 
@@ -135,6 +135,76 @@ class TestToolDecoractor:
             "type": "number",
             "enum": [1.5, 2.5],
         }
+        assert _python_to_json_type(Literal[1.0]) == {
+            "type": "number",
+            "enum": [1.0],
+        }
+
+    @pytest.mark.parametrize(
+        "literal_type",
+        [Literal[1, 1.0], Literal[1.0, 1]],
+        ids=["integer-first", "float-first"],
+    )
+    def test_python_to_json_type_rejects_ambiguous_numeric_literals(
+        self,
+        literal_type,
+    ):
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            _python_to_json_type(literal_type)
+
+    @pytest.mark.parametrize(
+        "literal_type",
+        [
+            Literal[1] | Literal[1.0],
+            list[Literal[1] | Literal[1.0]],
+        ],
+        ids=["split-union", "nested-split-union"],
+    )
+    def test_python_to_json_type_rejects_split_ambiguous_numeric_literals(
+        self,
+        literal_type,
+    ):
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            _python_to_json_type(literal_type)
+
+    @pytest.mark.parametrize(
+        "literal_type",
+        [
+            list[Literal[1]] | set[Literal[1.0]],
+            dict[str, list[Literal[1]]] | dict[str, set[Literal[1.0]]],
+        ],
+        ids=["collection-branches", "nested-dictionary-branches"],
+    )
+    def test_python_to_json_type_rejects_structurally_ambiguous_numeric_literals(
+        self,
+        literal_type,
+    ):
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            _python_to_json_type(literal_type)
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            type[Literal[1] | Literal[1.0]],
+            ClassVar[Literal[1] | Literal[1.0]],
+            Final[Literal[1] | Literal[1.0]],
+        ],
+        ids=["type", "class-var", "final"],
+    )
+    def test_python_to_json_type_preserves_unsupported_generic_fallback(
+        self,
+        annotation,
+    ):
+        assert _python_to_json_type(annotation) == {"type": "object"}
 
     def test_python_to_json_type_heterogeneous_json_literal_omits_type(self):
         assert _python_to_json_type(Literal["a", 2, False, None, 1.5]) == {
@@ -222,6 +292,148 @@ class TestToolDecoractor:
             }
         finally:
             _GLOBAL_TOOL_REGISTRY.pop("select_value", None)
+
+    def test_tool_schema_rejects_ambiguous_numeric_literal_without_registration(self):
+        _GLOBAL_TOOL_REGISTRY.pop("select_numeric_value", None)
+
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+
+            @tool
+            def select_numeric_value(agent, value: Literal[1, 1.0]) -> int | float:
+                """Select a numeric value.
+
+                Args:
+                    agent: The agent making the request.
+                    value: Numeric value to select.
+
+                Returns:
+                    The selected value.
+                """
+                del agent
+                return value
+
+        assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            Literal[1] | Literal[1.0],
+            list[Literal[1] | Literal[1.0]],
+        ],
+        ids=["split-union", "nested-split-union"],
+    )
+    def test_tool_schema_rejects_split_ambiguous_numeric_literal_without_registration(
+        self,
+        annotation,
+    ):
+        _GLOBAL_TOOL_REGISTRY.pop("select_numeric_value", None)
+
+        def select_numeric_value(agent, value) -> int | float:
+            """Select a numeric value.
+
+            Args:
+                agent: The agent making the request.
+                value: Numeric value to select.
+
+            Returns:
+                The selected value.
+            """
+            del agent
+            return value
+
+        select_numeric_value.__annotations__["value"] = annotation
+
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            tool(select_numeric_value)
+
+        assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            list[Literal[1]] | set[Literal[1.0]],
+            dict[str, list[Literal[1]]] | dict[str, set[Literal[1.0]]],
+        ],
+        ids=["collection-branches", "nested-dictionary-branches"],
+    )
+    def test_tool_schema_rejects_structurally_ambiguous_literal_without_side_effects(
+        self,
+        annotation,
+    ):
+        _GLOBAL_TOOL_REGISTRY.pop("select_numeric_value", None)
+        mutations = []
+
+        def select_numeric_value(agent, value) -> int | float:
+            """Select a numeric value.
+
+            Args:
+                agent: The agent making the request.
+                value: Numeric value to select.
+
+            Returns:
+                The selected value.
+            """
+            mutations.append((agent, value))
+            return value
+
+        select_numeric_value.__annotations__["value"] = annotation
+
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            tool(select_numeric_value)
+
+        assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
+        assert mutations == []
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            type[Literal[1] | Literal[1.0]],
+            ClassVar[Literal[1] | Literal[1.0]],
+            Final[Literal[1] | Literal[1.0]],
+        ],
+        ids=["type", "class-var", "final"],
+    )
+    def test_tool_schema_preserves_unsupported_generic_object_fallback(
+        self,
+        annotation,
+    ):
+        _GLOBAL_TOOL_REGISTRY.pop("inspect_legacy_value", None)
+
+        def inspect_legacy_value(agent, value) -> str:
+            """Inspect a legacy generic value.
+
+            Args:
+                agent: The agent making the request.
+                value: Value to inspect.
+
+            Returns:
+                Inspection confirmation.
+            """
+            del agent, value
+            return "inspected"
+
+        inspect_legacy_value.__annotations__["value"] = annotation
+        decorated_tool = tool(inspect_legacy_value)
+
+        try:
+            properties = decorated_tool.__tool_schema__["function"]["parameters"][
+                "properties"
+            ]
+            assert properties["value"] == {
+                "type": "object",
+                "description": "Value to inspect.",
+            }
+        finally:
+            _GLOBAL_TOOL_REGISTRY.pop("inspect_legacy_value", None)
 
     def test_tool(self):
         _GLOBAL_TOOL_REGISTRY.clear()

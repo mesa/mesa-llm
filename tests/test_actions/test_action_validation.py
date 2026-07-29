@@ -5,7 +5,7 @@ import gc
 import math
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import pytest
 
@@ -347,7 +347,7 @@ def test_execute_accepts_declared_literal_and_rejects_undeclared_before_mutation
     assert agent.mode == "b"
 
 
-def test_execute_literal_validation_requires_exact_type_and_value_before_mutation():
+def test_execute_numeric_literal_validation_normalizes_schema_equivalent_numbers():
     @action
     def set_integer(agent, value: Literal[1]) -> int:
         """Set an integer literal.
@@ -357,6 +357,19 @@ def test_execute_literal_validation_requires_exact_type_and_value_before_mutatio
 
         Returns:
             Applied integer.
+        """
+        agent.values.append(value)
+        return value
+
+    @action
+    def set_float(agent, value: Literal[1.0]) -> float:
+        """Set a float literal.
+
+        Args:
+            value: Float literal to apply.
+
+        Returns:
+            Applied float.
         """
         agent.values.append(value)
         return value
@@ -375,23 +388,37 @@ def test_execute_literal_validation_requires_exact_type_and_value_before_mutatio
         return value
 
     agent = SimpleNamespace(values=[])
-    manager = ActionManager(actions=[set_integer, set_boolean])
+    manager = ActionManager(actions=[set_integer, set_float, set_boolean])
 
-    assert (
-        manager.execute(
-            agent,
-            ActionChoice(name="set_integer", arguments={"value": 1}),
-        )
-        == 1
+    integer_result = manager.execute(
+        agent,
+        ActionChoice(name="set_integer", arguments={"value": 1.0}),
     )
+    assert integer_result == 1
+    assert type(integer_result) is int
     assert agent.values == [1]
+
+    float_result = manager.execute(
+        agent,
+        ActionChoice(name="set_float", arguments={"value": 1}),
+    )
+    assert float_result == 1.0
+    assert type(float_result) is float
+    assert agent.values == [1, 1.0]
 
     with pytest.raises(ValueError, match=r"Invalid argument type.*value.*one of"):
         manager.execute(
             agent,
             ActionChoice(name="set_integer", arguments={"value": True}),
         )
-    assert agent.values == [1]
+    assert agent.values == [1, 1.0]
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*value.*one of"):
+        manager.execute(
+            agent,
+            ActionChoice(name="set_float", arguments={"value": True}),
+        )
+    assert agent.values == [1, 1.0]
 
     assert (
         manager.execute(
@@ -400,14 +427,56 @@ def test_execute_literal_validation_requires_exact_type_and_value_before_mutatio
         )
         is True
     )
-    assert agent.values == [1, True]
+    assert agent.values == [1, 1.0, True]
 
     with pytest.raises(ValueError, match=r"Invalid argument type.*value.*one of"):
         manager.execute(
             agent,
             ActionChoice(name="set_boolean", arguments={"value": 1}),
         )
-    assert agent.values == [1, True]
+    assert agent.values == [1, 1.0, True]
+
+
+def test_execute_nonintegral_and_nonnumeric_literals_remain_exact_before_mutation():
+    @action
+    def set_value(agent, value: Literal[1.5, "ready"]) -> float | str:
+        """Set an exact literal value.
+
+        Args:
+            value: Exact value to apply.
+
+        Returns:
+            Applied value.
+        """
+        agent.values.append(value)
+        return value
+
+    agent = SimpleNamespace(values=[])
+    manager = ActionManager(actions=[set_value])
+
+    assert (
+        manager.execute(
+            agent,
+            ActionChoice(name="set_value", arguments={"value": 1.5}),
+        )
+        == 1.5
+    )
+    assert (
+        manager.execute(
+            agent,
+            ActionChoice(name="set_value", arguments={"value": "ready"}),
+        )
+        == "ready"
+    )
+    assert agent.values == [1.5, "ready"]
+
+    with pytest.raises(ValueError, match=r"Invalid argument type.*value.*one of"):
+        manager.execute(
+            agent,
+            ActionChoice(name="set_value", arguments={"value": 1}),
+        )
+
+    assert agent.values == [1.5, "ready"]
 
 
 @pytest.mark.parametrize(
@@ -447,7 +516,38 @@ def test_validate_accepts_every_nullable_union_member(value, expected):
     assert agent.value == "unchanged"
 
 
+def test_execute_annotated_action_parameter_uses_consistent_schema_and_runtime_type():
+    @action
+    def set_priority(agent, priority: Annotated[int, "priority"]) -> int:
+        """Set a typed priority.
+
+        Args:
+            priority: Priority to apply.
+
+        Returns:
+            Applied priority.
+        """
+        agent.priorities.append(priority)
+        return priority
+
+    schema = set_priority.__action_schema__["parameters"]["properties"]["priority"]
+    agent = SimpleNamespace(priorities=[])
+    manager = ActionManager(actions=[set_priority])
+
+    result = manager.execute(
+        agent,
+        ActionChoice(name="set_priority", arguments={"priority": "2"}),
+    )
+
+    assert schema == {"type": "integer", "description": "Priority to apply."}
+    assert result == 2
+    assert type(result) is int
+    assert agent.priorities == [2]
+
+
 def test_execute_unresolved_postponed_non_agent_annotation_fails_closed_before_mutation():
+    mutations = []
+
     def apply_payload(agent: LLMAgent, payload: MissingPayloadType) -> str:
         """Apply a typed payload.
 
@@ -457,25 +557,129 @@ def test_execute_unresolved_postponed_non_agent_annotation_fails_closed_before_m
         Returns:
             Payload confirmation.
         """
-        agent.applied_payloads.append(payload)
+        mutations.append((agent, payload))
         return "applied"
-
-    agent = SimpleNamespace(applied_payloads=[])
-    manager = ActionManager(actions=[apply_payload])
 
     with pytest.raises(
         ValueError,
         match=r"Could not resolve annotation.*payload.*MissingPayloadType",
     ):
-        manager.execute(
-            agent,
-            ActionChoice(
-                name="apply_payload",
-                arguments={"payload": {"value": 1}},
-            ),
-        )
+        ActionManager(actions=[apply_payload])
 
-    assert agent.applied_payloads == []
+    assert mutations == []
+
+
+def test_direct_undecorated_action_with_missing_annotation_fails_before_registration():
+    mutations = []
+
+    def apply_payload(agent, payload) -> str:
+        """Apply an untyped payload.
+
+        Args:
+            payload: Payload to apply.
+
+        Returns:
+            Payload confirmation.
+        """
+        mutations.append((agent, payload))
+        return "applied"
+
+    manager = ActionManager()
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        manager.register(apply_payload)
+
+    message = str(exc_info.value)
+    assert "apply_payload" in message
+    assert "payload" in message
+    assert "annotation" in message.lower()
+    assert manager.actions == {}
+    assert mutations == []
+
+
+def test_direct_undecorated_action_with_unsupported_annotation_fails_before_registration():
+    mutations = []
+
+    def apply_payload(agent, payload: object) -> str:
+        """Apply an unsupported payload.
+
+        Args:
+            payload: Payload to apply.
+
+        Returns:
+            Payload confirmation.
+        """
+        mutations.append((agent, payload))
+        return "applied"
+
+    manager = ActionManager()
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        manager.register(apply_payload)
+
+    message = str(exc_info.value)
+    assert "apply_payload" in message
+    assert "payload" in message
+    assert "annotation" in message.lower()
+    assert manager.actions == {}
+    assert mutations == []
+
+
+def test_direct_undecorated_action_with_unhashable_set_items_fails_before_registration():
+    mutations = []
+
+    def apply_values(agent, values: set[list[int]]) -> str:
+        """Apply a set of values.
+
+        Args:
+            values: Values to apply.
+
+        Returns:
+            Application confirmation.
+        """
+        mutations.append((agent, values))
+        return "applied"
+
+    manager = ActionManager()
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        manager.register(apply_values)
+
+    message = str(exc_info.value)
+    assert "apply_values" in message
+    assert "values" in message
+    assert "hashable" in message.lower() or "set element" in message.lower()
+    assert manager.actions == {}
+    assert mutations == []
+
+
+def test_execute_supports_hashable_nested_set_element_annotation():
+    @action
+    def apply_values(agent, values: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        """Apply a set of coordinate values.
+
+        Args:
+            values: Coordinate values to apply.
+
+        Returns:
+            Applied coordinate values.
+        """
+        agent.values = values
+        return values
+
+    agent = SimpleNamespace(values=None)
+    manager = ActionManager(actions=[apply_values])
+
+    result = manager.execute(
+        agent,
+        ActionChoice(
+            name="apply_values",
+            arguments={"values": [[1, 2], [3, 4]]},
+        ),
+    )
+
+    assert result == {(1, 2), (3, 4)}
+    assert agent.values == {(1, 2), (3, 4)}
 
 
 def test_validate_does_not_execute_action_or_mutate_state():

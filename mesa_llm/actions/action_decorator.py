@@ -5,6 +5,7 @@ import inspect
 import typing
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from types import UnionType
 from typing import TYPE_CHECKING, Any, get_type_hints
 
 from mesa_llm.tools.tool_decorator import _parse_docstring, _python_to_json_type
@@ -33,6 +34,10 @@ class ActionAnnotationResolutionError(ValueError):
     """Raised when a non-agent action parameter annotation cannot be resolved."""
 
 
+class ActionAnnotationContractError(TypeError):
+    """Raised when an action annotation cannot be validated and exposed safely."""
+
+
 class ActionSignatureError(ValueError):
     """Raised when an action signature cannot be exposed as JSON arguments."""
 
@@ -54,21 +59,42 @@ def _get_action_type_hints(
 ) -> dict[str, Any]:
     """Resolve type hints for non-agent action parameters only."""
     annotations = getattr(func, "__annotations__", {})
-    if not annotations:
-        return {}
+    if parameter_names is None:
+        selected_names = [
+            param_name
+            for param_name in annotations
+            if param_name != "return" and param_name.lower() != "agent"
+        ]
+    else:
+        selected_names = [
+            param_name
+            for param_name in parameter_names
+            if param_name.lower() != "agent"
+        ]
 
-    allowed_names = set(parameter_names) if parameter_names is not None else None
     type_hints = {}
-    for param_name, annotation in annotations.items():
-        if param_name == "return" or param_name.lower() == "agent":
-            continue
-        if allowed_names is not None and param_name not in allowed_names:
-            continue
-        type_hints[param_name] = _resolve_action_annotation(
+    for param_name in selected_names:
+        if param_name not in annotations:
+            raise ActionAnnotationContractError(
+                "Action "
+                f"{getattr(func, '__name__', repr(func))!r} parameter "
+                f"{param_name!r} must have a supported runtime annotation. "
+                "Only the framework-injected 'agent' parameter may be "
+                "unannotated."
+            )
+
+        resolved_annotation = _resolve_action_annotation(
             func,
             param_name,
-            annotation,
+            annotations[param_name],
         )
+        normalized_annotation = _normalize_action_parameter_annotation(
+            func,
+            param_name,
+            resolved_annotation,
+        )
+        _python_to_json_type(normalized_annotation)
+        type_hints[param_name] = normalized_annotation
     return type_hints
 
 
@@ -108,6 +134,233 @@ def _get_action_annotation_globalns(func: Callable) -> dict[str, Any]:
     return globalns
 
 
+def _normalize_action_parameter_annotation(
+    func: Callable,
+    param_name: str,
+    annotation: Any,
+    *,
+    annotation_path: str | None = None,
+) -> Any:
+    """Validate and normalize one model-exposed action parameter annotation."""
+    annotation_path = annotation_path or param_name
+
+    if annotation is Any or annotation is object:
+        raise _unsupported_action_annotation_error(
+            func,
+            param_name,
+            annotation_path,
+            annotation,
+            "unconstrained Any/object annotations are not supported",
+        )
+
+    if annotation in {int, float, str, bool, type(None)}:
+        return annotation
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    if origin is typing.Annotated:
+        if not args:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "Annotated must include a supported base annotation",
+            )
+        return _normalize_action_parameter_annotation(
+            func,
+            param_name,
+            args[0],
+            annotation_path=annotation_path,
+        )
+
+    if origin is typing.Literal:
+        if not args:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "Literal must contain at least one value",
+            )
+        _python_to_json_type(annotation)
+        return annotation
+
+    if origin in {typing.Union, UnionType}:
+        if not args:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "unions must contain supported member annotations",
+            )
+        normalized_args = tuple(
+            _normalize_action_parameter_annotation(
+                func,
+                param_name,
+                member,
+                annotation_path=f"{annotation_path}.union[{index}]",
+            )
+            for index, member in enumerate(args)
+        )
+        normalized_union = normalized_args[0]
+        for member in normalized_args[1:]:
+            normalized_union |= member
+        return normalized_union
+
+    if origin in {list, set}:
+        if len(args) != 1:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "collections must declare one supported item annotation",
+            )
+        item_annotation = _normalize_action_parameter_annotation(
+            func,
+            param_name,
+            args[0],
+            annotation_path=f"{annotation_path}.item",
+        )
+        if origin is list:
+            return list[item_annotation]
+        if not _action_annotation_produces_hashable_value(item_annotation):
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                f"{annotation_path}.item",
+                args[0],
+                "set elements must normalize to hashable runtime values",
+            )
+        return set[item_annotation]
+
+    if origin is tuple:
+        if not args:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "tuples must declare supported item annotations",
+            )
+        if len(args) == 2 and args[1] is Ellipsis:
+            item_annotation = _normalize_action_parameter_annotation(
+                func,
+                param_name,
+                args[0],
+                annotation_path=f"{annotation_path}.item",
+            )
+            return tuple[item_annotation, ...]
+        if Ellipsis in args:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "ellipsis is supported only in tuple[T, ...]",
+            )
+        item_annotations = tuple(
+            _normalize_action_parameter_annotation(
+                func,
+                param_name,
+                item_annotation,
+                annotation_path=f"{annotation_path}[{index}]",
+            )
+            for index, item_annotation in enumerate(args)
+        )
+        return tuple[item_annotations]
+
+    if origin is dict:
+        if len(args) != 2:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "dictionaries must declare string keys and a supported value type",
+            )
+        key_annotation = _normalize_action_parameter_annotation(
+            func,
+            param_name,
+            args[0],
+            annotation_path=f"{annotation_path}.key",
+        )
+        if key_annotation is not str:
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                f"{annotation_path}.key",
+                args[0],
+                "JSON object schemas support only unconstrained string keys",
+            )
+        value_annotation = _normalize_action_parameter_annotation(
+            func,
+            param_name,
+            args[1],
+            annotation_path=f"{annotation_path}.value",
+        )
+        return dict[str, value_annotation]
+
+    if annotation in {list, tuple, set, dict}:
+        raise _unsupported_action_annotation_error(
+            func,
+            param_name,
+            annotation_path,
+            annotation,
+            "bare collections are unconstrained; provide item/key/value annotations",
+        )
+
+    raise _unsupported_action_annotation_error(
+        func,
+        param_name,
+        annotation_path,
+        annotation,
+        "the annotation is not supported by action schema and runtime validation",
+    )
+
+
+def _action_annotation_produces_hashable_value(annotation: Any) -> bool:
+    """Return whether every value normalized for this annotation is hashable."""
+    if annotation in {int, float, str, bool, type(None)}:
+        return True
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    if origin is typing.Annotated:
+        return bool(args) and _action_annotation_produces_hashable_value(args[0])
+    if origin is typing.Literal:
+        return bool(args)
+    if origin in {typing.Union, UnionType}:
+        return bool(args) and all(
+            _action_annotation_produces_hashable_value(member) for member in args
+        )
+    if origin is tuple:
+        if len(args) == 2 and args[1] is Ellipsis:
+            return _action_annotation_produces_hashable_value(args[0])
+        return bool(args) and all(
+            _action_annotation_produces_hashable_value(member) for member in args
+        )
+    return False
+
+
+def _unsupported_action_annotation_error(
+    func: Callable,
+    param_name: str,
+    annotation_path: str,
+    annotation: Any,
+    reason: str,
+) -> ActionAnnotationContractError:
+    return ActionAnnotationContractError(
+        "Unsupported annotation for action "
+        f"{getattr(func, '__name__', repr(func))!r} parameter "
+        f"{param_name!r} at {annotation_path!r}: {annotation!r}; {reason}."
+    )
+
+
 def _get_action_parameters(
     func: Callable,
     signature: inspect.Signature | None = None,
@@ -141,6 +394,16 @@ def _get_action_parameters(
         )
 
     return action_params
+
+
+def _get_action_parameter_contract(
+    func: Callable,
+    signature: inspect.Signature | None = None,
+) -> tuple[dict[str, inspect.Parameter], dict[str, Any]]:
+    """Return validated non-agent parameters and normalized type hints."""
+    action_params = _get_action_parameters(func, signature)
+    type_hints = _get_action_type_hints(func, parameter_names=action_params)
+    return action_params, type_hints
 
 
 def _is_keyword_injectable_parameter(param: inspect.Parameter) -> bool:
@@ -210,15 +473,14 @@ def action(
     def decorator(func: Callable):
         name = func.__name__
         sig = inspect.signature(func)
-        action_params = _get_action_parameters(func, sig)
+        action_params, type_hints = _get_action_parameter_contract(func, sig)
         description, arg_docs, return_docs = _parse_docstring(func, ignore_agent=True)
 
-        type_hints = _get_action_type_hints(func, parameter_names=action_params)
         required_params = _get_required_action_parameter_names(action_params)
 
         properties = {}
         for param_name in action_params:
-            raw_type = type_hints.get(param_name, Any)
+            raw_type = type_hints[param_name]
             properties[param_name] = {
                 **_python_to_json_type(raw_type),
                 "description": arg_docs.get(param_name, ""),

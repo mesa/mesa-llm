@@ -22,6 +22,8 @@ from terminal_style import style
 
 from mesa_llm.actions.action_decorator import (
     _GLOBAL_ACTION_REGISTRY,
+    ActionAnnotationContractError,
+    _get_action_parameter_contract,
     _get_action_parameters,
     _get_action_type_hints,
     _get_required_action_parameter_names,
@@ -72,6 +74,7 @@ class ActionManager:
 
     def register(self, fn: Callable):
         """Register an action function by name."""
+        _get_action_parameter_contract(fn)
         self.actions[fn.__name__] = fn
 
     def register_many(self, actions: list[ActionRef] | tuple[ActionRef, ...]):
@@ -394,14 +397,9 @@ class ActionManager:
             parameter_names=contract["allowed"],
         )
 
-        if not type_hints:
-            return arguments
-
         coerced_arguments = dict(arguments)
         for argument_name in contract["allowed"]:
             if argument_name not in coerced_arguments:
-                continue
-            if argument_name not in type_hints:
                 continue
 
             coerced_arguments[argument_name] = self._validate_and_coerce_value(
@@ -422,15 +420,23 @@ class ActionManager:
         expected_type: Any,
     ) -> Any:
         expected_type = self._normalize_action_annotation(expected_type)
-        if expected_type is Any:
-            return value
+        if expected_type is Any or expected_type is object:
+            raise self._unsupported_runtime_action_annotation_error(
+                action_name,
+                argument_path,
+                expected_type,
+            )
 
         origin = get_origin(expected_type)
         args = get_args(expected_type)
 
         if origin is Annotated:
             if not args:
-                return value
+                raise self._unsupported_runtime_action_annotation_error(
+                    action_name,
+                    argument_path,
+                    expected_type,
+                )
             return self._validate_and_coerce_value(
                 action_name=action_name,
                 argument_path=argument_path,
@@ -448,16 +454,12 @@ class ActionManager:
             )
 
         if origin is Literal:
-            if any(
-                type(value) is type(candidate) and value == candidate
-                for candidate in args
-            ):
-                return value
-            raise self._invalid_action_argument_type_error(
-                action_name,
-                argument_path,
-                expected_type,
-                value,
+            return self._validate_and_coerce_literal_value(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=expected_type,
+                literal_values=args,
             )
 
         if expected_type is type(None):
@@ -519,7 +521,40 @@ class ActionManager:
                 args=args,
             )
 
-        return value
+        raise self._unsupported_runtime_action_annotation_error(
+            action_name,
+            argument_path,
+            expected_type,
+        )
+
+    def _validate_and_coerce_literal_value(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+        literal_values: tuple[Any, ...],
+    ) -> Any:
+        for candidate in literal_values:
+            if type(value) is type(candidate) and value == candidate:
+                return candidate
+
+        if type(value) in {int, float}:
+            numeric_matches = [
+                candidate
+                for candidate in literal_values
+                if type(candidate) in {int, float} and value == candidate
+            ]
+            if numeric_matches:
+                return numeric_matches[0]
+
+        raise self._invalid_action_argument_type_error(
+            action_name,
+            argument_path,
+            expected_type,
+            value,
+        )
 
     def _validate_and_coerce_union_value(
         self,
@@ -744,11 +779,22 @@ class ActionManager:
             "list": list,
             "None": type(None),
             "NoneType": type(None),
-            "object": Any,
+            "object": object,
             "set": set,
             "str": str,
             "tuple": tuple,
-        }.get(annotation, Any)
+        }.get(annotation, annotation)
+
+    def _unsupported_runtime_action_annotation_error(
+        self,
+        action_name: str,
+        argument_path: str,
+        expected_type: Any,
+    ) -> ActionAnnotationContractError:
+        return ActionAnnotationContractError(
+            "Unsupported annotation reached runtime validation for action "
+            f"{action_name!r} argument {argument_path!r}: {expected_type!r}."
+        )
 
     def _invalid_action_argument_type_error(
         self,

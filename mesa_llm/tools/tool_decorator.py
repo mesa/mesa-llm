@@ -8,6 +8,7 @@ import warnings
 from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     Literal,
     Union,
@@ -49,6 +50,132 @@ _RET_HEADER_RE = re.compile(r"^\s*Returns?:\s*$", re.IGNORECASE)
 _PARAM_LINE_RE = re.compile(r"^\s*(\w+)\s*:\s*(.+)$")
 
 
+def _validate_numeric_literal_schema_ambiguity(annotation: Any) -> None:
+    """Reject Python numeric Literal alternatives that JSON Schema conflates."""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Literal:
+        _reject_json_equivalent_numeric_literal_values(args)
+        return
+
+    if origin is Annotated:
+        if args:
+            _validate_numeric_literal_schema_ambiguity(args[0])
+        return
+
+    if origin is Union or (UnionType is not None and origin is UnionType):
+        numeric_values_by_branch = [
+            _nested_numeric_literal_values(member) for member in args
+        ]
+        for index, branch_values in enumerate(numeric_values_by_branch):
+            for other_branch_values in numeric_values_by_branch[index + 1 :]:
+                _reject_cross_branch_numeric_literal_ambiguity(
+                    branch_values,
+                    other_branch_values,
+                )
+        for member in args:
+            _validate_numeric_literal_schema_ambiguity(member)
+        return
+
+    if origin in {list, set}:
+        if args:
+            _validate_numeric_literal_schema_ambiguity(args[0])
+        return
+
+    if origin is tuple:
+        for item_annotation in args:
+            if item_annotation is not Ellipsis:
+                _validate_numeric_literal_schema_ambiguity(item_annotation)
+        return
+
+    if origin is dict and len(args) >= 2:
+        _validate_numeric_literal_schema_ambiguity(args[1])
+
+
+def _nested_numeric_literal_values(
+    annotation: Any,
+    annotation_path: tuple[tuple[Any, int], ...] = (),
+) -> list[tuple[tuple[tuple[Any, int], ...], int | float]]:
+    """Return numeric Literal values nested within one union member."""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Literal:
+        return [
+            (annotation_path, value) for value in args if type(value) in {int, float}
+        ]
+    if origin is Annotated and args:
+        return _nested_numeric_literal_values(args[0], annotation_path)
+    if origin is Union or (UnionType is not None and origin is UnionType):
+        return [
+            value
+            for member in args
+            for value in _nested_numeric_literal_values(member, annotation_path)
+        ]
+
+    if origin in {list, set} and args:
+        return _nested_numeric_literal_values(
+            args[0],
+            (*annotation_path, ("array", 0)),
+        )
+
+    if origin is tuple:
+        return [
+            value
+            for index, item_annotation in enumerate(args)
+            if item_annotation is not Ellipsis
+            for value in _nested_numeric_literal_values(
+                item_annotation,
+                (*annotation_path, (tuple, index)),
+            )
+        ]
+
+    if origin is dict and len(args) >= 2:
+        return _nested_numeric_literal_values(
+            args[1],
+            (*annotation_path, (dict, 1)),
+        )
+
+    return []
+
+
+def _reject_cross_branch_numeric_literal_ambiguity(
+    values: list[tuple[tuple[tuple[Any, int], ...], int | float]],
+    other_values: list[tuple[tuple[tuple[Any, int], ...], int | float]],
+) -> None:
+    for annotation_path, value in values:
+        for other_annotation_path, other_value in other_values:
+            if (
+                annotation_path == other_annotation_path
+                and type(value) is not type(other_value)
+                and value == other_value
+            ):
+                _raise_json_equivalent_numeric_literal_error(value, other_value)
+
+
+def _reject_json_equivalent_numeric_literal_values(
+    values: tuple[Any, ...] | list[int | float],
+) -> None:
+    numeric_values = [value for value in values if type(value) in {int, float}]
+    for index, value in enumerate(numeric_values):
+        for other_value in numeric_values[index + 1 :]:
+            if type(value) is not type(other_value) and value == other_value:
+                _raise_json_equivalent_numeric_literal_error(value, other_value)
+
+
+def _raise_json_equivalent_numeric_literal_error(
+    value: int | float,
+    other_value: int | float,
+) -> None:
+    raise TypeError(
+        "Literal schemas cannot contain JSON-equivalent numeric "
+        "values with different Python types; "
+        f"got {value!r} ({type(value).__name__}) and "
+        f"{other_value!r} ({type(other_value).__name__})."
+    )
+
+
 def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     """
     Convert Python type hints to JSON Schema type definitions.
@@ -62,6 +189,8 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     - Optional types: Optional[int], int | None
     - Nested types: list[tuple[int, str]]
     """
+
+    _validate_numeric_literal_schema_ambiguity(py_type)
 
     # Handle None type
     if py_type is type(None):
