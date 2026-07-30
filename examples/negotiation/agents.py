@@ -1,6 +1,6 @@
 import json
 
-from mesa_llm.actions import social_actions, teleport_to_location
+from mesa_llm.actions import ActionChoice, social_actions, teleport_to_location, wait
 from mesa_llm.llm_agent import LLMAgent
 
 
@@ -191,13 +191,12 @@ class SellerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            actions=social_actions(),
+            actions=[*social_actions(), wait],
         )
 
         self.sales = 0
 
-    def _seller_step_prompt(self, observation, dialogue_history):
-        eligible_buyers = get_eligible_recipients(self, observation, "BuyerAgent")
+    def _seller_step_prompt(self, dialogue_history, eligible_buyers):
         return (
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
@@ -210,8 +209,20 @@ class SellerAgent(LLMAgent):
 
     def step(self):
         observation = self.generate_obs()
+        eligible_buyers = get_eligible_recipients(
+            self,
+            observation,
+            "BuyerAgent",
+        )
+        if not eligible_buyers:
+            self.execute_action(
+                ActionChoice(name="wait", arguments={}),
+                actions=["wait"],
+            )
+            return
+
         dialogue_history = get_dialogue_history(self)
-        prompt = self._seller_step_prompt(observation, dialogue_history)
+        prompt = self._seller_step_prompt(dialogue_history, eligible_buyers)
 
         self.act(
             prompt=[f"OBSERVATION:\n{observation}", prompt],
@@ -220,8 +231,20 @@ class SellerAgent(LLMAgent):
 
     async def astep(self):
         observation = self.generate_obs()
+        eligible_buyers = get_eligible_recipients(
+            self,
+            observation,
+            "BuyerAgent",
+        )
+        if not eligible_buyers:
+            await self.aexecute_action(
+                ActionChoice(name="wait", arguments={}),
+                actions=["wait"],
+            )
+            return
+
         dialogue_history = get_dialogue_history(self)
-        prompt = self._seller_step_prompt(observation, dialogue_history)
+        prompt = self._seller_step_prompt(dialogue_history, eligible_buyers)
 
         await self.aact(
             prompt=[f"OBSERVATION:\n{observation}", prompt],
