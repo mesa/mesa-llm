@@ -1,3 +1,4 @@
+import json
 import math
 from enum import Enum
 
@@ -213,15 +214,55 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
             api_base=api_base,
         )
 
+    def _eligible_active_citizen_ids(self, observation) -> list[int]:
+        visible_labels = observation.local_state
+        eligible_ids = [
+            citizen.unique_id
+            for citizen in self.model.agents
+            if isinstance(citizen, Citizen)
+            and citizen.state is CitizenState.ACTIVE
+            and f"{citizen.__class__.__name__} {citizen.unique_id}" in visible_labels
+        ]
+        return sorted(eligible_ids)
+
+    def _action_selection_context(self, observation):
+        eligible_ids = self._eligible_active_citizen_ids(observation)
+        eligible_context = json.dumps({"eligible_active_citizen_ids": eligible_ids})
+
+        if not eligible_ids:
+            prompt = [
+                "Choose the available movement behavior for this step.",
+                f"OBSERVATION:\n{observation}",
+                (
+                    "ELIGIBLE ACTIVE CITIZENS:\n"
+                    f"{eligible_context}\n"
+                    "No currently visible active citizen is eligible. Move to a "
+                    "nearby cell."
+                ),
+            ]
+            return prompt, ["move_one_step"]
+
+        prompt = [
+            self.step_prompt,
+            f"OBSERVATION:\n{observation}",
+            (
+                "ARREST TARGETS:\n"
+                f"{eligible_context}\n"
+                "Only use arrest_citizen with one of these citizen IDs."
+            ),
+        ]
+        return prompt, ["move_one_step", "arrest_citizen"]
+
     def step(self):
         """
         Inspect local vision and arrest a random active agent. Move if
         applicable.
         """
         observation = self.generate_obs()
+        prompt, actions = self._action_selection_context(observation)
         self.act(
-            prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
-            actions=["move_one_step", "arrest_citizen"],
+            prompt=prompt,
+            actions=actions,
         )
 
     async def astep(self):
@@ -230,7 +271,8 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
         applicable.
         """
         observation = self.generate_obs()
+        prompt, actions = self._action_selection_context(observation)
         await self.aact(
-            prompt=[self.step_prompt, f"OBSERVATION:\n{observation}"],
-            actions=["move_one_step", "arrest_citizen"],
+            prompt=prompt,
+            actions=actions,
         )
