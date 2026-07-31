@@ -102,6 +102,12 @@ def _validate_continuous_space_coordinates(
 ) -> tuple[Any, ...]:
     """Reject coordinates that cannot safely represent a continuous position."""
     for coordinate in target_coordinates:
+        if isinstance(coordinate, bool):
+            raise ValueError(
+                "Continuous space coordinates must be finite real numbers; "
+                f"got {target_coordinates}."
+            )
+
         if not isinstance(coordinate, Real):
             raise ValueError(
                 "Continuous space coordinates must be finite real numbers; "

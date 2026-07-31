@@ -788,6 +788,37 @@ def test_teleport_to_location_continuousspace_rejects_non_finite_coordinates_bef
     _assert_continuous_space_agent_unchanged(model, agent, start)
 
 
+@pytest.mark.parametrize("managed", [False, True], ids=["direct", "managed"])
+@pytest.mark.parametrize("torus", [False, True], ids=["non-torus", "torus"])
+@pytest.mark.parametrize(
+    "target_coordinates",
+    [
+        (True, 3.0),
+        (2.0, False),
+    ],
+    ids=["boolean-x", "boolean-y"],
+)
+def test_teleport_to_location_continuousspace_rejects_boolean_coordinates_before_mutation(
+    managed,
+    torus,
+    target_coordinates,
+):
+    start = (1.25, 2.5)
+    model, agent = _continuous_space_agent(torus, start=start)
+
+    with pytest.raises(ValueError):
+        if managed:
+            _execute_spatial(
+                agent,
+                "teleport_to_location",
+                {"target_coordinates": target_coordinates},
+            )
+        else:
+            teleport_to_location(agent, target_coordinates)
+
+    _assert_continuous_space_agent_unchanged(model, agent, start)
+
+
 @pytest.mark.parametrize("torus", [False, True], ids=["non-torus", "torus"])
 def test_teleport_to_location_continuousspace_rejects_non_numeric_coordinates_before_mutation(
     torus,

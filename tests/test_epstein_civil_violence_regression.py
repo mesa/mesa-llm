@@ -1,5 +1,6 @@
 import json
 import random as process_random
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -8,6 +9,7 @@ from mesa.space import MultiGrid
 
 from examples.epstein_civil_violence.actions import arrest_citizen
 from examples.epstein_civil_violence.agents import Citizen, CitizenState, Cop
+from mesa_llm.actions import ActionChoice
 from mesa_llm.reasoning.react import ReActReasoning
 from mesa_llm.reasoning.reasoning import Observation
 
@@ -77,6 +79,45 @@ def make_cop_and_citizen(*, seed=42, max_jail_term=5):
     return cop, citizen
 
 
+def make_provider_boundary_cop_and_citizen(*, citizen_state):
+    model = CivilViolenceTestModel()
+    cop = Cop(
+        model=model,
+        reasoning=ReActReasoning,
+        llm_model="openai/test",
+        system_prompt="",
+        vision=1,
+        internal_state=[],
+        step_prompt=_ARREST_OR_MOVE_STEP_PROMPT,
+        max_jail_term=5,
+    )
+    citizen = Citizen(
+        model=model,
+        reasoning=ReActReasoning,
+        llm_model="openai/test",
+        system_prompt="",
+        vision=1,
+        internal_state=[],
+        step_prompt="test citizen step",
+    )
+    cop.memory = NoOpMemory()
+    citizen.memory = NoOpMemory()
+    model.grid.place_agent(cop, (1, 1))
+    model.grid.place_agent(citizen, (2, 2))
+
+    citizen.state = citizen_state
+    citizen.jail_sentence_left = 2 if citizen_state is CitizenState.ARRESTED else 0
+    citizen.internal_state[:] = [
+        state_entry
+        for state_entry in citizen.internal_state
+        if not state_entry.startswith("my current state in the simulation is")
+    ]
+    citizen.internal_state.append(
+        f"my current state in the simulation is {citizen_state}"
+    )
+    return cop, citizen
+
+
 def add_citizen(cop, *, state, position=(2, 2)):
     citizen = make_citizen(cop.model)
     cop.model.grid.move_agent(citizen, position)
@@ -116,6 +157,18 @@ def action_call(cop, *, asynchronous=False):
     return action_mock.await_args if asynchronous else action_mock.call_args
 
 
+def action_choice_response(name, arguments):
+    content = json.dumps(
+        {
+            "name": name,
+            "arguments": arguments,
+            "rationale": "provider-boundary regression choice",
+        }
+    )
+    message = SimpleNamespace(content=content)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
 def eligible_ids_from_prompt(prompt):
     prompt_text = "\n".join(prompt)
     eligible_contexts = []
@@ -141,23 +194,85 @@ def prompt_text_from_call(call):
     return "\n".join(call.kwargs["prompt"])
 
 
+def instructional_prompt_text_from_call(call, *, observation):
+    prompt = call.kwargs["prompt"]
+    observation_indexes = [
+        index
+        for index, element in enumerate(prompt)
+        if element.startswith("OBSERVATION:\n")
+    ]
+    assert len(observation_indexes) == 1
+    observation_index = observation_indexes[0]
+    assert prompt[observation_index] == f"OBSERVATION:\n{observation}"
+    return "\n".join(
+        element for index, element in enumerate(prompt) if index != observation_index
+    )
+
+
+def system_prompt_from_call(call):
+    assert "system_prompt" in call.kwargs
+    system_prompt = call.kwargs["system_prompt"]
+    assert isinstance(system_prompt, str)
+    return system_prompt
+
+
 def assert_movement_only_prompt(call, *, observation):
     prompt_text = prompt_text_from_call(call)
-    assert f"OBSERVATION:\n{observation}" in prompt_text
+    instructional_prompt_text = instructional_prompt_text_from_call(
+        call,
+        observation=observation,
+    )
+    system_prompt = system_prompt_from_call(call)
     assert json.dumps({"eligible_active_citizen_ids": []}) in prompt_text
     assert eligible_ids_from_prompt(call.kwargs["prompt"]) == []
-    assert "arrest_citizen" not in prompt_text
-    assert _ARREST_OR_MOVE_STEP_PROMPT not in prompt_text
-    assert "Move to a nearby cell." in prompt_text
+    assert "Move to a nearby cell." in instructional_prompt_text
+    for instructional_text in (instructional_prompt_text, system_prompt):
+        casefolded_text = instructional_text.casefold()
+        assert "arrest" not in casefolded_text
+        assert "arrest_citizen" not in casefolded_text
 
 
 def assert_eligible_arrest_prompt(call, *, observation, eligible_ids):
     prompt_text = prompt_text_from_call(call)
-    assert f"OBSERVATION:\n{observation}" in prompt_text
+    instructional_prompt_text = instructional_prompt_text_from_call(
+        call,
+        observation=observation,
+    )
+    system_prompt = system_prompt_from_call(call)
     assert json.dumps({"eligible_active_citizen_ids": eligible_ids}) in prompt_text
     assert eligible_ids_from_prompt(call.kwargs["prompt"]) == eligible_ids
-    assert "arrest_citizen" in prompt_text
-    assert _ARREST_OR_MOVE_STEP_PROMPT in prompt_text
+    assert "arrest_citizen" in instructional_prompt_text.casefold()
+    assert _ARREST_OR_MOVE_STEP_PROMPT in instructional_prompt_text
+    assert "arrest" in system_prompt.casefold()
+
+
+def assert_provider_action_call(call, *, observation, eligible_citizen_id=None):
+    assert call.kwargs["tool_schema"] is None
+    assert call.kwargs["tool_choice"] == "none"
+    assert call.kwargs["response_format"] is ActionChoice
+    assert call.kwargs["suppress_thinking"] is True
+
+    instructional_prompt_text = instructional_prompt_text_from_call(
+        call,
+        observation=observation,
+    )
+    system_prompt = system_prompt_from_call(call)
+    if eligible_citizen_id is None:
+        assert "arrest" not in system_prompt.casefold()
+        assert "arrest_citizen" not in instructional_prompt_text.casefold()
+        assert '"name": "move_one_step"' in instructional_prompt_text
+        assert json.dumps({"eligible_active_citizen_ids": []}) in (
+            instructional_prompt_text
+        )
+    else:
+        assert "arrest" in system_prompt.casefold()
+        assert "arrest_citizen" in instructional_prompt_text.casefold()
+        assert '"name": "move_one_step"' in instructional_prompt_text
+        assert '"name": "arrest_citizen"' in instructional_prompt_text
+        assert (
+            json.dumps({"eligible_active_citizen_ids": [eligible_citizen_id]})
+            in instructional_prompt_text
+        )
 
 
 def assert_rejected_arrest_has_no_side_effects(cop, citizen_id, expected_error):
@@ -278,9 +393,18 @@ def test_cop_excludes_visible_non_active_citizens_from_arrest_selection(
     state, jail_sentence_left
 ):
     cop, citizen = make_cop_and_citizen()
+    cop.step_prompt = _ARREST_OR_MOVE_STEP_PROMPT
     citizen.state = state
     citizen.jail_sentence_left = jail_sentence_left
-    observation = make_cop_observation(cop, [citizen])
+    observation = make_cop_observation(
+        cop,
+        [citizen],
+        internal_states={
+            citizen.unique_id: [f"my current state in the simulation is {state}"]
+        },
+    )
+    if state is CitizenState.ARRESTED:
+        assert "arrest" in str(observation).casefold()
     configure_cop_workflow(cop, observation)
 
     result = cop.step()
@@ -290,7 +414,7 @@ def test_cop_excludes_visible_non_active_citizens_from_arrest_selection(
     cop.act.assert_called_once()
     call = action_call(cop)
     assert call.kwargs["actions"] == ["move_one_step"]
-    assert eligible_ids_from_prompt(call.kwargs["prompt"]) == []
+    assert_movement_only_prompt(call, observation=observation)
 
 
 def test_cop_excludes_active_citizen_absent_from_observation():
@@ -470,6 +594,103 @@ async def test_async_cop_narrows_actions_from_current_eligibility(
     else:
         assert_movement_only_prompt(call, observation=observation)
     cop.act.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "eligible_target",
+    [
+        pytest.param(False, id="no-target"),
+        pytest.param(True, id="eligible-target"),
+    ],
+)
+def test_sync_cop_provider_boundary_context_and_local_execution(eligible_target):
+    citizen_state = CitizenState.ACTIVE if eligible_target else CitizenState.ARRESTED
+    cop, citizen = make_provider_boundary_cop_and_citizen(citizen_state=citizen_state)
+    observation = cop.generate_obs()
+    cop_start = cop.pos
+    citizen_start = citizen.pos
+
+    if eligible_target:
+        response = action_choice_response(
+            "arrest_citizen",
+            {"citizen_id": citizen.unique_id},
+        )
+    else:
+        assert "CitizenState.ARRESTED" in str(observation)
+        response = action_choice_response(
+            "move_one_step",
+            {"direction": "North"},
+        )
+    cop.llm.generate = Mock(return_value=response)
+
+    result = cop.step()
+
+    assert result is None
+    cop.llm.generate.assert_called_once()
+    assert_provider_action_call(
+        cop.llm.generate.call_args,
+        observation=observation,
+        eligible_citizen_id=citizen.unique_id if eligible_target else None,
+    )
+    assert citizen.pos == citizen_start
+    if eligible_target:
+        assert cop.pos == cop_start
+        assert citizen.state is CitizenState.ARRESTED
+        assert 1 <= citizen.jail_sentence_left <= cop.max_jail_term
+    else:
+        assert cop.pos == (1, 2)
+        assert citizen.state is CitizenState.ARRESTED
+        assert citizen.jail_sentence_left == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "eligible_target",
+    [
+        pytest.param(False, id="no-target"),
+        pytest.param(True, id="eligible-target"),
+    ],
+)
+async def test_async_cop_provider_boundary_context_and_local_execution(
+    eligible_target,
+):
+    citizen_state = CitizenState.ACTIVE if eligible_target else CitizenState.ARRESTED
+    cop, citizen = make_provider_boundary_cop_and_citizen(citizen_state=citizen_state)
+    observation = cop.generate_obs()
+    cop_start = cop.pos
+    citizen_start = citizen.pos
+
+    if eligible_target:
+        response = action_choice_response(
+            "arrest_citizen",
+            {"citizen_id": citizen.unique_id},
+        )
+    else:
+        assert "CitizenState.ARRESTED" in str(observation)
+        response = action_choice_response(
+            "move_one_step",
+            {"direction": "North"},
+        )
+    cop.llm.agenerate = AsyncMock(return_value=response)
+
+    result = await cop.astep()
+
+    assert result is None
+    cop.llm.agenerate.assert_awaited_once()
+    assert_provider_action_call(
+        cop.llm.agenerate.await_args,
+        observation=observation,
+        eligible_citizen_id=citizen.unique_id if eligible_target else None,
+    )
+    assert citizen.pos == citizen_start
+    if eligible_target:
+        assert cop.pos == cop_start
+        assert citizen.state is CitizenState.ARRESTED
+        assert 1 <= citizen.jail_sentence_left <= cop.max_jail_term
+    else:
+        assert cop.pos == (1, 2)
+        assert citizen.state is CitizenState.ARRESTED
+        assert citizen.jail_sentence_left == 2
 
 
 def test_arrest_citizen_uses_agent_rng_not_process_global_random(monkeypatch):

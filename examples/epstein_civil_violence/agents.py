@@ -10,6 +10,16 @@ from mesa_llm.memory.st_lt_memory import STLTMemory
 
 _JAIL_SENTENCE_STEP = 0.1
 _JAIL_SENTENCE_EPSILON = 1e-9
+_COP_MOVEMENT_SYSTEM_PROMPT = (
+    "You are a cop in a country that is experiencing civil violence. You are a "
+    "member of the police force. For this step, move one step to a nearby cell."
+)
+_COP_ARREST_SYSTEM_PROMPT = (
+    "You are a cop in a country that is experiencing civil violence. You are a "
+    "member of the police force and your job is to arrest active citizens. You "
+    "can arrest a citizen ONLY if they are active. You can move one step in a "
+    "nearby cell or arrest a citizen."
+)
 
 
 class CitizenState(Enum):
@@ -205,7 +215,7 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
             actions=[move_one_step, "arrest_citizen"],
         )
         self.max_jail_term = max_jail_term
-        self.system_prompt = "You are a cop in a country that is experiencing civil violence. You are a member of the police force and your job is to arrest active citizens. You can arrest a citizen ONLY if they are active. You can move one step in a nearby cell or arrest a citizen."
+        self.system_prompt = _COP_MOVEMENT_SYSTEM_PROMPT
 
         self.memory = STLTMemory(
             agent=self,
@@ -240,7 +250,7 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
                     "nearby cell."
                 ),
             ]
-            return prompt, ["move_one_step"]
+            return prompt, ["move_one_step"], _COP_MOVEMENT_SYSTEM_PROMPT
 
         prompt = [
             self.step_prompt,
@@ -251,7 +261,11 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
                 "Only use arrest_citizen with one of these citizen IDs."
             ),
         ]
-        return prompt, ["move_one_step", "arrest_citizen"]
+        return (
+            prompt,
+            ["move_one_step", "arrest_citizen"],
+            _COP_ARREST_SYSTEM_PROMPT,
+        )
 
     def step(self):
         """
@@ -259,10 +273,11 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
         applicable.
         """
         observation = self.generate_obs()
-        prompt, actions = self._action_selection_context(observation)
+        prompt, actions, system_prompt = self._action_selection_context(observation)
         self.act(
             prompt=prompt,
             actions=actions,
+            system_prompt=system_prompt,
         )
 
     async def astep(self):
@@ -271,8 +286,9 @@ class Cop(LLMAgent, mesa.discrete_space.CellAgent):
         applicable.
         """
         observation = self.generate_obs()
-        prompt, actions = self._action_selection_context(observation)
+        prompt, actions, system_prompt = self._action_selection_context(observation)
         await self.aact(
             prompt=prompt,
             actions=actions,
+            system_prompt=system_prompt,
         )
