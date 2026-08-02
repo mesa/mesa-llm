@@ -316,6 +316,11 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
         # Handle list, tuple, set as arrays
         if origin in (list, tuple, set):
             if args:
+                if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+                    return {
+                        "type": "array",
+                        "items": _python_to_json_type(args[0]),
+                    }
                 # Handle tuple with specific types like tuple[int, str]
                 if origin is tuple and len(args) > 1:
                     # For tuples with multiple specific types, we'll use array with mixed items

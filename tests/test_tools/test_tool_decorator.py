@@ -96,6 +96,28 @@ class TestToolDecoractor:
         set_schema = _python_to_json_type(set[str])
         assert set_schema == {"type": "array", "items": {"type": "string"}}
 
+    @pytest.mark.parametrize(
+        ("annotation", "item_schema"),
+        [
+            (tuple[int, ...], {"type": "integer"}),
+            (tuple[str, ...], {"type": "string"}),
+            (
+                tuple[list[int], ...],
+                {"type": "array", "items": {"type": "integer"}},
+            ),
+        ],
+        ids=["integers", "strings", "nested-lists"],
+    )
+    def test_python_to_json_type_variadic_tuple_uses_homogeneous_items(
+        self,
+        annotation,
+        item_schema,
+    ):
+        assert _python_to_json_type(annotation) == {
+            "type": "array",
+            "items": item_schema,
+        }
+
     def test_python_to_json_type_literal_and_nullable_union_schemas(self):
         assert _python_to_json_type(Literal["a", "b"]) == {
             "type": "string",

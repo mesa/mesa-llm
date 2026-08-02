@@ -69,6 +69,7 @@ class ActionManager:
 
     def register(self, fn: Callable):
         """Register an action function by name."""
+        self._get_action_schema(fn)
         _get_action_parameter_contract(fn)
         self.actions[fn.__name__] = fn
 
@@ -118,7 +119,10 @@ class ActionManager:
         schema_name = schema_name or getattr(fn, "__name__", repr(fn))
         schema = getattr(fn, "__action_schema__", None)
         if schema is None:
-            return {"error": f"Action {schema_name} missing __action_schema__"}
+            raise ActionAnnotationContractError(
+                f"Action {schema_name!r} must be decorated with @action before "
+                "registration; missing __action_schema__."
+            )
 
         if schema.get("name") == schema_name:
             return schema
@@ -561,6 +565,15 @@ class ActionManager:
         union_args: tuple[Any, ...],
     ) -> Any:
         for union_type in union_args:
+            if self._is_exact_action_value_match(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=union_type,
+            ):
+                return value
+
+        for union_type in union_args:
             with contextlib.suppress(ValueError):
                 return self._validate_and_coerce_value(
                     action_name=action_name,
@@ -574,6 +587,126 @@ class ActionManager:
             argument_path,
             expected_type,
             value,
+        )
+
+    def _is_exact_action_value_match(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+    ) -> bool:
+        """Return whether a value satisfies an annotation without coercion."""
+        expected_type = self._normalize_action_annotation(expected_type)
+        if expected_type is Any or expected_type is object:
+            raise self._unsupported_runtime_action_annotation_error(
+                action_name,
+                argument_path,
+                expected_type,
+            )
+
+        origin = get_origin(expected_type)
+        args = get_args(expected_type)
+
+        if origin is Annotated:
+            if not args:
+                raise self._unsupported_runtime_action_annotation_error(
+                    action_name,
+                    argument_path,
+                    expected_type,
+                )
+            return self._is_exact_action_value_match(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=args[0],
+            )
+
+        if origin in {Union, UnionType}:
+            return any(
+                self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=argument_path,
+                    value=value,
+                    expected_type=union_type,
+                )
+                for union_type in args
+            )
+
+        if origin is Literal:
+            return any(
+                type(value) is type(candidate) and value == candidate
+                for candidate in args
+            )
+
+        if expected_type is type(None):
+            return value is None
+
+        if expected_type in {int, float}:
+            return self._is_valid_numeric_action_value(value, expected_type)
+
+        if expected_type is str:
+            return isinstance(value, str)
+
+        if expected_type is bool:
+            return isinstance(value, bool)
+
+        if origin in {list, tuple, set} or expected_type in {list, tuple, set}:
+            container_type = origin or expected_type
+            if not isinstance(value, container_type):
+                return False
+
+            if container_type is tuple and args and args[-1] is not Ellipsis:
+                if len(value) != len(args):
+                    return False
+                return all(
+                    self._is_exact_action_value_match(
+                        action_name=action_name,
+                        argument_path=f"{argument_path}[{index}]",
+                        value=item,
+                        expected_type=args[index],
+                    )
+                    for index, item in enumerate(value)
+                )
+
+            item_type = args[0] if args else Any
+            return all(
+                self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}[{index}]",
+                    value=item,
+                    expected_type=item_type,
+                )
+                for index, item in enumerate(value)
+            )
+
+        if origin is dict or expected_type is dict:
+            if not isinstance(value, dict):
+                return False
+
+            key_type = args[0] if len(args) >= 1 else Any
+            value_type = args[1] if len(args) >= 2 else Any
+            return all(
+                self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}.<key>",
+                    value=key,
+                    expected_type=key_type,
+                )
+                and self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}[{key!r}]",
+                    value=item_value,
+                    expected_type=value_type,
+                )
+                for key, item_value in value.items()
+            )
+
+        raise self._unsupported_runtime_action_annotation_error(
+            action_name,
+            argument_path,
+            expected_type,
         )
 
     def _validate_and_coerce_sequence_value(

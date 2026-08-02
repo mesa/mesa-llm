@@ -546,7 +546,7 @@ def test_execute_annotated_action_parameter_uses_consistent_schema_and_runtime_t
     assert agent.priorities == [2]
 
 
-def test_execute_unresolved_postponed_non_agent_annotation_fails_closed_before_mutation():
+def test_action_decorator_unresolved_annotation_fails_before_manager_registration():
     mutations = []
 
     def apply_payload(agent: LLMAgent, payload: MissingPayloadType) -> str:
@@ -561,16 +561,20 @@ def test_execute_unresolved_postponed_non_agent_annotation_fails_closed_before_m
         mutations.append((agent, payload))
         return "applied"
 
+    manager = ActionManager()
+
     with pytest.raises(
         ValueError,
         match=r"Could not resolve annotation.*payload.*MissingPayloadType",
     ):
-        ActionManager(actions=[apply_payload])
+        action(action_manager=manager)(apply_payload)
 
+    assert manager.actions == {}
+    assert not hasattr(apply_payload, "__action_schema__")
     assert mutations == []
 
 
-def test_direct_undecorated_action_with_missing_annotation_fails_before_registration():
+def test_action_decorator_with_missing_annotation_fails_before_manager_registration():
     mutations = []
 
     def apply_payload(agent, payload) -> str:
@@ -588,17 +592,18 @@ def test_direct_undecorated_action_with_missing_annotation_fails_before_registra
     manager = ActionManager()
 
     with pytest.raises((TypeError, ValueError)) as exc_info:
-        manager.register(apply_payload)
+        action(action_manager=manager)(apply_payload)
 
     message = str(exc_info.value)
     assert "apply_payload" in message
     assert "payload" in message
     assert "annotation" in message.lower()
     assert manager.actions == {}
+    assert not hasattr(apply_payload, "__action_schema__")
     assert mutations == []
 
 
-def test_direct_undecorated_action_with_unsupported_annotation_fails_before_registration():
+def test_action_decorator_with_unsupported_annotation_fails_before_manager_registration():
     mutations = []
 
     def apply_payload(agent, payload: object) -> str:
@@ -616,17 +621,18 @@ def test_direct_undecorated_action_with_unsupported_annotation_fails_before_regi
     manager = ActionManager()
 
     with pytest.raises((TypeError, ValueError)) as exc_info:
-        manager.register(apply_payload)
+        action(action_manager=manager)(apply_payload)
 
     message = str(exc_info.value)
     assert "apply_payload" in message
     assert "payload" in message
     assert "annotation" in message.lower()
     assert manager.actions == {}
+    assert not hasattr(apply_payload, "__action_schema__")
     assert mutations == []
 
 
-def test_direct_undecorated_action_with_unhashable_set_items_fails_before_registration():
+def test_action_decorator_with_unhashable_set_items_fails_before_manager_registration():
     mutations = []
 
     def apply_values(agent, values: set[list[int]]) -> str:
@@ -644,13 +650,14 @@ def test_direct_undecorated_action_with_unhashable_set_items_fails_before_regist
     manager = ActionManager()
 
     with pytest.raises((TypeError, ValueError)) as exc_info:
-        manager.register(apply_values)
+        action(action_manager=manager)(apply_values)
 
     message = str(exc_info.value)
     assert "apply_values" in message
     assert "values" in message
     assert "hashable" in message.lower() or "set element" in message.lower()
     assert manager.actions == {}
+    assert not hasattr(apply_values, "__action_schema__")
     assert mutations == []
 
 
@@ -1064,6 +1071,98 @@ async def test_aexecute_awaits_future_returned_by_sync_action():
             agent.future.cancel()
             with suppress(asyncio.CancelledError):
                 await agent.future
+
+
+@pytest.mark.parametrize(
+    ("annotation", "raw_value", "expected", "expected_type"),
+    [
+        (int | Literal["007"], "007", "007", str),
+        (list[int] | str, "[1, 2]", "[1, 2]", str),
+        (Literal["4"] | int, "4", "4", str),
+        (str | list[int], "[3, 4]", "[3, 4]", str),
+        (int | bool, True, True, bool),
+        (str | None, None, None, type(None)),
+        (int | float, 4.0, 4.0, float),
+        (tuple[int, ...] | list[int], [1, 2], [1, 2], list),
+    ],
+    ids=[
+        "literal-string-after-int",
+        "string-after-list",
+        "literal-string-before-int",
+        "string-before-list",
+        "bool-after-int",
+        "none-after-string",
+        "float-after-int",
+        "list-after-tuple",
+    ],
+)
+def test_validate_union_prefers_exact_member_before_coercion(
+    annotation,
+    raw_value,
+    expected,
+    expected_type,
+):
+    def capture_value(agent, value) -> object:
+        """Capture a typed value.
+
+        Args:
+            value: Value to capture.
+
+        Returns:
+            The captured value.
+        """
+        del agent
+        return value
+
+    capture_value.__annotations__["value"] = annotation
+    capture_value = action(capture_value)
+    manager = ActionManager(actions=[capture_value])
+
+    validated = manager.validate(
+        SimpleNamespace(),
+        ActionChoice(name="capture_value", arguments={"value": raw_value}),
+    )
+
+    assert validated.arguments == {"value": expected}
+    assert type(validated.arguments["value"]) is expected_type
+
+
+@pytest.mark.parametrize(
+    ("annotation", "expected", "expected_type"),
+    [
+        (int | float, 4, int),
+        (float | int, 4.0, float),
+    ],
+    ids=["int-first", "float-first"],
+)
+def test_validate_union_coercion_without_exact_match_uses_declaration_order(
+    annotation,
+    expected,
+    expected_type,
+):
+    def capture_value(agent, value) -> object:
+        """Capture a typed value.
+
+        Args:
+            value: Value to capture.
+
+        Returns:
+            The captured value.
+        """
+        del agent
+        return value
+
+    capture_value.__annotations__["value"] = annotation
+    capture_value = action(capture_value)
+    manager = ActionManager(actions=[capture_value])
+
+    validated = manager.validate(
+        SimpleNamespace(),
+        ActionChoice(name="capture_value", arguments={"value": "4"}),
+    )
+
+    assert validated.arguments == {"value": expected}
+    assert type(validated.arguments["value"]) is expected_type
 
 
 def test_validate_coerces_exact_numeric_string_arguments():

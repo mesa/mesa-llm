@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 
+import mesa_llm.actions.action_manager as action_manager_module
 from mesa_llm.actions import (
     ActionManager,
     ActionMetadata,
@@ -13,7 +14,10 @@ from mesa_llm.actions import (
     default_actions,
     wait,
 )
-from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
+from mesa_llm.actions.action_decorator import (
+    _GLOBAL_ACTION_REGISTRY,
+    ActionAnnotationContractError,
+)
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
@@ -386,6 +390,59 @@ def test_bare_action_global_registration_can_be_opted_into_by_name():
     assert manager.available_actions() == {"registered_action": registered_action}
 
 
+def test_action_manager_rejects_undecorated_callable_before_contract_inference(
+    monkeypatch,
+):
+    @action
+    def decorated_action(agent, amount: int) -> int:
+        """Return an amount.
+
+        Args:
+            amount: Amount to return.
+
+        Returns:
+            The amount.
+        """
+        del agent
+        return amount
+
+    def undecorated_action(agent, amount: int) -> int:
+        del agent
+        return amount
+
+    manager = ActionManager()
+    contract_inference_calls = []
+    original_get_contract = action_manager_module._get_action_parameter_contract
+
+    def record_contract_inference(*args, **kwargs):
+        contract_inference_calls.append(args[0])
+        return original_get_contract(*args, **kwargs)
+
+    # Registration must reject on the missing decorator marker before attempting
+    # to infer a callable contract from otherwise valid annotations.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            action_manager_module,
+            "_get_action_parameter_contract",
+            record_contract_inference,
+        )
+        with pytest.raises(ActionAnnotationContractError) as exc_info:
+            manager.register(undecorated_action)
+
+    message = str(exc_info.value)
+    assert "undecorated_action" in message
+    assert "@action" in message or "decorated" in message.lower()
+    assert manager.actions == {}
+    assert contract_inference_calls == []
+    assert not hasattr(undecorated_action, "__action_schema__")
+
+    callable_manager = ActionManager(actions=[decorated_action])
+    named_manager = ActionManager(actions=["decorated_action"])
+
+    assert callable_manager.actions == {"decorated_action": decorated_action}
+    assert named_manager.actions == {"decorated_action": decorated_action}
+
+
 def test_action_manager_argument_registers_directly_with_that_manager():
     manager = ActionManager()
 
@@ -688,6 +745,50 @@ def test_action_preserves_supported_fixed_tuple_annotation():
         "type": "array",
         "items": {"type": "integer"},
         "description": "Coordinates to move to.",
+    }
+
+
+def test_action_schema_preserves_homogeneous_variadic_tuple_annotations():
+    @action
+    def collect_values(
+        agent,
+        integer_values: tuple[int, ...],
+        text_values: tuple[str, ...],
+        batches: tuple[list[int], ...],
+    ) -> None:
+        """Collect homogeneous tuple values.
+
+        Args:
+            integer_values: Integer values to collect.
+            text_values: Text values to collect.
+            batches: Integer batches to collect.
+
+        Returns:
+            Nothing.
+        """
+        del agent, integer_values, text_values, batches
+
+    properties = collect_values.__action_schema__["parameters"]["properties"]
+
+    assert properties == {
+        "integer_values": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": "Integer values to collect.",
+        },
+        "text_values": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Text values to collect.",
+        },
+        "batches": {
+            "type": "array",
+            "items": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+            "description": "Integer batches to collect.",
+        },
     }
 
 
