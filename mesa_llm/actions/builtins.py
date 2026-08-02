@@ -144,16 +144,18 @@ def wait(agent: Any) -> str:
 @action
 def move_one_step(agent: Any, direction: str) -> str:
     """
-    Moves agents one step in specified cardinal/diagonal directions.
+    Move an agent one step in a recognized cardinal or diagonal direction.
 
     Automatically handles Mesa grid types including SingleGrid, MultiGrid,
-    OrthogonalGrids, and ContinuousSpace.
+    OrthogonalGrids, and ContinuousSpace. On connection-based orthogonal grids,
+    movement is possible only when the agent's current cell has a connection in
+    the requested direction.
 
     Args:
         agent: Provided automatically.
-        direction: The direction to move in. Must be one of:
-            'North', 'South', 'East', 'West', 'NorthEast', 'NorthWest',
-            'SouthEast', or 'SouthWest'.
+        direction: The direction to move in. Recognized cardinal directions are
+            'North', 'South', 'East', and 'West'; recognized diagonal directions
+            are 'NorthEast', 'NorthWest', 'SouthEast', and 'SouthWest'.
 
     Returns:
         A string confirming the result of the movement attempt.
@@ -171,8 +173,9 @@ def move_one_step(agent: Any, direction: str) -> str:
         target_cell = connections.get(direction_map_row_col[direction])
         if target_cell is None:
             return (
-                f"Agent {agent.unique_id} is at the boundary and cannot move "
-                f"{direction}. Try a different direction."
+                f"Agent {agent.unique_id} cannot move {direction} because that "
+                "direction is unavailable from the current cell: no connection "
+                "exists in the grid topology. Try a different direction."
             )
 
         if target_cell.is_full:

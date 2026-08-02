@@ -1144,57 +1144,47 @@ def test_move_one_step_singlegrid_occupied_target():
     assert "North" in result
 
 
-def test_move_one_step_boundary_orthogonal_grid():
-    class _DummyOrthogonalGrid(OrthogonalMooreGrid):
-        pass
-
-    orth_grid = object.__new__(_DummyOrthogonalGrid)
-    orth_grid.torus = False
-    orth_grid.dimensions = (5, 5)
-    start = (0, 1)
-    start_cell = SimpleNamespace(
-        coordinate=start, agents=[], connections={}, is_full=False
+@pytest.mark.parametrize(
+    "grid_type",
+    [OrthogonalMooreGrid, OrthogonalVonNeumannGrid],
+)
+def test_move_one_step_boundary_on_real_orthogonal_grid(grid_type):
+    model, agent = _orthogonal_grid_agent(
+        grid_type,
+        start=(0, 1),
+        unique_id=22,
     )
-    orth_grid._cells = {start: start_cell}
-
-    model = DummyModel()
-    model.grid = orth_grid
-
-    agent = DummyAgent(unique_id=22, model=model)
-    agent.cell = start_cell
-    model.agents.append(agent)
+    start_cell = agent.cell
 
     result = _execute_spatial(agent, "move_one_step", {"direction": "North"})
 
-    assert agent.cell is start_cell
-    assert "boundary" in result.lower()
+    _assert_orthogonal_grid_agent_unchanged(model, agent, start_cell)
+    assert "unavailable" in result.lower()
+    assert "no connection" in result.lower()
+    assert "grid topology" in result.lower()
     assert "North" in result
 
 
-def test_move_one_step_boundary_orthogonal_torus_missing_wrapped_cell():
-    class _DummyOrthogonalGrid(OrthogonalMooreGrid):
-        pass
-
-    orth_grid = object.__new__(_DummyOrthogonalGrid)
-    orth_grid.torus = True
-    orth_grid.dimensions = (3, 3)
-    start = (0, 0)
-    start_cell = SimpleNamespace(
-        coordinate=start, agents=[], connections={}, is_full=False
+def test_move_one_step_removed_torus_connection_is_not_a_boundary():
+    model, agent = _orthogonal_grid_agent(
+        OrthogonalMooreGrid,
+        start=(0, 0),
+        unique_id=38,
+        dimensions=(3, 3),
+        torus=True,
     )
-    orth_grid._cells = {start: start_cell}
-
-    model = DummyModel()
-    model.grid = orth_grid
-
-    agent = DummyAgent(unique_id=38, model=model)
-    agent.cell = start_cell
-    model.agents.append(agent)
+    start_cell = agent.cell
+    wrapped_cell = model.grid[(2, 0)]
+    model.grid.remove_connection(start_cell, wrapped_cell)
 
     result = _execute_spatial(agent, "move_one_step", {"direction": "North"})
 
-    assert agent.cell is start_cell
-    assert "boundary" in result.lower()
+    _assert_orthogonal_grid_agent_unchanged(model, agent, start_cell)
+    assert agent not in wrapped_cell.agents
+    assert "unavailable" in result.lower()
+    assert "no connection" in result.lower()
+    assert "grid topology" in result.lower()
+    assert "boundary" not in result.lower()
     assert "North" in result
 
 
@@ -1231,7 +1221,10 @@ def test_move_one_step_diagonal_unavailable_on_real_vonneumann_grid():
     result = _execute_spatial(agent, "move_one_step", {"direction": "NorthEast"})
 
     _assert_orthogonal_grid_agent_unchanged(model, agent, start_cell)
-    assert "cannot move" in result.lower()
+    assert "unavailable" in result.lower()
+    assert "no connection" in result.lower()
+    assert "grid topology" in result.lower()
+    assert "boundary" not in result.lower()
     assert "NorthEast" in result
 
 
@@ -1295,7 +1288,10 @@ def test_move_one_step_removed_connection_prevents_movement():
 
     _assert_orthogonal_grid_agent_unchanged(model, agent, start_cell)
     assert agent not in disconnected_cell.agents
-    assert "cannot move" in result.lower()
+    assert "unavailable" in result.lower()
+    assert "no connection" in result.lower()
+    assert "grid topology" in result.lower()
+    assert "boundary" not in result.lower()
     assert "North" in result
 
 
@@ -1320,6 +1316,27 @@ def test_move_one_step_follows_custom_connection_target():
     )
     assert agent not in coordinate_derived_cell.agents
     assert result == "agent 32 moved to (3, 3)."
+
+
+def test_move_one_step_boundary_connection_remains_authoritative():
+    model, agent = _orthogonal_grid_agent(
+        OrthogonalMooreGrid,
+        start=(0, 1),
+        unique_id=34,
+    )
+    start_cell = agent.cell
+    connected_cell = model.grid[(3, 3)]
+    start_cell.connections[(-1, 0)] = connected_cell
+
+    result = _execute_spatial(agent, "move_one_step", {"direction": "North"})
+
+    _assert_orthogonal_grid_agent_moved(
+        model,
+        agent,
+        start_cell,
+        connected_cell,
+    )
+    assert result == "agent 34 moved to (3, 3)."
 
 
 def test_move_one_step_torus_wraps_through_real_grid_connection():
