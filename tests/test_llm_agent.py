@@ -5,6 +5,7 @@ import gc
 import json
 import logging
 import warnings
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -173,17 +174,213 @@ def test_llm_agent_actions_constructor_accepts_registered_action_name():
         _GLOBAL_ACTION_REGISTRY.update(original_registry)
 
 
-def test_llm_agent_actions_constructor_unknown_name_fails_fast():
-    class DummyModel(Model):
+def _exception_signature(call):
+    try:
+        call()
+    except Exception as exc:
+        return type(exc), str(exc)
+    pytest.fail("Expected construction to raise an exception.")
+
+
+def _assert_failed_llm_agent_construction_is_cleaned_up(
+    monkeypatch,
+    constructor,
+    expected_exception,
+    expected_exception_object=None,
+):
+    model = Model(rng=42)
+    baseline_agent = Agent(model)
+    baseline_count = len(model.agents)
+    registered_agents = []
+    original_register_agent = model.register_agent
+
+    def capture_registered_agent(agent):
+        result = original_register_agent(agent)
+        registered_agents.append(agent)
+        return result
+
+    monkeypatch.setattr(model, "register_agent", capture_registered_agent)
+
+    try:
+        constructor(model)
+    except Exception as exc:
+        initialization_error = exc
+    else:
+        pytest.fail("Expected LLMAgent construction to raise an exception.")
+
+    assert (type(initialization_error), str(initialization_error)) == expected_exception
+    if expected_exception_object is not None:
+        assert initialization_error is expected_exception_object
+    assert len(registered_agents) == 1
+
+    failed_agent = registered_agents.pop()
+    failed_agent_ref = weakref.ref(failed_agent)
+
+    assert len(model.agents) == baseline_count
+    assert baseline_agent in model.agents
+    assert failed_agent not in model.agents
+    assert all(
+        failed_agent not in typed_agents
+        for typed_agents in model.agents_by_type.values()
+    )
+
+    initialization_error.__traceback__ = None
+    del initialization_error, failed_agent
+    gc.collect()
+
+    assert failed_agent_ref() is None
+
+
+def test_llm_agent_registration_failure_after_mesa_mutation_is_cleaned_up():
+    registration_error = RuntimeError("register_agent failed after registration")
+
+    class RaiseAfterRegistrationModel(Model):
         def __init__(self):
             super().__init__(rng=42)
+            self.registered_agent_ref = None
 
-    with pytest.raises(ValueError, match="Unknown action name"):
-        LLMAgent(
-            DummyModel(),
-            reasoning=ReActReasoning,
-            actions=["missing_llm_agent_action"],
+        def register_agent(self, agent):
+            super().register_agent(agent)
+            self.registered_agent_ref = weakref.ref(agent)
+            raise registration_error
+
+    model = RaiseAfterRegistrationModel()
+
+    def construct_and_assert_cleanup():
+        with pytest.raises(RuntimeError) as exc_info:
+            LLMAgent(model, reasoning=ReActReasoning)
+
+        assert exc_info.value is registration_error
+        assert str(exc_info.value) == "register_agent failed after registration"
+
+        failed_agent_ref = model.registered_agent_ref
+        assert failed_agent_ref is not None
+        failed_agent = failed_agent_ref()
+        assert failed_agent is not None
+        assert failed_agent not in model.agents
+        assert all(
+            failed_agent not in typed_agents
+            for typed_agents in model.agents_by_type.values()
         )
+
+        exc_info.value.__traceback__ = None
+        return failed_agent_ref
+
+    failed_agent_ref = construct_and_assert_cleanup()
+    gc.collect()
+
+    assert failed_agent_ref() is None
+
+
+def test_llm_agent_unknown_action_failure_cleans_up_mesa_registration(monkeypatch):
+    missing_action_name = "missing_llm_agent_lifecycle_action"
+    expected_exception = _exception_signature(
+        lambda: ActionManager(actions=[missing_action_name])
+    )
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(
+            model,
+            reasoning=ReActReasoning,
+            actions=[missing_action_name],
+        ),
+        expected_exception,
+    )
+
+
+def test_llm_agent_undecorated_action_failure_cleans_up_mesa_registration(
+    monkeypatch,
+):
+    def undecorated_action(agent, value: int) -> int:
+        """Return a value supplied by an agent."""
+        del agent
+        return value
+
+    expected_exception = _exception_signature(
+        lambda: ActionManager(actions=[undecorated_action])
+    )
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(
+            model,
+            reasoning=ReActReasoning,
+            actions=[undecorated_action],
+        ),
+        expected_exception,
+    )
+
+
+def test_llm_agent_invalid_tool_failure_cleans_up_mesa_registration(monkeypatch):
+    invalid_tool = object()
+    expected_exception = _exception_signature(lambda: ToolManager(tools=[invalid_tool]))
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(
+            model,
+            reasoning=ReActReasoning,
+            tools=[invalid_tool],
+        ),
+        expected_exception,
+    )
+
+
+def test_llm_agent_reasoning_failure_cleans_up_mesa_registration(monkeypatch):
+    reasoning_error = RuntimeError("reasoning constructor failed")
+
+    class FailingReasoning(ReActReasoning):
+        def __init__(self, agent):
+            del agent
+            raise reasoning_error
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(model, reasoning=FailingReasoning),
+        (RuntimeError, "reasoning constructor failed"),
+        expected_exception_object=reasoning_error,
+    )
+
+
+def test_llm_agent_late_failure_bypasses_overridden_remove_during_cleanup(
+    monkeypatch,
+):
+    late_initialization_error = RuntimeError("late LLMAgent initialization failed")
+
+    class LateFailingLLMAgent(LLMAgent):
+        remove_calls = 0
+
+        @LLMAgent.system_prompt.setter
+        def system_prompt(self, value):
+            del value
+            raise late_initialization_error
+
+        def remove(self):
+            type(self).remove_calls += 1
+            raise AssertionError("failed-construction cleanup called remove override")
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LateFailingLLMAgent(model, reasoning=ReActReasoning),
+        (RuntimeError, "late LLMAgent initialization failed"),
+        expected_exception_object=late_initialization_error,
+    )
+
+    assert LateFailingLLMAgent.remove_calls == 0
+
+
+def test_successful_llm_agent_construction_remains_registered():
+    model = Model(rng=42)
+    baseline_agent = Agent(model)
+    baseline_count = len(model.agents)
+
+    agent = LLMAgent(model, reasoning=ReActReasoning)
+
+    assert len(model.agents) == baseline_count + 1
+    assert baseline_agent in model.agents
+    assert agent in model.agents
+    assert agent in model.agents_by_type[type(agent)]
 
 
 def test_llm_agent_does_not_expose_public_action_manager_property():

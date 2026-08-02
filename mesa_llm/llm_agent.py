@@ -94,41 +94,55 @@ class LLMAgent(Agent):
         tools: list[Callable | str] | tuple[Callable | str, ...] | None = None,
         actions: list[Callable | str] | tuple[Callable | str, ...] | None = None,
     ):
-        super().__init__(model=model)
+        try:
+            super().__init__(model=model)
 
-        self.model = model
-        self.step_prompt = step_prompt
-        self.llm = ModuleLLM(
-            llm_model=llm_model, system_prompt=system_prompt, api_base=api_base
-        )
+            self.model = model
+            self.step_prompt = step_prompt
+            self.llm = ModuleLLM(
+                llm_model=llm_model, system_prompt=system_prompt, api_base=api_base
+            )
 
-        self.memory = STLTMemory(
-            agent=self,
-            short_term_capacity=5,
-            consolidation_capacity=2,
-            llm_model=llm_model,
-            api_base=api_base,
-        )
+            self.memory = STLTMemory(
+                agent=self,
+                short_term_capacity=5,
+                consolidation_capacity=2,
+                llm_model=llm_model,
+                api_base=api_base,
+            )
 
-        self._tool_manager = ToolManager(tools=tools)
-        self._action_manager = ActionManager(actions=actions)
-        self.vision = vision
-        self.reasoning = reasoning(agent=self)
-        self.system_prompt = system_prompt
-        self._current_plan = None  # Store current plan for formatting
+            self._tool_manager = ToolManager(tools=tools)
+            self._action_manager = ActionManager(actions=actions)
+            self.vision = vision
+            self.reasoning = reasoning(agent=self)
+            self.system_prompt = system_prompt
+            self._current_plan = None  # Store current plan for formatting
 
-        # display coordination
-        self._step_display_data = {}
+            # display coordination
+            self._step_display_data = {}
 
-        # Placeholder so @record_model can attach the SimulationRecorder
-        self.recorder: SimulationRecorder | None = None
+            # Placeholder so @record_model can attach the SimulationRecorder
+            self.recorder: SimulationRecorder | None = None
 
-        if isinstance(internal_state, str):
-            internal_state = [internal_state]
-        elif internal_state is None:
-            internal_state = []
+            if isinstance(internal_state, str):
+                internal_state = [internal_state]
+            elif internal_state is None:
+                internal_state = []
 
-        self.internal_state = internal_state
+            self.internal_state = internal_state
+        except Exception as initialization_error:
+            try:
+                LLMAgent._remove_after_failed_initialization(self, model)
+            except Exception as cleanup_error:
+                initialization_error.add_note(
+                    "Failed to remove the partially initialized LLMAgent: "
+                    f"{cleanup_error!r}"
+                )
+            raise
+
+    def _remove_after_failed_initialization(self, model: Model) -> None:
+        if any(agent is self for agent in model.agents):
+            super().remove()
 
     def __str__(self):
         return f"LLMAgent {self.unique_id}"
