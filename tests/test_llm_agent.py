@@ -567,7 +567,9 @@ def _assert_rejects_async_action_without_unawaited_warning(call):
     assert unawaited_warnings == []
 
 
-def _make_local_action_choice_agent():
+def _make_local_action_choice_agent(
+    llm_model: str = "gemini/gemini-2.0-flash",
+):
     class DummyModel(Model):
         def __init__(self):
             super().__init__(rng=42)
@@ -588,6 +590,7 @@ def _make_local_action_choice_agent():
     agent = LLMAgent(
         DummyModel(),
         reasoning=ReActReasoning,
+        llm_model=llm_model,
         actions=[local_increment_counter],
     )
     agent.counter = 0
@@ -647,6 +650,7 @@ def test_choose_action_parses_local_json_fallbacks_and_validates_choice(
     assert choice.rationale == expected_rationale
     assert agent.counter == 0
 
+    agent.llm.generate.assert_called_once()
     call_kwargs = agent.llm.generate.call_args.kwargs
     assert call_kwargs["tool_schema"] is None
     assert call_kwargs["tool_choice"] == "none"
@@ -685,7 +689,32 @@ def test_choose_action_rejects_invalid_or_ambiguous_local_output_before_mutation
         agent.choose_action("Choose one local action.")
 
     assert agent.counter == 0
+    agent.llm.generate.assert_called_once()
     agent.execute_action.assert_not_called()
+
+
+def test_choose_action_invalid_output_makes_one_provider_request_without_tools(
+    monkeypatch,
+):
+    calls = []
+
+    def _invalid_completion(**kwargs):
+        calls.append(kwargs)
+        return _action_choice_response("not valid action JSON")
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _invalid_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="ollama/llama3.2:3b")
+
+    with pytest.raises(ValueError):
+        agent.choose_action("Choose one local action.")
+
+    assert len(calls) == 1
+    provider_kwargs = calls[0]
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is ActionChoice
+    assert provider_kwargs["think"] is False
+    assert agent.counter == 0
 
 
 def test_choose_action_prefers_final_content_over_reasoning_json():
@@ -747,11 +776,37 @@ async def test_achoose_action_parses_local_json_fallbacks_without_tools(content)
     assert isinstance(choice.arguments["amount"], int)
     assert agent.counter == 0
 
+    agent.llm.agenerate.assert_awaited_once()
     call_kwargs = agent.llm.agenerate.call_args.kwargs
     assert call_kwargs["tool_schema"] is None
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["response_format"] is ActionChoice
     assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_invalid_output_makes_one_provider_request_without_tools(
+    monkeypatch,
+):
+    calls = []
+
+    async def _invalid_acompletion(**kwargs):
+        calls.append(kwargs)
+        return _action_choice_response("not valid action JSON")
+
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _invalid_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="ollama_chat/llama3.2:3b")
+
+    with pytest.raises(ValueError):
+        await agent.achoose_action("Choose one async local action.")
+
+    assert len(calls) == 1
+    provider_kwargs = calls[0]
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is ActionChoice
+    assert provider_kwargs["think"] is False
+    assert agent.counter == 0
 
 
 def test_choose_action_uses_structured_output_context_and_does_not_execute():

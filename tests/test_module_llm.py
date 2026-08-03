@@ -322,18 +322,38 @@ class TestModuleLLM:
         assert captured["messages"][0]["content"] == "scoped-system-prompt"
         assert llm.system_prompt == "base-system-prompt"
 
-    def test_generate_can_suppress_hidden_reasoning_without_overriding_core_options(
-        self, monkeypatch, llm_response_factory
+    @pytest.mark.parametrize(
+        ("llm_model", "api_base", "expects_think"),
+        [
+            pytest.param("ollama/llama3.2:3b", None, True, id="ollama"),
+            pytest.param("ollama_chat/llama3.2:3b", None, True, id="ollama-chat"),
+            pytest.param("openai/gpt-4o", None, False, id="openai"),
+            pytest.param("gemini/gemini-2.0-flash", None, False, id="gemini"),
+            pytest.param(
+                "openai/strict-compatible-model",
+                "http://strict-openai-compatible.test/v1",
+                False,
+                id="strict-openai-compatible",
+            ),
+        ],
+    )
+    def test_generate_routes_thinking_suppression_only_to_ollama(
+        self,
+        monkeypatch,
+        llm_response_factory,
+        llm_model,
+        api_base,
+        expects_think,
     ):
-        captured = {}
+        calls = []
 
         def _dummy_completion(**kwargs):
-            captured.update(kwargs)
+            calls.append(kwargs)
             return llm_response_factory()
 
         monkeypatch.setattr("mesa_llm.module_llm.completion", _dummy_completion)
 
-        llm = ModuleLLM(llm_model="openai/gpt-4o")
+        llm = ModuleLLM(llm_model=llm_model, api_base=api_base)
         tool_schema = [{"type": "function", "function": {"name": "read_state"}}]
         response_format = {"type": "json_object"}
 
@@ -345,9 +365,13 @@ class TestModuleLLM:
             suppress_thinking=True,
         )
 
-        assert captured["think"] is False
-        assert captured["drop_params"] is True
-        assert captured["model"] == "openai/gpt-4o"
+        assert len(calls) == 1
+        captured = calls[0]
+        if expects_think:
+            assert captured["think"] is False
+        else:
+            assert "think" not in captured
+        assert captured["model"] == llm_model
         assert captured["messages"] == [
             {"role": "system", "content": ""},
             {"role": "user", "content": "Hello"},
@@ -375,18 +399,38 @@ class TestModuleLLM:
         assert llm.system_prompt == "base-system-prompt"
 
     @pytest.mark.asyncio
-    async def test_agenerate_can_suppress_hidden_reasoning_without_overriding_core_options(
-        self, monkeypatch, llm_response_factory
+    @pytest.mark.parametrize(
+        ("llm_model", "api_base", "expects_think"),
+        [
+            pytest.param("ollama/llama3.2:3b", None, True, id="ollama"),
+            pytest.param("ollama_chat/llama3.2:3b", None, True, id="ollama-chat"),
+            pytest.param("openai/gpt-4o", None, False, id="openai"),
+            pytest.param("gemini/gemini-2.0-flash", None, False, id="gemini"),
+            pytest.param(
+                "openai/strict-compatible-model",
+                "http://strict-openai-compatible.test/v1",
+                False,
+                id="strict-openai-compatible",
+            ),
+        ],
+    )
+    async def test_agenerate_routes_thinking_suppression_only_to_ollama(
+        self,
+        monkeypatch,
+        llm_response_factory,
+        llm_model,
+        api_base,
+        expects_think,
     ):
-        captured = {}
+        calls = []
 
         async def _dummy_acompletion(**kwargs):
-            captured.update(kwargs)
+            calls.append(kwargs)
             return llm_response_factory()
 
         monkeypatch.setattr("mesa_llm.module_llm.acompletion", _dummy_acompletion)
 
-        llm = ModuleLLM(llm_model="openai/gpt-4o")
+        llm = ModuleLLM(llm_model=llm_model, api_base=api_base)
         tool_schema = [{"type": "function", "function": {"name": "read_state"}}]
         response_format = {"type": "json_object"}
 
@@ -398,9 +442,13 @@ class TestModuleLLM:
             suppress_thinking=True,
         )
 
-        assert captured["think"] is False
-        assert captured["drop_params"] is True
-        assert captured["model"] == "openai/gpt-4o"
+        assert len(calls) == 1
+        captured = calls[0]
+        if expects_think:
+            assert captured["think"] is False
+        else:
+            assert "think" not in captured
+        assert captured["model"] == llm_model
         assert captured["messages"] == [
             {"role": "system", "content": ""},
             {"role": "user", "content": "Hello"},

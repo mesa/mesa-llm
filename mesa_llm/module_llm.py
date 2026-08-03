@@ -203,8 +203,8 @@ class ModuleLLM:
             tool_choice: The choice of tool to use
             response_format: The format of the response
             system_prompt: Optional system prompt scoped to this call only.
-            suppress_thinking: Ask providers that support hidden reasoning
-                controls to return only final response content for this call.
+            suppress_thinking: Ask supported Ollama providers to return only
+                final response content for this call.
 
         Returns:
             The response from the LLM
@@ -219,7 +219,7 @@ class ModuleLLM:
             "tool_choice": tool_choice if tool_schema else None,
             "response_format": response_format,
         }
-        if suppress_thinking:
+        if suppress_thinking and self.llm_model.startswith(("ollama/", "ollama_chat/")):
             completion_kwargs.update({"think": False, "drop_params": True})
         if self.api_base:
             completion_kwargs["api_base"] = self.api_base
@@ -263,7 +263,9 @@ class ModuleLLM:
                     "tool_choice": tool_choice if tool_schema else None,
                     "response_format": response_format,
                 }
-                if suppress_thinking:
+                if suppress_thinking and self.llm_model.startswith(
+                    ("ollama/", "ollama_chat/")
+                ):
                     completion_kwargs.update({"think": False, "drop_params": True})
                 if self.api_base:
                     completion_kwargs["api_base"] = self.api_base
