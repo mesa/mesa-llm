@@ -6,7 +6,7 @@ State-changing built-ins such as `move_one_step`, `teleport_to_location`, and `s
 
 ## Tool Sets
 
-Tool sets are factory functions that return tuples. They are preferred over mutable constants and are imported from `mesa_llm.tools`.
+Tool sets are factory functions that return tuples. They are preferred over mutable constants. Their canonical definitions live in `mesa_llm.tools.defaults`, and `mesa_llm.tools` re-exports the same factory objects for root imports.
 
 - `default_tools()` returns exactly `()` because no safe read-only built-ins are available yet.
 - `math_tools()` returns `()`.

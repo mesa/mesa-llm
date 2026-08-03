@@ -1,4 +1,4 @@
-"""Built-in read-only tool factories."""
+"""Canonical read-only tool factories."""
 
 from collections.abc import Callable
 
