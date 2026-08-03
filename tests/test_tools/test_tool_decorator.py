@@ -97,6 +97,47 @@ class TestToolDecoractor:
         assert set_schema == {"type": "array", "items": {"type": "string"}}
 
     @pytest.mark.parametrize(
+        ("annotation", "item_schema", "length"),
+        [
+            pytest.param(
+                tuple[int, int],
+                {"type": "integer"},
+                2,
+                id="two-integers",
+            ),
+            pytest.param(
+                tuple[str, str, str],
+                {"type": "string"},
+                3,
+                id="three-strings",
+            ),
+            pytest.param(
+                tuple[int | float, int | float],
+                {
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "number"},
+                    ]
+                },
+                2,
+                id="two-numeric-unions",
+            ),
+        ],
+    )
+    def test_python_to_json_type_homogeneous_fixed_tuple_has_exact_length(
+        self,
+        annotation,
+        item_schema,
+        length,
+    ):
+        assert _python_to_json_type(annotation) == {
+            "type": "array",
+            "items": item_schema,
+            "minItems": length,
+            "maxItems": length,
+        }
+
+    @pytest.mark.parametrize(
         ("annotation", "item_schema"),
         [
             (tuple[int, ...], {"type": "integer"}),

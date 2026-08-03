@@ -175,7 +175,16 @@ def test_migrated_action_schemas_omit_agent_and_keep_required_arguments():
     assert schemas["teleport_to_location"]["parameters"]["required"] == [
         "target_coordinates",
     ]
-    assert teleport_properties["target_coordinates"]["type"] == "array"
+    target_coordinates_schema = teleport_properties["target_coordinates"]
+    assert target_coordinates_schema["type"] == "array"
+    assert target_coordinates_schema["items"] == {
+        "anyOf": [
+            {"type": "integer"},
+            {"type": "number"},
+        ]
+    }
+    assert target_coordinates_schema["minItems"] == 2
+    assert target_coordinates_schema["maxItems"] == 2
 
     speak_properties = schemas["speak_to"]["parameters"]["properties"]
     assert "agent" not in speak_properties

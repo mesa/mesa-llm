@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import inspect
+import math
 import typing
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -88,6 +89,7 @@ def _get_action_type_hints(
             param_name,
             annotations[param_name],
         )
+        _python_to_json_type(resolved_annotation)
         normalized_annotation = _normalize_action_parameter_annotation(
             func,
             param_name,
@@ -210,7 +212,17 @@ def _normalize_action_parameter_annotation(
             normalized_union |= member
         return normalized_union
 
-    if origin in {list, set}:
+    if origin is set:
+        raise _unsupported_action_annotation_error(
+            func,
+            param_name,
+            annotation_path,
+            annotation,
+            "set annotations are not supported for action parameters or nested "
+            "set elements",
+        )
+
+    if origin is list:
         if len(args) != 1:
             raise _unsupported_action_annotation_error(
                 func,
@@ -225,17 +237,7 @@ def _normalize_action_parameter_annotation(
             args[0],
             annotation_path=f"{annotation_path}.item",
         )
-        if origin is list:
-            return list[item_annotation]
-        if not _action_annotation_produces_hashable_value(item_annotation):
-            raise _unsupported_action_annotation_error(
-                func,
-                param_name,
-                f"{annotation_path}.item",
-                args[0],
-                "set elements must normalize to hashable runtime values",
-            )
-        return set[item_annotation]
+        return list[item_annotation]
 
     if origin is tuple:
         if not args:
@@ -271,6 +273,18 @@ def _normalize_action_parameter_annotation(
             )
             for index, item_annotation in enumerate(args)
         )
+        if any(
+            item_annotation != item_annotations[0]
+            for item_annotation in item_annotations[1:]
+        ):
+            raise _unsupported_action_annotation_error(
+                func,
+                param_name,
+                annotation_path,
+                annotation,
+                "fixed tuple action annotations must be homogeneous; every "
+                "position must use the same supported annotation",
+            )
         return tuple[item_annotations]
 
     if origin is dict:
@@ -320,31 +334,6 @@ def _normalize_action_parameter_annotation(
         annotation,
         "the annotation is not supported by action schema and runtime validation",
     )
-
-
-def _action_annotation_produces_hashable_value(annotation: Any) -> bool:
-    """Return whether every value normalized for this annotation is hashable."""
-    if annotation in {int, float, str, bool, type(None)}:
-        return True
-
-    origin = typing.get_origin(annotation)
-    args = typing.get_args(annotation)
-
-    if origin is typing.Annotated:
-        return bool(args) and _action_annotation_produces_hashable_value(args[0])
-    if origin is typing.Literal:
-        return bool(args)
-    if origin in {typing.Union, UnionType}:
-        return bool(args) and all(
-            _action_annotation_produces_hashable_value(member) for member in args
-        )
-    if origin is tuple:
-        if len(args) == 2 and args[1] is Ellipsis:
-            return _action_annotation_produces_hashable_value(args[0])
-        return bool(args) and all(
-            _action_annotation_produces_hashable_value(member) for member in args
-        )
-    return False
 
 
 def _unsupported_action_annotation_error(
@@ -403,7 +392,85 @@ def _get_action_parameter_contract(
     """Return validated non-agent parameters and normalized type hints."""
     action_params = _get_action_parameters(func, signature)
     type_hints = _get_action_type_hints(func, parameter_names=action_params)
+    _validate_action_parameter_defaults(func, action_params, type_hints)
     return action_params, type_hints
+
+
+def _validate_action_parameter_defaults(
+    func: Callable,
+    action_params: Mapping[str, inspect.Parameter],
+    type_hints: Mapping[str, Any],
+) -> None:
+    """Require declared action defaults to satisfy annotations without coercion."""
+    for param_name, param in action_params.items():
+        if param.default is inspect.Parameter.empty:
+            continue
+
+        annotation = type_hints[param_name]
+        if _action_default_matches_annotation(param.default, annotation):
+            continue
+
+        raise ActionSignatureError(
+            "Invalid default for action "
+            f"{getattr(func, '__name__', repr(func))!r} parameter "
+            f"{param_name!r}: {param.default!r} "
+            f"({type(param.default).__name__}) does not match normalized "
+            f"annotation {annotation!r} without coercion."
+        )
+
+
+def _action_default_matches_annotation(value: Any, annotation: Any) -> bool:
+    """Return whether a default exactly satisfies a normalized annotation."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    if origin is typing.Annotated:
+        return bool(args) and _action_default_matches_annotation(value, args[0])
+    if origin in {typing.Union, UnionType}:
+        return any(_action_default_matches_annotation(value, member) for member in args)
+    if origin is typing.Literal:
+        return any(
+            type(value) is type(candidate) and value == candidate for candidate in args
+        )
+
+    if annotation is type(None):
+        return value is None
+    if annotation is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if annotation is float:
+        return (isinstance(value, int) and not isinstance(value, bool)) or (
+            isinstance(value, float) and math.isfinite(value)
+        )
+    if annotation is str:
+        return isinstance(value, str)
+    if annotation is bool:
+        return isinstance(value, bool)
+
+    if origin is list:
+        return isinstance(value, list) and all(
+            _action_default_matches_annotation(item, args[0]) for item in value
+        )
+
+    if origin is tuple:
+        if not isinstance(value, tuple):
+            return False
+        if len(args) == 2 and args[1] is Ellipsis:
+            return all(
+                _action_default_matches_annotation(item, args[0]) for item in value
+            )
+        return len(value) == len(args) and all(
+            _action_default_matches_annotation(item, item_annotation)
+            for item, item_annotation in zip(value, args, strict=True)
+        )
+
+    if origin is dict:
+        return isinstance(value, dict) and all(
+            _action_default_matches_annotation(key, args[0])
+            and _action_default_matches_annotation(item, args[1])
+            for key, item in value.items()
+        )
+
+    return False
 
 
 def _is_keyword_injectable_parameter(param: inspect.Parameter) -> bool:

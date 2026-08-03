@@ -969,21 +969,19 @@ def test_action_rejects_unsupported_or_unconstrained_parameter_annotation(
 @pytest.mark.parametrize(
     "annotation",
     [
-        set[list[int]],
-        set[tuple[int, list[int]]],
-        set[set[int]],
-        set[dict[str, int]],
+        set[int],
+        set[tuple[int, int]],
+        list[set[int]],
     ],
     ids=[
-        "list-element",
-        "nested-list-element",
-        "set-element",
-        "dict-element",
+        "scalar-set",
+        "tuple-set",
+        "nested-set",
     ],
 )
-def test_action_rejects_recursively_unhashable_set_element_annotation(
-    annotation,
-):
+def test_action_rejects_set_annotations_before_metadata_or_registration(annotation):
+    mutations = []
+
     def apply_values(agent, values) -> str:
         """Apply a set of values.
 
@@ -993,21 +991,25 @@ def test_action_rejects_recursively_unhashable_set_element_annotation(
         Returns:
             Application confirmation.
         """
-        del agent, values
+        mutations.append((agent, values))
         return "applied"
 
     apply_values.__annotations__["values"] = annotation
+    manager = ActionManager()
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
 
     with pytest.raises((TypeError, ValueError)) as exc_info:
-        action(apply_values)
+        action(action_manager=manager)(apply_values)
 
     message = str(exc_info.value)
     assert "apply_values" in message
     assert "values" in message
-    assert "hashable" in message.lower() or "set element" in message.lower()
-    assert "apply_values" not in _GLOBAL_ACTION_REGISTRY
+    assert "set" in message.lower()
+    assert manager.actions == {}
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
     assert not hasattr(apply_values, "__action_metadata__")
     assert not hasattr(apply_values, "__action_schema__")
+    assert mutations == []
 
 
 def test_action_exempts_injected_agent_and_return_annotations_from_contract():
@@ -1039,25 +1041,97 @@ def test_action_exempts_injected_agent_and_return_annotations_from_contract():
     assert params["required"] == ["payload"]
 
 
-def test_action_preserves_supported_fixed_tuple_annotation():
-    @action
-    def move_to(agent, coordinates: tuple[int, int]) -> tuple[int, int]:
-        """Move to fixed coordinates.
+@pytest.mark.parametrize(
+    ("annotation", "item_schema", "length"),
+    [
+        pytest.param(tuple[int, int], {"type": "integer"}, 2, id="two-integers"),
+        pytest.param(
+            tuple[str, str, str],
+            {"type": "string"},
+            3,
+            id="three-strings",
+        ),
+        pytest.param(
+            tuple[int | float, int | float],
+            {
+                "anyOf": [
+                    {"type": "integer"},
+                    {"type": "number"},
+                ]
+            },
+            2,
+            id="two-numeric-unions",
+        ),
+    ],
+)
+def test_action_schema_preserves_homogeneous_fixed_tuple_length(
+    annotation,
+    item_schema,
+    length,
+):
+    def collect_values(agent, values) -> None:
+        """Collect fixed tuple values.
 
         Args:
-            coordinates: Coordinates to move to.
+            values: Values to collect.
+        """
+        del agent, values
+
+    collect_values.__annotations__["values"] = annotation
+    manager = ActionManager()
+    collect_values = action(action_manager=manager)(collect_values)
+
+    assert collect_values.__action_schema__["parameters"]["properties"]["values"] == {
+        "type": "array",
+        "items": item_schema,
+        "minItems": length,
+        "maxItems": length,
+        "description": "Values to collect.",
+    }
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        tuple[int, str],
+        list[tuple[int, str]],
+    ],
+    ids=["direct", "nested"],
+)
+def test_action_rejects_heterogeneous_fixed_tuple_before_metadata_or_registration(
+    annotation,
+):
+    mutations = []
+
+    def apply_values(agent, values) -> str:
+        """Apply tuple values.
+
+        Args:
+            values: Values to apply.
 
         Returns:
-            The selected coordinates.
+            Application confirmation.
         """
-        del agent
-        return coordinates
+        mutations.append((agent, values))
+        return "applied"
 
-    assert move_to.__action_schema__["parameters"]["properties"]["coordinates"] == {
-        "type": "array",
-        "items": {"type": "integer"},
-        "description": "Coordinates to move to.",
-    }
+    apply_values.__annotations__["values"] = annotation
+    manager = ActionManager()
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(action_manager=manager)(apply_values)
+
+    message = str(exc_info.value)
+    assert "apply_values" in message
+    assert "values" in message
+    assert "tuple" in message.lower()
+    assert "homogeneous" in message.lower() or "heterogeneous" in message.lower()
+    assert manager.actions == {}
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(apply_values, "__action_metadata__")
+    assert not hasattr(apply_values, "__action_schema__")
+    assert mutations == []
 
 
 def test_action_schema_preserves_homogeneous_variadic_tuple_annotations():
@@ -1102,6 +1176,62 @@ def test_action_schema_preserves_homogeneous_variadic_tuple_annotations():
             "description": "Integer batches to collect.",
         },
     }
+    for property_schema in properties.values():
+        assert "minItems" not in property_schema
+        assert "maxItems" not in property_schema
+
+
+@pytest.mark.parametrize(
+    ("annotation", "default_value"),
+    [
+        pytest.param(int, "4", id="integer-string"),
+        pytest.param(int, True, id="integer-boolean"),
+        pytest.param(float, float("nan"), id="float-nan"),
+        pytest.param(float, float("inf"), id="float-infinity"),
+        pytest.param(list[int], [1, "2"], id="list-item"),
+        pytest.param(list[int], (1, 2), id="list-container"),
+        pytest.param(tuple[int, int], (1, "2"), id="tuple-item"),
+        pytest.param(tuple[int, int], [1, 2], id="tuple-container"),
+        pytest.param(dict[str, int], {"one": "1"}, id="dict-item"),
+        pytest.param(dict[str, int], [("one", 1)], id="dict-container"),
+        pytest.param(Literal["safe", "fast"], "other", id="literal"),
+    ],
+)
+def test_action_rejects_incompatible_default_before_metadata_or_registration(
+    annotation,
+    default_value,
+):
+    mutations = []
+
+    def apply_default(agent, value) -> object:
+        """Apply a default value.
+
+        Args:
+            value: Value to apply.
+
+        Returns:
+            The applied value.
+        """
+        mutations.append((agent, value))
+        return value
+
+    apply_default.__annotations__["value"] = annotation
+    apply_default.__defaults__ = (default_value,)
+    manager = ActionManager()
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(action_manager=manager)(apply_default)
+
+    message = str(exc_info.value)
+    assert "apply_default" in message
+    assert "value" in message
+    assert "default" in message.lower()
+    assert manager.actions == {}
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(apply_default, "__action_metadata__")
+    assert not hasattr(apply_default, "__action_schema__")
+    assert mutations == []
 
 
 def test_action_rejects_non_agent_positional_only_parameter():

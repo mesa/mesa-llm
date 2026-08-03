@@ -190,6 +190,54 @@ def test_validate_and_execute_allow_omitted_default_arguments():
     assert agent.calls == [("go", 2, "!")]
 
 
+@pytest.mark.parametrize(
+    ("annotation", "default_value"),
+    [
+        pytest.param(int, 4, id="integer"),
+        pytest.param(float, 2.5, id="finite-float"),
+        pytest.param(float, 1, id="integral-value-for-float"),
+        pytest.param(str, "ready", id="string"),
+        pytest.param(bool, True, id="boolean"),
+        pytest.param(int | None, None, id="optional-none"),
+        pytest.param(list[int], [1, 2], id="list"),
+        pytest.param(tuple[int, int], (1, 2), id="fixed-tuple"),
+        pytest.param(dict[str, int], {"one": 1}, id="dictionary"),
+        pytest.param(Literal["safe", "fast"], "safe", id="literal"),
+    ],
+)
+def test_execute_uses_annotation_compatible_python_default(
+    annotation,
+    default_value,
+):
+    def use_default(agent, value) -> object:
+        """Use a configured default value.
+
+        Args:
+            value: Value to use.
+
+        Returns:
+            The configured value.
+        """
+        agent.values.append(value)
+        return value
+
+    use_default.__annotations__["value"] = annotation
+    use_default.__defaults__ = (default_value,)
+    manager = ActionManager()
+    use_default = action(action_manager=manager)(use_default)
+    agent = SimpleNamespace(values=[])
+    choice = ActionChoice(name="use_default", arguments={})
+
+    validated = manager.validate(agent, choice)
+    result = manager.execute(agent, choice)
+
+    assert manager.actions == {"use_default": use_default}
+    assert validated.arguments == {}
+    assert result is default_value
+    assert len(agent.values) == 1
+    assert agent.values[0] is default_value
+
+
 def test_validate_rejects_unexpected_extra_arguments():
     @action
     def speak(agent, message: str) -> str:
@@ -632,10 +680,10 @@ def test_action_decorator_with_unsupported_annotation_fails_before_manager_regis
     assert mutations == []
 
 
-def test_action_decorator_with_unhashable_set_items_fails_before_manager_registration():
+def test_action_decorator_with_set_annotation_fails_before_manager_registration():
     mutations = []
 
-    def apply_values(agent, values: set[list[int]]) -> str:
+    def apply_values(agent, values: set[int]) -> str:
         """Apply a set of values.
 
         Args:
@@ -655,14 +703,16 @@ def test_action_decorator_with_unhashable_set_items_fails_before_manager_registr
     message = str(exc_info.value)
     assert "apply_values" in message
     assert "values" in message
-    assert "hashable" in message.lower() or "set element" in message.lower()
+    assert "set" in message.lower()
     assert manager.actions == {}
+    assert not hasattr(apply_values, "__action_metadata__")
     assert not hasattr(apply_values, "__action_schema__")
     assert mutations == []
 
 
-def test_execute_supports_hashable_nested_set_element_annotation():
-    @action
+def test_action_decorator_with_tuple_set_fails_before_execution_or_registration():
+    mutations = []
+
     def apply_values(agent, values: set[tuple[int, int]]) -> set[tuple[int, int]]:
         """Apply a set of coordinate values.
 
@@ -672,22 +722,22 @@ def test_execute_supports_hashable_nested_set_element_annotation():
         Returns:
             Applied coordinate values.
         """
-        agent.values = values
+        mutations.append((agent, values))
         return values
 
-    agent = SimpleNamespace(values=None)
-    manager = ActionManager(actions=[apply_values])
+    manager = ActionManager()
 
-    result = manager.execute(
-        agent,
-        ActionChoice(
-            name="apply_values",
-            arguments={"values": [[1, 2], [3, 4]]},
-        ),
-    )
+    with pytest.raises((TypeError, ValueError)) as exc_info:
+        action(action_manager=manager)(apply_values)
 
-    assert result == {(1, 2), (3, 4)}
-    assert agent.values == {(1, 2), (3, 4)}
+    message = str(exc_info.value)
+    assert "apply_values" in message
+    assert "values" in message
+    assert "set" in message.lower()
+    assert manager.actions == {}
+    assert not hasattr(apply_values, "__action_metadata__")
+    assert not hasattr(apply_values, "__action_schema__")
+    assert mutations == []
 
 
 def test_validate_does_not_execute_action_or_mutate_state():

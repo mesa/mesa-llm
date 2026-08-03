@@ -81,7 +81,7 @@ async def astep(self):
 
 Omitting per-call `tools` inherits the tools configured on the agent. Passing `tools=None` or `tools=[]` exposes no tools for that reasoning call. Passing `tools=[...]` narrows the configured set and fails fast if a named or callable tool was not configured on the agent first.
 
-Omitting per-call `actions` on action workflow methods inherits the actions configured on the agent. Passing `actions=None` or `actions=[]` exposes no actions for that call. Passing `actions=[...]` narrows the configured action set and fails fast if a named or callable action was not configured on the agent first. A `Callable` supplied as a model-selectable action must be decorated with `@action`.
+Omitting per-call `actions` on action workflow methods inherits the actions configured on the agent. Passing `actions=None` or `actions=[]` exposes no actions for that call. Passing `actions=[...]` narrows the configured action set and fails fast if a named or callable action was not configured on the agent first. A `Callable` supplied as a model-selectable action must be decorated with `@action`. Model-exposed action parameters must use supported runtime annotations. Homogeneous fixed tuples such as `tuple[int, int]` and homogeneous variadic tuples such as `tuple[T, ...]` are supported; heterogeneous fixed tuples and `set[T]` action parameters are rejected. Parameter defaults must already satisfy their annotations without coercion.
 
 ## Base abstractions
 

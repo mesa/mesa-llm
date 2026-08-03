@@ -321,6 +321,14 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
                         "type": "array",
                         "items": _python_to_json_type(args[0]),
                     }
+                if origin is tuple and all(arg == args[0] for arg in args[1:]):
+                    arity = len(args)
+                    return {
+                        "type": "array",
+                        "items": _python_to_json_type(args[0]),
+                        "minItems": arity,
+                        "maxItems": arity,
+                    }
                 # Handle tuple with specific types like tuple[int, str]
                 if origin is tuple and len(args) > 1:
                     # For tuples with multiple specific types, we'll use array with mixed items
