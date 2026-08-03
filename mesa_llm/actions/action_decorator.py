@@ -500,6 +500,7 @@ def action(
                 "type": "object",
                 "properties": properties,
                 "required": list(required_params),
+                "additionalProperties": False,
             },
         }
         if return_docs:

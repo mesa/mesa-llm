@@ -729,6 +729,43 @@ def test_choose_action_invalid_output_makes_one_provider_request_without_tools(
     assert agent.counter == 0
 
 
+def test_act_extra_argument_fails_after_one_provider_request_before_mutation(
+    monkeypatch,
+):
+    provider_calls = []
+
+    def _extra_argument_completion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": 1, "undeclared": "reject me"},
+                    "rationale": "Attempt an invalid local action.",
+                }
+            )
+        )
+
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.completion",
+        _extra_argument_completion,
+    )
+    agent, _ = _make_local_action_choice_agent()
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("act must not execute an invalid selection")
+    )
+
+    with pytest.raises(ValueError, match="Unexpected argument"):
+        agent.act("Choose and execute one local action.")
+
+    assert len(provider_calls) == 1
+    assert agent.counter == 0
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
 def test_choose_action_prefers_final_content_over_reasoning_json():
     agent, _ = _make_local_action_choice_agent()
     agent.llm.generate = Mock(
@@ -821,6 +858,44 @@ async def test_achoose_action_invalid_output_makes_one_provider_request_without_
     assert agent.counter == 0
 
 
+@pytest.mark.asyncio
+async def test_aact_extra_argument_fails_after_one_provider_request_before_mutation(
+    monkeypatch,
+):
+    provider_calls = []
+
+    async def _extra_argument_acompletion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": 1, "undeclared": "reject me"},
+                    "rationale": "Attempt an invalid async local action.",
+                }
+            )
+        )
+
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.acompletion",
+        _extra_argument_acompletion,
+    )
+    agent, _ = _make_local_action_choice_agent()
+    agent.recorder = Mock()
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("aact must not execute an invalid selection")
+    )
+
+    with pytest.raises(ValueError, match="Unexpected argument"):
+        await agent.aact("Choose and execute one async local action.")
+
+    assert len(provider_calls) == 1
+    assert agent.counter == 0
+    assert "action" not in agent.memory.step_content
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
 def test_choose_action_uses_structured_output_context_and_does_not_execute():
     class DummyModel(Model):
         def __init__(self):
@@ -877,6 +952,10 @@ def test_choose_action_uses_structured_output_context_and_does_not_execute():
 
     action_context = call_kwargs["prompt"][0]
     assert "Available actions:" in action_context
+    assert (
+        "The `arguments` object may contain only properties declared for "
+        "the selected action."
+    ) in action_context
     assert '"name": "increment_counter"' in action_context
     assert '"amount"' in action_context
     assert "Choose the next committed action." in call_kwargs["prompt"][1]
@@ -1073,6 +1152,10 @@ async def test_achoose_action_uses_structured_output_context_and_does_not_execut
 
     action_context = call_kwargs["prompt"][0]
     assert "Available actions:" in action_context
+    assert (
+        "The `arguments` object may contain only properties declared for "
+        "the selected action."
+    ) in action_context
     assert '"name": "increment_counter"' in action_context
     assert '"amount"' in action_context
     assert "Choose the next committed action." in call_kwargs["prompt"][1]

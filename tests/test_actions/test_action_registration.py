@@ -80,8 +80,30 @@ def test_action_generates_metadata_and_schema_from_type_hints_and_docstring():
             "type": "object",
             "properties": metadata.parameters,
             "required": ["location", "duration", "tags"],
+            "additionalProperties": False,
         },
         "returns": "Visit confirmation.",
+    }
+
+
+def test_action_schema_closes_outer_arguments_but_preserves_declared_dict_values():
+    @action
+    def record_scores(agent, scores: dict[str, int], round_number: int) -> None:
+        """Record named scores for one round.
+
+        Args:
+            scores: Integer scores keyed by participant name.
+            round_number: Round being recorded.
+        """
+        del agent, scores, round_number
+
+    parameters = record_scores.__action_schema__["parameters"]
+
+    assert parameters["additionalProperties"] is False
+    assert parameters["properties"]["scores"] == {
+        "type": "object",
+        "additionalProperties": {"type": "integer"},
+        "description": "Integer scores keyed by participant name.",
     }
 
 
@@ -471,6 +493,7 @@ def test_action_manager_argument_registers_directly_with_that_manager():
                 },
             },
             "required": ["score"],
+            "additionalProperties": False,
         },
         "returns": "Direct action confirmation.",
     }
@@ -1090,6 +1113,7 @@ def test_wait_has_action_metadata_schema_and_is_explicitly_configurable():
             "type": "object",
             "properties": {},
             "required": [],
+            "additionalProperties": False,
         },
         "returns": "A confirmation that the agent waited.",
     }

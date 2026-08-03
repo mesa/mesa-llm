@@ -329,6 +329,8 @@ class LLMAgent(Agent):
             '{"name": str, "arguments": object, "rationale": str | null}. '
             "The `name` value must be one of the listed action names. "
             "The `arguments` value must be a JSON object for that action. "
+            "The `arguments` object may contain only properties declared for "
+            "the selected action. "
             "Start your response with `{` and end it with `}`. "
             "Do not include any other JSON objects. "
             "Do not include Markdown fences, prose, or hidden reasoning. "
