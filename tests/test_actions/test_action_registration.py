@@ -36,6 +36,25 @@ def restore_global_action_registry():
     _GLOBAL_ACTION_REGISTRY.update(original_registry)
 
 
+def _make_named_managed_action(
+    name: str,
+    marker: str,
+    execution_calls: list[str],
+):
+    def generated_action(agent) -> str:
+        """Return a deterministic marker.
+
+        Returns:
+            The configured marker.
+        """
+        del agent
+        execution_calls.append(marker)
+        return marker
+
+    generated_action.__name__ = name
+    return action(action_manager=ActionManager())(generated_action)
+
+
 def test_action_generates_metadata_and_schema_from_type_hints_and_docstring():
     @action
     def visit(agent, location: str, duration: int, tags: list[str]) -> str:
@@ -410,6 +429,276 @@ def test_bare_action_global_registration_can_be_opted_into_by_name():
 
     assert manager.actions == {"registered_action": registered_action}
     assert manager.available_actions() == {"registered_action": registered_action}
+
+
+def test_action_manager_registration_is_idempotent_for_identical_callable_and_name():
+    execution_calls = []
+    registered_action = _make_named_managed_action(
+        "manager_idempotent_action",
+        "registered",
+        execution_calls,
+    )
+    manager = ActionManager(actions=[registered_action])
+    original_items = list(manager.actions.items())
+
+    manager.register(registered_action)
+
+    assert list(manager.actions.items()) == original_items
+    assert manager.actions["manager_idempotent_action"] is registered_action
+    assert execution_calls == []
+
+
+def test_action_manager_rejects_different_callable_with_occupied_name():
+    execution_calls = []
+    original_action = _make_named_managed_action(
+        "manager_collision_action",
+        "original",
+        execution_calls,
+    )
+    conflicting_action = _make_named_managed_action(
+        "manager_collision_action",
+        "conflicting",
+        execution_calls,
+    )
+    manager = ActionManager(actions=[original_action])
+    original_items = list(manager.actions.items())
+
+    with pytest.raises(ValueError) as exc_info:
+        manager.register(conflicting_action)
+
+    message = str(exc_info.value)
+    assert "manager_collision_action" in message
+    assert any(
+        term in message.lower()
+        for term in ("already", "collision", "conflict", "different")
+    )
+    assert list(manager.actions.items()) == original_items
+    assert manager.actions["manager_collision_action"] is original_action
+    assert execution_calls == []
+
+
+def test_bare_action_registration_is_idempotent_when_redecorating_same_callable():
+    execution_calls = []
+
+    @action
+    def global_idempotent_action(agent) -> str:
+        """Return a marker.
+
+        Returns:
+            The marker.
+        """
+        del agent
+        execution_calls.append("called")
+        return "registered"
+
+    registry_after_first_registration = dict(_GLOBAL_ACTION_REGISTRY)
+
+    redecorated_action = action(global_idempotent_action)
+
+    assert redecorated_action is global_idempotent_action
+    assert registry_after_first_registration == _GLOBAL_ACTION_REGISTRY
+    assert (
+        _GLOBAL_ACTION_REGISTRY["global_idempotent_action"] is global_idempotent_action
+    )
+    assert execution_calls == []
+
+
+def test_bare_action_registration_rejects_name_collision_and_retains_original():
+    execution_calls = []
+
+    @action
+    def global_collision_action(agent) -> str:
+        """Return the original marker.
+
+        Returns:
+            The original marker.
+        """
+        del agent
+        execution_calls.append("original")
+        return "original"
+
+    original_action = global_collision_action
+    registry_before_collision = dict(_GLOBAL_ACTION_REGISTRY)
+
+    def global_collision_action(agent) -> str:
+        """Return the conflicting marker.
+
+        Returns:
+            The conflicting marker.
+        """
+        del agent
+        execution_calls.append("conflicting")
+        return "conflicting"
+
+    with pytest.raises(ValueError) as exc_info:
+        action(global_collision_action)
+
+    message = str(exc_info.value)
+    assert "global_collision_action" in message
+    assert any(
+        term in message.lower()
+        for term in ("already", "collision", "conflict", "different")
+    )
+    assert registry_before_collision == _GLOBAL_ACTION_REGISTRY
+    assert _GLOBAL_ACTION_REGISTRY["global_collision_action"] is original_action
+    assert execution_calls == []
+
+
+def test_register_many_late_collision_is_atomic():
+    execution_calls = []
+    original_action = _make_named_managed_action(
+        "batch_collision_action",
+        "original",
+        execution_calls,
+    )
+    early_new_action = _make_named_managed_action(
+        "batch_early_new_action",
+        "early",
+        execution_calls,
+    )
+    conflicting_action = _make_named_managed_action(
+        "batch_collision_action",
+        "conflicting",
+        execution_calls,
+    )
+    manager = ActionManager(actions=[original_action])
+    original_items = list(manager.actions.items())
+
+    with pytest.raises(ValueError) as exc_info:
+        manager.register_many((early_new_action, conflicting_action))
+
+    assert "batch_collision_action" in str(exc_info.value)
+    assert list(manager.actions.items()) == original_items
+    assert manager.actions["batch_collision_action"] is original_action
+    assert "batch_early_new_action" not in manager.actions
+    assert execution_calls == []
+
+
+@pytest.mark.parametrize(
+    ("late_ref_kind", "expected_exception", "expected_message"),
+    [
+        pytest.param(
+            "invalid",
+            TypeError,
+            "callables or registered action names",
+            id="invalid-reference",
+        ),
+        pytest.param(
+            "undecorated",
+            ActionAnnotationContractError,
+            "@action",
+            id="undecorated-callable",
+        ),
+        pytest.param(
+            "unknown",
+            ValueError,
+            "Unknown action name",
+            id="unknown-name",
+        ),
+    ],
+)
+def test_register_many_late_invalid_reference_is_atomic(
+    late_ref_kind,
+    expected_exception,
+    expected_message,
+):
+    execution_calls = []
+    existing_action = _make_named_managed_action(
+        "batch_existing_action",
+        "existing",
+        execution_calls,
+    )
+    early_new_action = _make_named_managed_action(
+        "batch_valid_early_action",
+        "early",
+        execution_calls,
+    )
+
+    if late_ref_kind == "invalid":
+        late_ref = object()
+    elif late_ref_kind == "undecorated":
+
+        def late_ref(agent) -> str:
+            del agent
+            execution_calls.append("undecorated")
+            return "undecorated"
+
+    else:
+        late_ref = "missing_batch_action"
+
+    manager = ActionManager(actions=[existing_action])
+    original_items = list(manager.actions.items())
+
+    with pytest.raises(expected_exception, match=expected_message):
+        manager.register_many([early_new_action, late_ref])
+
+    assert list(manager.actions.items()) == original_items
+    assert manager.actions["batch_existing_action"] is existing_action
+    assert "batch_valid_early_action" not in manager.actions
+    assert execution_calls == []
+
+
+def test_action_manager_constructor_collision_does_not_partially_register():
+    execution_calls = []
+    early_action = _make_named_managed_action(
+        "constructor_early_action",
+        "early",
+        execution_calls,
+    )
+    original_action = _make_named_managed_action(
+        "constructor_collision_action",
+        "original",
+        execution_calls,
+    )
+    conflicting_action = _make_named_managed_action(
+        "constructor_collision_action",
+        "conflicting",
+        execution_calls,
+    )
+    failed_manager = ActionManager.__new__(ActionManager)
+
+    with pytest.raises(ValueError) as exc_info:
+        failed_manager.__init__(
+            actions=[early_action, original_action, conflicting_action]
+        )
+
+    assert "constructor_collision_action" in str(exc_info.value)
+    assert failed_manager.actions == {}
+    assert execution_calls == []
+
+
+def test_register_many_resolves_repeated_names_and_staged_callable_by_identity():
+    execution_calls = []
+
+    @action
+    def repeated_global_action(agent) -> str:
+        """Return the global marker.
+
+        Returns:
+            The global marker.
+        """
+        del agent
+        execution_calls.append("global")
+        return "global"
+
+    global_manager = ActionManager(
+        actions=["repeated_global_action", "repeated_global_action"]
+    )
+
+    staged_action = _make_named_managed_action(
+        "staged_named_action",
+        "staged",
+        execution_calls,
+    )
+    staged_manager = ActionManager(
+        actions=[staged_action, "staged_named_action", "staged_named_action"]
+    )
+
+    assert global_manager.actions == {"repeated_global_action": repeated_global_action}
+    assert global_manager.actions["repeated_global_action"] is repeated_global_action
+    assert staged_manager.actions == {"staged_named_action": staged_action}
+    assert staged_manager.actions["staged_named_action"] is staged_action
+    assert execution_calls == []
 
 
 def test_action_manager_rejects_undecorated_callable_before_contract_inference(

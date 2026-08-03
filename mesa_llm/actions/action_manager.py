@@ -69,14 +69,47 @@ class ActionManager:
 
     def register(self, fn: Callable):
         """Register an action function by name."""
-        self._get_action_schema(fn)
-        _get_action_parameter_contract(fn)
-        self.actions[fn.__name__] = fn
+        action_name = self._preflight_registration(fn, self.actions)
+        if action_name not in self.actions:
+            self.actions[action_name] = fn
 
     def register_many(self, actions: list[ActionRef] | tuple[ActionRef, ...]):
         """Register explicit action callables or registered action names."""
+        staged_actions = dict(self.actions)
         for action_ref in actions:
-            self.register(self._resolve_registration_action_ref(action_ref))
+            fn = self._resolve_registration_action_ref(
+                action_ref,
+                registered_actions=staged_actions,
+            )
+            action_name = self._preflight_registration(fn, staged_actions)
+            if action_name not in staged_actions:
+                staged_actions[action_name] = fn
+
+        self.actions.update(
+            (name, fn)
+            for name, fn in staged_actions.items()
+            if name not in self.actions
+        )
+
+    def _preflight_registration(
+        self,
+        fn: Callable,
+        registered_actions: dict[str, Callable],
+    ) -> str:
+        """Validate one resolved registration without mutating manager state."""
+        action_name = fn.__name__
+        if (
+            action_name in registered_actions
+            and registered_actions[action_name] is not fn
+        ):
+            raise ValueError(
+                f"Action name {action_name!r} is already registered to a "
+                "different callable in this manager."
+            )
+
+        self._get_action_schema(fn, schema_name=action_name)
+        _get_action_parameter_contract(fn)
+        return action_name
 
     def has_action(self, name: str) -> bool:
         """Return whether this manager has a configured action by name."""
@@ -156,21 +189,29 @@ class ActionManager:
             )
         )
 
-    def _resolve_registration_action_ref(self, action_ref: ActionRef) -> Callable:
+    def _resolve_registration_action_ref(
+        self,
+        action_ref: ActionRef,
+        *,
+        registered_actions: dict[str, Callable] | None = None,
+    ) -> Callable:
         """Resolve constructor action references."""
+        registered_actions = (
+            self.actions if registered_actions is None else registered_actions
+        )
         if callable(action_ref):
             return action_ref
 
         if isinstance(action_ref, str):
-            if action_ref in self.actions:
-                return self.actions[action_ref]
+            if action_ref in registered_actions:
+                return registered_actions[action_ref]
             if action_ref in _GLOBAL_ACTION_REGISTRY:
                 return _GLOBAL_ACTION_REGISTRY[action_ref]
             raise ValueError(
                 style(
                     "Unknown action name(s): "
                     f"{[action_ref]}. Available actions: "
-                    f"{sorted(set(self.actions) | set(_GLOBAL_ACTION_REGISTRY))}",
+                    f"{sorted(set(registered_actions) | set(_GLOBAL_ACTION_REGISTRY))}",
                     color="red",
                 )
             )

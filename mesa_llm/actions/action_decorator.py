@@ -512,7 +512,16 @@ def action(
         if action_manager:
             action_manager.register(func)
         else:
-            _GLOBAL_ACTION_REGISTRY[name] = func
+            if (
+                name in _GLOBAL_ACTION_REGISTRY
+                and _GLOBAL_ACTION_REGISTRY[name] is not func
+            ):
+                raise ValueError(
+                    f"Action name {name!r} is already registered to a different "
+                    "callable in the global action registry."
+                )
+            if name not in _GLOBAL_ACTION_REGISTRY:
+                _GLOBAL_ACTION_REGISTRY[name] = func
 
         return func
 

@@ -1580,7 +1580,9 @@ def test_execute_rejects_non_finite_or_prose_float_before_mutation(invalid_ratio
 def test_execute_rejects_integer_labels_and_prose_before_mutation(
     invalid_citizen_id,
 ):
-    @action
+    manager = ActionManager()
+
+    @action(action_manager=manager)
     def arrest_citizen(agent, citizen_id: int) -> int:
         """Arrest a citizen by id.
 
@@ -1594,7 +1596,6 @@ def test_execute_rejects_integer_labels_and_prose_before_mutation(
         return citizen_id
 
     agent = SimpleNamespace(arrested_ids=[])
-    manager = ActionManager(actions=[arrest_citizen])
 
     with pytest.raises(ValueError, match=r"Invalid argument type.*citizen_id.*int"):
         manager.execute(
