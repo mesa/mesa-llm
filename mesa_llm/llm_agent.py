@@ -26,7 +26,7 @@ from mesa_llm.actions.action_manager import (
     ActionManager,
     ActionSelection,
 )
-from mesa_llm.actions.action_result import ActResult
+from mesa_llm.actions.action_result import ActionPostCommitError, ActResult
 from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.module_llm import ModuleLLM
 from mesa_llm.reasoning.reasoning import (
@@ -458,14 +458,23 @@ class LLMAgent(Agent):
             "action": action_choice.model_dump(),
             "result": result,
         }
-        self.memory.add_to_memory(type="action", content=content)
+        observer_errors: dict[str, Exception] = {}
+        try:
+            self.memory.add_to_memory(type="action", content=content)
+        except Exception as error:
+            observer_errors["memory"] = error
         if self.recorder is not None:
-            self.recorder.record_event(
-                "action",
-                content=content,
-                agent_id=self.unique_id,
-                metadata={"source": "LLMAgent.execute_action"},
-            )
+            try:
+                self.recorder.record_event(
+                    "action",
+                    content=content,
+                    agent_id=self.unique_id,
+                    metadata={"source": "LLMAgent.execute_action"},
+                )
+            except Exception as error:
+                observer_errors["recorder"] = error
+        if observer_errors:
+            raise ActionPostCommitError(action_choice, result, observer_errors)
 
     async def _arecord_successful_action_event(
         self,
@@ -476,14 +485,23 @@ class LLMAgent(Agent):
             "action": action_choice.model_dump(),
             "result": result,
         }
-        await self.memory.aadd_to_memory(type="action", content=content)
+        observer_errors: dict[str, Exception] = {}
+        try:
+            await self.memory.aadd_to_memory(type="action", content=content)
+        except Exception as error:
+            observer_errors["memory"] = error
         if self.recorder is not None:
-            self.recorder.record_event(
-                "action",
-                content=content,
-                agent_id=self.unique_id,
-                metadata={"source": "LLMAgent.execute_action"},
-            )
+            try:
+                self.recorder.record_event(
+                    "action",
+                    content=content,
+                    agent_id=self.unique_id,
+                    metadata={"source": "LLMAgent.execute_action"},
+                )
+            except Exception as error:
+                observer_errors["recorder"] = error
+        if observer_errors:
+            raise ActionPostCommitError(action_choice, result, observer_errors)
 
     def _format_message_status(
         self, message: str, delivered_ids: list[int], skipped_ids: list[int]

@@ -15,8 +15,20 @@ from mesa.discrete_space import OrthogonalMooreGrid
 from mesa.model import Model
 from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
 
-from mesa_llm import Plan
-from mesa_llm.actions import ActionChoice, ActionManager, action, wait
+import mesa_llm.actions as action_exports
+from mesa_llm import (
+    ActionPostCommitError as RootActionPostCommitError,
+)
+from mesa_llm import (
+    Plan,
+)
+from mesa_llm.actions import (
+    ActionChoice,
+    ActionManager,
+    ActionPostCommitError,
+    action,
+    wait,
+)
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
 from mesa_llm.actions.action_manager import _UNSET as _ACTIONS_UNSET
 from mesa_llm.llm_agent import LLMAgent
@@ -1578,6 +1590,525 @@ async def test_aact_records_successful_execution_and_does_not_record_failures():
     assert failing_agent.started is True
     assert "action" not in failing_agent.memory.step_content
     failing_agent.recorder.record_event.assert_not_called()
+
+
+class _ObserverAbort(BaseException):
+    """Sentinel proving observer boundaries catch Exception, not BaseException."""
+
+
+def _make_sync_post_commit_agent(result):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def pd03_sync_action(agent, amount: int) -> object:
+        """Execute one observable synchronous mutation.
+
+        Args:
+            amount: Validated amount.
+
+        Returns:
+            The committed result sentinel.
+        """
+        agent.action_calls += 1
+        agent.timeline.append("action")
+        return result
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_sync_action],
+    )
+    agent.action_calls = 0
+    agent.timeline = []
+    choice = ActionChoice(
+        name="pd03_sync_action",
+        arguments={"amount": "2"},
+        rationale="Exercise post-commit observers.",
+    )
+    return agent, choice
+
+
+def _make_async_post_commit_agent(result):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def pd03_async_action(agent, amount: int) -> object:
+        """Execute one observable asynchronous mutation.
+
+        Args:
+            amount: Validated amount.
+
+        Returns:
+            The committed result sentinel.
+        """
+        agent.action_calls += 1
+        await asyncio.sleep(0)
+        agent.action_await_completions += 1
+        agent.timeline.append("action")
+        return result
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_async_action],
+    )
+    agent.action_calls = 0
+    agent.action_await_completions = 0
+    agent.timeline = []
+    choice = ActionChoice(
+        name="pd03_async_action",
+        arguments={"amount": "2"},
+        rationale="Exercise asynchronous post-commit observers.",
+    )
+    return agent, choice
+
+
+def _install_sync_post_commit_observers(
+    agent,
+    *,
+    memory_error=None,
+    recorder_error=None,
+    recorder_present=True,
+):
+    def observe_memory(*args, **kwargs):
+        agent.timeline.append("memory")
+        if memory_error is not None:
+            raise memory_error
+
+    def observe_recorder(*args, **kwargs):
+        agent.timeline.append("recorder")
+        if recorder_error is not None:
+            raise recorder_error
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(side_effect=observe_memory),
+    )
+    agent.recorder = (
+        SimpleNamespace(record_event=Mock(side_effect=observe_recorder))
+        if recorder_present
+        else None
+    )
+
+
+def _install_async_post_commit_observers(
+    agent,
+    *,
+    memory_error=None,
+    recorder_error=None,
+    recorder_present=True,
+):
+    async def observe_memory(*args, **kwargs):
+        agent.timeline.append("memory")
+        await asyncio.sleep(0)
+        if memory_error is not None:
+            raise memory_error
+
+    def observe_recorder(*args, **kwargs):
+        agent.timeline.append("recorder")
+        if recorder_error is not None:
+            raise recorder_error
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(
+            side_effect=AssertionError("async execution must not use sync memory")
+        ),
+        aadd_to_memory=AsyncMock(side_effect=observe_memory),
+    )
+    agent.recorder = (
+        SimpleNamespace(record_event=Mock(side_effect=observe_recorder))
+        if recorder_present
+        else None
+    )
+
+
+def test_action_post_commit_error_has_established_public_exports():
+    assert action_exports.ActionPostCommitError is ActionPostCommitError
+    assert RootActionPostCommitError is ActionPostCommitError
+
+
+def test_action_post_commit_error_rejects_empty_observer_errors():
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+
+    with pytest.raises(ValueError, match="at least one error"):
+        ActionPostCommitError(action_choice, object(), {})
+
+
+def test_action_post_commit_error_rejects_unsupported_observer_key():
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+
+    with pytest.raises(ValueError, match="unsupported key"):
+        ActionPostCommitError(
+            action_choice,
+            object(),
+            {"cache": RuntimeError("cache failed")},
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_error",
+    [
+        pytest.param("not an exception", id="non-exception"),
+        pytest.param(_ObserverAbort("observer aborted"), id="base-exception-only"),
+    ],
+)
+def test_action_post_commit_error_rejects_non_exception_values(invalid_error):
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+
+    with pytest.raises(TypeError, match="Exception instance"):
+        ActionPostCommitError(
+            action_choice,
+            object(),
+            {"memory": invalid_error},
+        )
+
+
+def test_action_post_commit_error_copies_observer_mapping_shallowly():
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+    memory_error = RuntimeError("memory failed")
+    observer_errors = {"memory": memory_error}
+
+    error = ActionPostCommitError(action_choice, object(), observer_errors)
+
+    assert error.observer_errors is not observer_errors
+    assert error.observer_errors["memory"] is memory_error
+
+    observer_errors["memory"] = RuntimeError("replacement memory failure")
+    observer_errors["recorder"] = ValueError("late recorder failure")
+
+    assert set(error.observer_errors) == {"memory"}
+    assert error.observer_errors["memory"] is memory_error
+
+
+def test_action_post_commit_error_preserves_valid_dual_mapping_and_message():
+    action_choice = ActionChoice(
+        name="constructor_action",
+        arguments={"amount": 2},
+        rationale="Exercise constructor validation.",
+    )
+    result = object()
+    memory_error = RuntimeError("memory failed")
+    recorder_error = ValueError("recorder failed")
+    observer_errors = {
+        "memory": memory_error,
+        "recorder": recorder_error,
+    }
+
+    error = ActionPostCommitError(action_choice, result, observer_errors)
+
+    assert error.committed is True
+    assert error.action is action_choice
+    assert error.result is result
+    assert error.observer_errors is not observer_errors
+    assert error.observer_errors["memory"] is memory_error
+    assert error.observer_errors["recorder"] is recorder_error
+    assert str(error) == (
+        "Action 'constructor_action' committed, but post-commit observer(s) "
+        "failed: memory, recorder."
+    )
+
+
+@pytest.mark.parametrize(
+    ("memory_fails", "recorder_fails"),
+    [
+        pytest.param(True, False, id="memory"),
+        pytest.param(False, True, id="recorder"),
+        pytest.param(True, True, id="both"),
+    ],
+)
+def test_execute_action_reports_post_commit_observer_exceptions(
+    memory_fails,
+    recorder_fails,
+):
+    result = object()
+    memory_error = RuntimeError("memory observer failed")
+    recorder_error = ValueError("recorder observer failed")
+    agent, choice = _make_sync_post_commit_agent(result)
+    _install_sync_post_commit_observers(
+        agent,
+        memory_error=memory_error if memory_fails else None,
+        recorder_error=recorder_error if recorder_fails else None,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        agent.execute_action(choice)
+
+    error = exc_info.value
+    assert error.committed is True
+    assert isinstance(error.action, ActionChoice)
+    assert error.action.name == choice.name
+    assert error.action.arguments == {"amount": 2}
+    assert error.action.rationale == choice.rationale
+    assert error.result is result
+    expected_keys = {
+        name
+        for name, failed in (
+            ("memory", memory_fails),
+            ("recorder", recorder_fails),
+        )
+        if failed
+    }
+    assert isinstance(error.observer_errors, dict)
+    assert set(error.observer_errors) == expected_keys
+    if memory_fails:
+        assert error.observer_errors["memory"] is memory_error
+    if recorder_fails:
+        assert error.observer_errors["recorder"] is recorder_error
+
+    assert agent.action_calls == 1
+    assert agent.timeline == ["action", "memory", "recorder"]
+    agent.memory.add_to_memory.assert_called_once()
+    agent.recorder.record_event.assert_called_once()
+    assert agent.memory.add_to_memory.call_args.kwargs["content"]["result"] is result
+    assert agent.recorder.record_event.call_args.kwargs["content"]["result"] is result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("memory_fails", "recorder_fails"),
+    [
+        pytest.param(True, False, id="memory"),
+        pytest.param(False, True, id="recorder"),
+        pytest.param(True, True, id="both"),
+    ],
+)
+async def test_aexecute_action_reports_post_commit_observer_exceptions(
+    memory_fails,
+    recorder_fails,
+):
+    result = object()
+    memory_error = RuntimeError("async memory observer failed")
+    recorder_error = ValueError("async recorder observer failed")
+    agent, choice = _make_async_post_commit_agent(result)
+    _install_async_post_commit_observers(
+        agent,
+        memory_error=memory_error if memory_fails else None,
+        recorder_error=recorder_error if recorder_fails else None,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        await agent.aexecute_action(choice)
+
+    error = exc_info.value
+    assert error.committed is True
+    assert isinstance(error.action, ActionChoice)
+    assert error.action.name == choice.name
+    assert error.action.arguments == {"amount": 2}
+    assert error.action.rationale == choice.rationale
+    assert error.result is result
+    expected_keys = {
+        name
+        for name, failed in (
+            ("memory", memory_fails),
+            ("recorder", recorder_fails),
+        )
+        if failed
+    }
+    assert isinstance(error.observer_errors, dict)
+    assert set(error.observer_errors) == expected_keys
+    if memory_fails:
+        assert error.observer_errors["memory"] is memory_error
+    if recorder_fails:
+        assert error.observer_errors["recorder"] is recorder_error
+
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    assert agent.timeline == ["action", "memory", "recorder"]
+    agent.memory.aadd_to_memory.assert_awaited_once()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_called_once()
+    assert agent.memory.aadd_to_memory.call_args.kwargs["content"]["result"] is result
+    assert agent.recorder.record_event.call_args.kwargs["content"]["result"] is result
+
+
+def test_execute_action_succeeds_without_optional_recorder():
+    result = object()
+    agent, choice = _make_sync_post_commit_agent(result)
+    _install_sync_post_commit_observers(agent, recorder_present=False)
+
+    returned_result = agent.execute_action(choice)
+
+    assert returned_result is result
+    assert agent.action_calls == 1
+    assert agent.timeline == ["action", "memory"]
+    agent.memory.add_to_memory.assert_called_once()
+    assert agent.recorder is None
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_succeeds_without_optional_recorder():
+    result = object()
+    agent, choice = _make_async_post_commit_agent(result)
+    _install_async_post_commit_observers(agent, recorder_present=False)
+
+    returned_result = await agent.aexecute_action(choice)
+
+    assert returned_result is result
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    assert agent.timeline == ["action", "memory"]
+    agent.memory.aadd_to_memory.assert_awaited_once()
+    agent.memory.add_to_memory.assert_not_called()
+    assert agent.recorder is None
+
+
+def test_execute_action_preserves_pre_commit_failures_without_observers():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    action_error = RuntimeError("sync action body failed")
+
+    @action(action_manager=ActionManager())
+    def pd03_failing_sync_action(agent, amount: int) -> None:
+        """Fail during synchronous action execution.
+
+        Args:
+            amount: Required amount.
+        """
+        agent.action_calls += 1
+        raise action_error
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_failing_sync_action],
+    )
+    agent.action_calls = 0
+    agent.memory = SimpleNamespace(add_to_memory=Mock())
+    agent.recorder = SimpleNamespace(record_event=Mock())
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        agent.execute_action(
+            ActionChoice(name="pd03_failing_sync_action", arguments={})
+        )
+
+    assert agent.action_calls == 0
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        agent.execute_action(
+            ActionChoice(
+                name="pd03_failing_sync_action",
+                arguments={"amount": 1},
+            )
+        )
+
+    assert exc_info.value is action_error
+    assert agent.action_calls == 1
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_preserves_pre_commit_failures_without_observers():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    action_error = RuntimeError("async action body failed")
+
+    @action(action_manager=ActionManager())
+    async def pd03_failing_async_action(agent, amount: int) -> None:
+        """Fail during asynchronous action execution.
+
+        Args:
+            amount: Required amount.
+        """
+        agent.action_calls += 1
+        await asyncio.sleep(0)
+        agent.action_await_completions += 1
+        raise action_error
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_failing_async_action],
+    )
+    agent.action_calls = 0
+    agent.action_await_completions = 0
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(),
+    )
+    agent.recorder = SimpleNamespace(record_event=Mock())
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await agent.aexecute_action(
+            ActionChoice(name="pd03_failing_async_action", arguments={})
+        )
+
+    assert agent.action_calls == 0
+    assert agent.action_await_completions == 0
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await agent.aexecute_action(
+            ActionChoice(
+                name="pd03_failing_async_action",
+                arguments={"amount": 1},
+            )
+        )
+
+    assert exc_info.value is action_error
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_observer", ["memory", "recorder"])
+def test_execute_action_does_not_convert_observer_base_exceptions(failing_observer):
+    result = object()
+    observer_abort = _ObserverAbort(f"sync {failing_observer} aborted")
+    agent, choice = _make_sync_post_commit_agent(result)
+    _install_sync_post_commit_observers(
+        agent,
+        memory_error=observer_abort if failing_observer == "memory" else None,
+        recorder_error=observer_abort if failing_observer == "recorder" else None,
+    )
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        agent.execute_action(choice)
+
+    assert exc_info.value is observer_abort
+    assert agent.action_calls == 1
+    agent.memory.add_to_memory.assert_called_once()
+    if failing_observer == "recorder":
+        agent.recorder.record_event.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_observer", ["memory", "recorder"])
+async def test_aexecute_action_does_not_convert_observer_base_exceptions(
+    failing_observer,
+):
+    result = object()
+    observer_abort = _ObserverAbort(f"async {failing_observer} aborted")
+    agent, choice = _make_async_post_commit_agent(result)
+    _install_async_post_commit_observers(
+        agent,
+        memory_error=observer_abort if failing_observer == "memory" else None,
+        recorder_error=observer_abort if failing_observer == "recorder" else None,
+    )
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        await agent.aexecute_action(choice)
+
+    assert exc_info.value is observer_abort
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    agent.memory.aadd_to_memory.assert_awaited_once()
+    agent.memory.add_to_memory.assert_not_called()
+    if failing_observer == "recorder":
+        agent.recorder.record_event.assert_called_once()
 
 
 @pytest.mark.asyncio

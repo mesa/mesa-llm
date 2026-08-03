@@ -3,7 +3,7 @@ from mesa_llm.actions.action_decorator import (
     action,
 )
 from mesa_llm.actions.action_manager import ActionChoice, ActionManager
-from mesa_llm.actions.action_result import ActResult
+from mesa_llm.actions.action_result import ActionPostCommitError, ActResult
 from mesa_llm.actions.builtins import (
     default_actions,
     move_one_step,
@@ -19,6 +19,7 @@ __all__ = [
     "ActionChoice",
     "ActionManager",
     "ActionMetadata",
+    "ActionPostCommitError",
     "action",
     "default_actions",
     "move_one_step",
