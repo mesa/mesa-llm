@@ -456,6 +456,60 @@ class TestToolDecoractor:
         assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
         assert mutations == []
 
+    def test_tool_preserves_list_variadic_tuple_numeric_literal_union_acceptance(
+        self,
+    ):
+        annotation = list[Literal[1]] | tuple[Literal[1.0], ...]
+        expected_schema = {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1]},
+                },
+                {
+                    "type": "array",
+                    "items": {"type": "number", "enum": [1.0]},
+                },
+            ]
+        }
+        _GLOBAL_TOOL_REGISTRY.pop("select_nested_numeric_value", None)
+        mutations = []
+
+        def select_nested_numeric_value(agent, value) -> object:
+            """Select a nested numeric value.
+
+            Args:
+                agent: The agent making the request.
+                value: Value to select.
+
+            Returns:
+                The selected value.
+            """
+            mutations.append((agent, value))
+            return value
+
+        select_nested_numeric_value.__annotations__["value"] = annotation
+
+        assert _python_to_json_type(annotation) == expected_schema
+        decorated_tool = tool(select_nested_numeric_value)
+
+        try:
+            assert decorated_tool is select_nested_numeric_value
+            assert (
+                _GLOBAL_TOOL_REGISTRY["select_nested_numeric_value"]
+                is select_nested_numeric_value
+            )
+            value_schema = decorated_tool.__tool_schema__["function"]["parameters"][
+                "properties"
+            ]["value"]
+            assert value_schema == {
+                **expected_schema,
+                "description": "Value to select.",
+            }
+            assert mutations == []
+        finally:
+            _GLOBAL_TOOL_REGISTRY.pop("select_nested_numeric_value", None)
+
     @pytest.mark.parametrize(
         "annotation",
         [

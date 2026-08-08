@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import inspect
 import weakref
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import pytest
 
@@ -656,6 +656,234 @@ def test_action_schema_exposes_unambiguous_integral_numeric_literals():
         "enum": [1],
         "description": "Integer literal to select.",
     }
+
+
+_LIST_VARIADIC_NUMERIC_LITERAL_AMBIGUITIES = (
+    pytest.param(
+        list[Literal[1]] | tuple[Literal[1.0], ...],
+        id="list-integer-first",
+    ),
+    pytest.param(
+        tuple[Literal[1.0], ...] | list[Literal[1]],
+        id="variadic-float-first",
+    ),
+)
+
+
+def _make_numeric_container_action(name, annotation, mutations):
+    def select_numeric_value(agent, value) -> object:
+        """Select a numeric container value.
+
+        Args:
+            value: Value to select.
+
+        Returns:
+            The selected value.
+        """
+        mutations.append((agent, value))
+        return value
+
+    select_numeric_value.__name__ = name
+    select_numeric_value.__annotations__["value"] = annotation
+    return select_numeric_value
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    _LIST_VARIADIC_NUMERIC_LITERAL_AMBIGUITIES,
+)
+def test_action_rejects_list_variadic_tuple_numeric_literal_ambiguity_before_mutation(
+    annotation,
+):
+    mutations = []
+    action_name = "select_nested_numeric_value"
+    action_fn = _make_numeric_container_action(action_name, annotation, mutations)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+        action(action_fn)
+
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert mutations == []
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    _LIST_VARIADIC_NUMERIC_LITERAL_AMBIGUITIES,
+)
+def test_action_manager_decorator_rejects_nested_numeric_literal_ambiguity_atomically(
+    annotation,
+):
+    mutations = []
+    retained_action = _make_named_managed_action(
+        "retained_nested_numeric_action",
+        "retained",
+        mutations,
+    )
+    manager = ActionManager(actions=[retained_action])
+    manager_before = dict(manager.actions)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    action_fn = _make_numeric_container_action(
+        "managed_nested_numeric_value",
+        annotation,
+        mutations,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+        action(action_manager=manager)(action_fn)
+
+    assert manager.actions == manager_before
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert mutations == []
+
+
+def test_action_rejects_annotated_nested_dictionary_numeric_literal_ambiguity():
+    annotation = (
+        dict[
+            str,
+            Annotated[list[Literal[1]], "integer list branch"],
+        ]
+        | dict[str, tuple[Literal[1.0], ...]]
+    )
+    mutations = []
+    action_fn = _make_numeric_container_action(
+        "select_annotated_nested_numeric_value",
+        annotation,
+        mutations,
+    )
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+        action(action_fn)
+
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert mutations == []
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    (
+        pytest.param(
+            tuple[Literal[1], Literal[1]] | tuple[Literal[1.0], Literal[1.0]],
+            id="same-fixed-length",
+        ),
+        pytest.param(
+            tuple[Literal[1], Literal[1]] | tuple[Literal[1.0], ...],
+            id="fixed-and-variadic-overlap",
+        ),
+    ),
+)
+def test_action_rejects_overlapping_homogeneous_tuple_numeric_literal_ambiguity(
+    annotation,
+):
+    mutations = []
+    action_fn = _make_numeric_container_action(
+        "select_tuple_numeric_value",
+        annotation,
+        mutations,
+    )
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises(
+        TypeError,
+        match=r"JSON-equivalent|ambiguous|indistinguishable",
+    ):
+        action(action_fn)
+
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert mutations == []
+
+
+@pytest.mark.parametrize(
+    ("case_name", "annotation", "expected_any_of"),
+    (
+        pytest.param(
+            "boolean_integer",
+            list[Literal[True]] | tuple[Literal[1], ...],
+            [
+                {
+                    "type": "array",
+                    "items": {"type": "boolean", "enum": [True]},
+                },
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1]},
+                },
+            ],
+            id="boolean-and-integer",
+        ),
+        pytest.param(
+            "non_equivalent_numbers",
+            list[Literal[1]] | tuple[Literal[2.0], ...],
+            [
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1]},
+                },
+                {
+                    "type": "array",
+                    "items": {"type": "number", "enum": [2.0]},
+                },
+            ],
+            id="non-equivalent-numbers",
+        ),
+        pytest.param(
+            "different_fixed_lengths",
+            tuple[Literal[1], Literal[1]]
+            | tuple[Literal[1.0], Literal[1.0], Literal[1.0]],
+            [
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1]},
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
+                {
+                    "type": "array",
+                    "items": {"type": "number", "enum": [1.0]},
+                    "minItems": 3,
+                    "maxItems": 3,
+                },
+            ],
+            id="different-fixed-lengths",
+        ),
+    ),
+)
+def test_action_accepts_non_ambiguous_nested_numeric_literal_branches(
+    case_name,
+    annotation,
+    expected_any_of,
+):
+    mutations = []
+    action_name = f"select_non_ambiguous_nested_numeric_value_{case_name}"
+    action_fn = _make_numeric_container_action(action_name, annotation, mutations)
+
+    decorated_action = action(action_fn)
+
+    assert decorated_action is action_fn
+    assert _GLOBAL_ACTION_REGISTRY[action_name] is action_fn
+    assert action_fn.__action_schema__["parameters"]["properties"]["value"] == {
+        "anyOf": expected_any_of,
+        "description": "Value to select.",
+    }
+    assert mutations == []
 
 
 def test_action_schema_rejects_ambiguous_numeric_literal_without_registration():

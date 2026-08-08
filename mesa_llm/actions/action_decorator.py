@@ -43,6 +43,226 @@ class ActionSignatureError(ValueError):
     """Raised when an action signature cannot be exposed as JSON arguments."""
 
 
+_ACTION_OBJECT_VALUE_PATH_SEGMENT = ("object", "value")
+_ACTION_ARRAY_WILDCARD_PATH_SEGMENT = ("array", None, None)
+
+
+def _validate_action_numeric_literal_ambiguity(
+    func: Callable,
+    param_name: str,
+    annotation: Any,
+) -> None:
+    """Reject JSON-equivalent numeric Literals in overlapping action shapes."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    if origin is typing.Literal:
+        numeric_values = [value for value in args if type(value) in {int, float}]
+        for index, value in enumerate(numeric_values):
+            for other_value in numeric_values[index + 1 :]:
+                _reject_action_numeric_literal_pair(
+                    func,
+                    param_name,
+                    value,
+                    other_value,
+                )
+        return
+
+    if origin is typing.Annotated:
+        if args:
+            _validate_action_numeric_literal_ambiguity(func, param_name, args[0])
+        return
+
+    if origin in {typing.Union, UnionType}:
+        branch_occurrences = [
+            _action_numeric_literal_occurrences(member) for member in args
+        ]
+        for index, occurrences in enumerate(branch_occurrences):
+            for other_occurrences in branch_occurrences[index + 1 :]:
+                for annotation_path, value in occurrences:
+                    for other_path, other_value in other_occurrences:
+                        if _action_literal_paths_are_compatible(
+                            annotation_path,
+                            other_path,
+                        ):
+                            _reject_action_numeric_literal_pair(
+                                func,
+                                param_name,
+                                value,
+                                other_value,
+                            )
+        for member in args:
+            _validate_action_numeric_literal_ambiguity(func, param_name, member)
+        return
+
+    if origin in {list, set} and args:
+        _validate_action_numeric_literal_ambiguity(func, param_name, args[0])
+        return
+
+    if origin is tuple:
+        for item_annotation in args:
+            if item_annotation is not Ellipsis:
+                _validate_action_numeric_literal_ambiguity(
+                    func,
+                    param_name,
+                    item_annotation,
+                )
+        return
+
+    if origin is dict and len(args) == 2:
+        _validate_action_numeric_literal_ambiguity(func, param_name, args[1])
+
+
+def _action_numeric_literal_occurrences(
+    annotation: Any,
+    annotation_path: tuple[tuple[Any, ...], ...] = (),
+) -> list[tuple[tuple[tuple[Any, ...], ...], int | float]]:
+    """Collect exact numeric Literal values at canonical JSON paths."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    if origin is typing.Literal:
+        return [
+            (annotation_path, value) for value in args if type(value) in {int, float}
+        ]
+    if origin is typing.Annotated and args:
+        return _action_numeric_literal_occurrences(args[0], annotation_path)
+    if origin in {typing.Union, UnionType}:
+        return [
+            occurrence
+            for member in args
+            for occurrence in _action_numeric_literal_occurrences(
+                member,
+                annotation_path,
+            )
+        ]
+    if origin in {list, set} and args:
+        return _action_numeric_literal_occurrences(
+            args[0],
+            (*annotation_path, _ACTION_ARRAY_WILDCARD_PATH_SEGMENT),
+        )
+    if origin is tuple:
+        if len(args) == 2 and args[1] is Ellipsis:
+            return _action_numeric_literal_occurrences(
+                args[0],
+                (*annotation_path, _ACTION_ARRAY_WILDCARD_PATH_SEGMENT),
+            )
+        tuple_length = len(args)
+        return [
+            occurrence
+            for position, item_annotation in enumerate(args)
+            for occurrence in _action_numeric_literal_occurrences(
+                item_annotation,
+                (*annotation_path, ("array", tuple_length, position)),
+            )
+        ]
+    if origin is dict and len(args) == 2:
+        return _action_numeric_literal_occurrences(
+            args[1],
+            (*annotation_path, _ACTION_OBJECT_VALUE_PATH_SEGMENT),
+        )
+    return []
+
+
+def _action_literal_paths_are_compatible(
+    annotation_path: tuple[tuple[Any, ...], ...],
+    other_path: tuple[tuple[Any, ...], ...],
+) -> bool:
+    """Return whether two canonical paths can address the same JSON value."""
+    if len(annotation_path) != len(other_path):
+        return False
+
+    for segment, other_segment in zip(annotation_path, other_path, strict=True):
+        if segment[0] != other_segment[0]:
+            return False
+        if segment[0] == "object":
+            if segment != other_segment:
+                return False
+        elif (
+            segment != _ACTION_ARRAY_WILDCARD_PATH_SEGMENT
+            and other_segment != _ACTION_ARRAY_WILDCARD_PATH_SEGMENT
+            and segment != other_segment
+        ):
+            return False
+    return True
+
+
+def _reject_action_numeric_literal_pair(
+    func: Callable,
+    param_name: str,
+    value: int | float,
+    other_value: int | float,
+) -> None:
+    if type(value) is type(other_value) or value != other_value:
+        return
+    raise ActionAnnotationContractError(
+        "Ambiguous numeric Literal contract for action "
+        f"{getattr(func, '__name__', repr(func))!r} parameter {param_name!r}: "
+        "JSON-equivalent values with different Python numeric types occur at "
+        "compatible JSON paths; "
+        f"got {value!r} ({type(value).__name__}) and "
+        f"{other_value!r} ({type(other_value).__name__})."
+    )
+
+
+def _action_annotation_to_json_type(annotation: Any) -> dict[str, Any]:
+    """Convert a normalized action annotation without applying tool policy."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    if origin is typing.Annotated and args:
+        return _action_annotation_to_json_type(args[0])
+
+    if origin in {typing.Union, UnionType}:
+        non_none_args = [member for member in args if member is not type(None)]
+        if len(non_none_args) == 1 and type(None) in args:
+            base_schema = _action_annotation_to_json_type(non_none_args[0])
+            if "enum" in base_schema:
+                return {"anyOf": [base_schema, {"type": "null"}]}
+            if "type" in base_schema:
+                base_type = base_schema["type"]
+                base_schema["type"] = (
+                    [*base_type, "null"]
+                    if isinstance(base_type, list)
+                    else [base_type, "null"]
+                )
+                return base_schema
+            return {"anyOf": [base_schema, {"type": "null"}]}
+        if len(non_none_args) > 1:
+            return {
+                "anyOf": [_action_annotation_to_json_type(member) for member in args]
+            }
+        return {"type": "null"}
+
+    if origin is list:
+        return {
+            "type": "array",
+            "items": _action_annotation_to_json_type(args[0]),
+        }
+
+    if origin is tuple:
+        if len(args) == 2 and args[1] is Ellipsis:
+            return {
+                "type": "array",
+                "items": _action_annotation_to_json_type(args[0]),
+            }
+        tuple_length = len(args)
+        return {
+            "type": "array",
+            "items": _action_annotation_to_json_type(args[0]),
+            "minItems": tuple_length,
+            "maxItems": tuple_length,
+        }
+
+    if origin is dict:
+        return {
+            "type": "object",
+            "additionalProperties": _action_annotation_to_json_type(args[1]),
+        }
+
+    return _python_to_json_type(annotation)
+
+
 def _validate_action_callable(func: Callable) -> None:
     """Reject callable kinds that cannot return one completed action result."""
     if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
@@ -100,13 +320,22 @@ def _get_action_type_hints(
             param_name,
             annotations[param_name],
         )
-        _python_to_json_type(resolved_annotation)
+        _validate_action_numeric_literal_ambiguity(
+            func,
+            param_name,
+            resolved_annotation,
+        )
         normalized_annotation = _normalize_action_parameter_annotation(
             func,
             param_name,
             resolved_annotation,
         )
-        _python_to_json_type(normalized_annotation)
+        _validate_action_numeric_literal_ambiguity(
+            func,
+            param_name,
+            normalized_annotation,
+        )
+        _action_annotation_to_json_type(normalized_annotation)
         type_hints[param_name] = normalized_annotation
     return type_hints
 
@@ -197,7 +426,6 @@ def _normalize_action_parameter_annotation(
                 annotation,
                 "Literal must contain at least one value",
             )
-        _python_to_json_type(annotation)
         return annotation
 
     if origin in {typing.Union, UnionType}:
@@ -591,7 +819,7 @@ def action(
         for param_name in action_params:
             raw_type = type_hints[param_name]
             properties[param_name] = {
-                **_python_to_json_type(raw_type),
+                **_action_annotation_to_json_type(raw_type),
                 "description": arg_docs.get(param_name, ""),
             }
 
