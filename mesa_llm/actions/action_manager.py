@@ -28,6 +28,7 @@ from mesa_llm.actions.action_decorator import (
     _get_action_type_hints,
     _get_required_action_parameter_names,
     _is_keyword_injectable_parameter,
+    _validate_action_callable,
 )
 
 _UNSET = object()
@@ -97,6 +98,7 @@ class ActionManager:
         registered_actions: dict[str, Callable],
     ) -> str:
         """Validate one resolved registration without mutating manager state."""
+        _validate_action_callable(fn)
         action_name = fn.__name__
         if (
             action_name in registered_actions

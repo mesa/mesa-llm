@@ -43,6 +43,17 @@ class ActionSignatureError(ValueError):
     """Raised when an action signature cannot be exposed as JSON arguments."""
 
 
+def _validate_action_callable(func: Callable) -> None:
+    """Reject callable kinds that cannot return one completed action result."""
+    if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
+        raise ActionSignatureError(
+            "Action "
+            f"{getattr(func, '__name__', repr(func))!r} must return one completed "
+            "result; generator and async-generator functions are not supported "
+            "as actions."
+        )
+
+
 @dataclass(frozen=True)
 class ActionMetadata:
     """Metadata generated for an action function."""
@@ -538,6 +549,7 @@ def action(
         )
 
     def decorator(func: Callable):
+        _validate_action_callable(func)
         name = func.__name__
         sig = inspect.signature(func)
         action_params, type_hints = _get_action_parameter_contract(func, sig)

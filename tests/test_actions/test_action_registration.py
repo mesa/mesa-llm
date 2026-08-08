@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import weakref
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -8,6 +9,7 @@ import pytest
 
 import mesa_llm.actions.action_manager as action_manager_module
 from mesa_llm.actions import (
+    ActionChoice,
     ActionManager,
     ActionMetadata,
     action,
@@ -17,6 +19,7 @@ from mesa_llm.actions import (
 from mesa_llm.actions.action_decorator import (
     _GLOBAL_ACTION_REGISTRY,
     ActionAnnotationContractError,
+    ActionSignatureError,
 )
 
 if TYPE_CHECKING:
@@ -53,6 +56,206 @@ def _make_named_managed_action(
 
     generated_action.__name__ = name
     return action(action_manager=ActionManager())(generated_action)
+
+
+_DECLARED_GENERATOR_KINDS = ("generator", "async-generator")
+
+
+def _make_declared_generator_action(
+    kind: str,
+    name: str,
+    body_calls: list[object],
+):
+    if kind == "generator":
+
+        def generated_action(agent):
+            """Yield one action result.
+
+            Returns:
+                One yielded result.
+            """
+            body_calls.append(agent)
+            yield "generated"
+
+    else:
+
+        async def generated_action(agent):
+            """Yield one asynchronous action result.
+
+            Returns:
+                One yielded result.
+            """
+            body_calls.append(agent)
+            yield "generated"
+
+    generated_action.__name__ = name
+    return generated_action
+
+
+def _assert_declared_generator_error(exc_info, action_name: str):
+    assert type(exc_info.value) is ActionSignatureError
+    assert str(exc_info.value) == (
+        f"Action {action_name!r} must return one completed result; generator and "
+        "async-generator functions are not supported as actions."
+    )
+
+
+@pytest.mark.parametrize("kind", _DECLARED_GENERATOR_KINDS)
+def test_action_rejects_declared_generator_before_metadata_schema_or_global_registration(
+    kind,
+):
+    body_calls = []
+    action_name = f"direct_{kind.replace('-', '_')}_action"
+    action_fn = _make_declared_generator_action(kind, action_name, body_calls)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    assert inspect.isgeneratorfunction(action_fn) is (kind == "generator")
+    assert inspect.isasyncgenfunction(action_fn) is (kind == "async-generator")
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        action(action_fn)
+
+    _assert_declared_generator_error(exc_info, action_name)
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize("kind", _DECLARED_GENERATOR_KINDS)
+def test_action_manager_decorator_rejects_declared_generator_atomically(kind):
+    body_calls = []
+    manager = ActionManager()
+    retained_action = _make_named_managed_action(
+        f"retained_decorator_{kind.replace('-', '_')}_action",
+        "retained",
+        body_calls,
+    )
+    manager.register(retained_action)
+    manager_before = dict(manager.actions)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    action_name = f"managed_{kind.replace('-', '_')}_action"
+    action_fn = _make_declared_generator_action(kind, action_name, body_calls)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        action(action_manager=manager)(action_fn)
+
+    _assert_declared_generator_error(exc_info, action_name)
+    assert manager.actions == manager_before
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize("kind", _DECLARED_GENERATOR_KINDS)
+def test_action_manager_constructor_rejects_declared_generator_atomically(kind):
+    body_calls = []
+    suffix = kind.replace("-", "_")
+    early_action = _make_named_managed_action(
+        f"early_constructor_{suffix}_action",
+        "early",
+        body_calls,
+    )
+    action_name = f"constructor_{suffix}_action"
+    action_fn = _make_declared_generator_action(kind, action_name, body_calls)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    failed_manager = ActionManager.__new__(ActionManager)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        failed_manager.__init__(actions=[early_action, action_fn])
+
+    _assert_declared_generator_error(exc_info, action_name)
+    assert failed_manager.actions == {}
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize("kind", _DECLARED_GENERATOR_KINDS)
+def test_action_manager_register_rejects_declared_generator_atomically(kind):
+    body_calls = []
+    suffix = kind.replace("-", "_")
+    retained_action = _make_named_managed_action(
+        f"retained_register_{suffix}_action",
+        "retained",
+        body_calls,
+    )
+    manager = ActionManager(actions=[retained_action])
+    manager_before = dict(manager.actions)
+    action_name = f"register_{suffix}_action"
+    action_fn = _make_declared_generator_action(kind, action_name, body_calls)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        manager.register(action_fn)
+
+    _assert_declared_generator_error(exc_info, action_name)
+    assert manager.actions == manager_before
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize("kind", _DECLARED_GENERATOR_KINDS)
+def test_action_manager_register_many_rejects_declared_generator_atomically(kind):
+    body_calls = []
+    suffix = kind.replace("-", "_")
+    retained_action = _make_named_managed_action(
+        f"retained_batch_{suffix}_action",
+        "retained",
+        body_calls,
+    )
+    early_action = _make_named_managed_action(
+        f"early_batch_{suffix}_action",
+        "early",
+        body_calls,
+    )
+    manager = ActionManager(actions=[retained_action])
+    manager_before = dict(manager.actions)
+    action_name = f"batch_{suffix}_action"
+    action_fn = _make_declared_generator_action(kind, action_name, body_calls)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        manager.register_many([early_action, action_fn])
+
+    _assert_declared_generator_error(exc_info, action_name)
+    assert manager.actions == manager_before
+    assert early_action.__name__ not in manager.actions
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+def test_normal_action_returning_generator_remains_a_deferred_runtime_contract():
+    body_calls = []
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def return_generator(agent) -> object:
+        """Return a generator object from an ordinary action function.
+
+        Returns:
+            A deferred generator result.
+        """
+        body_calls.append(agent)
+        return (value for value in ("deferred",))
+
+    agent = object()
+
+    result = manager.execute(
+        agent,
+        ActionChoice(name="return_generator", arguments={}),
+    )
+
+    assert not inspect.isgeneratorfunction(return_generator)
+    assert inspect.isgenerator(result)
+    assert body_calls == [agent]
+    assert list(result) == ["deferred"]
 
 
 def test_action_generates_metadata_and_schema_from_type_hints_and_docstring():
