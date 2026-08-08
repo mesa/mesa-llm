@@ -361,17 +361,47 @@ def _unsupported_action_annotation_error(
     )
 
 
+def _validate_injected_agent_parameters(
+    func: Callable,
+    signature: inspect.Signature | None = None,
+) -> tuple[str, ...]:
+    """Return injected-agent names, rejecting ambiguous action signatures."""
+    if signature is None:
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return ()
+
+    injected_agent_parameters = tuple(
+        param_name
+        for param_name, param in signature.parameters.items()
+        if param_name.casefold() == "agent" and _is_keyword_injectable_parameter(param)
+    )
+    if len(injected_agent_parameters) > 1:
+        raise ActionSignatureError(
+            "Action "
+            f"{getattr(func, '__name__', repr(func))!r} has multiple injected "
+            f"'agent' parameters: {list(injected_agent_parameters)}. At most one "
+            "keyword-compatible parameter named 'agent' case-insensitively is "
+            "supported."
+        )
+
+    return injected_agent_parameters
+
+
 def _get_action_parameters(
     func: Callable,
     signature: inspect.Signature | None = None,
 ) -> dict[str, inspect.Parameter]:
     """Return non-agent action parameters, rejecting unsupported signatures."""
     signature = signature or inspect.signature(func)
+    injected_agent_parameters = _validate_injected_agent_parameters(func, signature)
+
     action_params: dict[str, inspect.Parameter] = {}
     unsupported_params = []
 
     for param_name, param in signature.parameters.items():
-        if param_name.lower() == "agent" and _is_keyword_injectable_parameter(param):
+        if param_name in injected_agent_parameters:
             continue
         if param.kind in {
             inspect.Parameter.POSITIONAL_ONLY,

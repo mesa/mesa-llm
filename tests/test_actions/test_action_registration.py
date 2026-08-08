@@ -100,6 +100,71 @@ def _assert_declared_generator_error(exc_info, action_name: str):
     )
 
 
+_DUPLICATE_AGENT_PARAMETER_CASES = (
+    pytest.param(
+        "mixed-kinds",
+        ("agent", "Agent"),
+        id="positional-agent-and-keyword-only-Agent",
+    ),
+    pytest.param(
+        "capitalization-variants",
+        ("AgEnT", "AGENT", "aGeNt"),
+        id="three-capitalization-variants",
+    ),
+)
+
+
+def _make_duplicate_agent_action(
+    case: str,
+    name: str,
+    body_calls: list[tuple[object, ...]],
+):
+    if case == "mixed-kinds":
+
+        def duplicate_agent_action(agent, *, Agent) -> str:  # noqa: N803
+            """Return a completion marker.
+
+            Returns:
+                The completion marker.
+            """
+            body_calls.append((agent, Agent))
+            return "completed"
+
+    else:
+
+        def duplicate_agent_action(
+            AgEnT,  # noqa: N803
+            AGENT,  # noqa: N803
+            *,
+            aGeNt,  # noqa: N803
+        ) -> str:
+            """Return a completion marker.
+
+            Returns:
+                The completion marker.
+            """
+            body_calls.append((AgEnT, AGENT, aGeNt))
+            return "completed"
+
+    duplicate_agent_action.__name__ = name
+    return duplicate_agent_action
+
+
+def _assert_duplicate_agent_error(
+    exc_info,
+    action_name: str,
+    parameter_names: tuple[str, ...],
+):
+    assert type(exc_info.value) is ActionSignatureError
+    message = str(exc_info.value)
+    assert action_name in message
+    assert all(repr(name) in message for name in parameter_names)
+    assert any(
+        phrase in message.casefold()
+        for phrase in ("multiple", "at most one", "more than one", "duplicate")
+    )
+
+
 @pytest.mark.parametrize("kind", _DECLARED_GENERATOR_KINDS)
 def test_action_rejects_declared_generator_before_metadata_schema_or_global_registration(
     kind,
@@ -256,6 +321,189 @@ def test_normal_action_returning_generator_remains_a_deferred_runtime_contract()
     assert inspect.isgenerator(result)
     assert body_calls == [agent]
     assert list(result) == ["deferred"]
+
+
+@pytest.mark.parametrize(
+    ("case", "parameter_names"),
+    _DUPLICATE_AGENT_PARAMETER_CASES,
+)
+def test_action_rejects_duplicate_injected_agent_parameters_before_mutation(
+    case,
+    parameter_names,
+):
+    body_calls = []
+    action_name = f"direct_duplicate_agent_{case.replace('-', '_')}"
+    action_fn = _make_duplicate_agent_action(case, action_name, body_calls)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        action(action_fn)
+
+    _assert_duplicate_agent_error(exc_info, action_name, parameter_names)
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case", "parameter_names"),
+    _DUPLICATE_AGENT_PARAMETER_CASES,
+)
+def test_action_manager_decorator_rejects_duplicate_injected_agent_parameters_atomically(
+    case,
+    parameter_names,
+):
+    body_calls = []
+    retained_action = _make_named_managed_action(
+        f"retained_duplicate_agent_decorator_{case.replace('-', '_')}",
+        "retained",
+        body_calls,
+    )
+    manager = ActionManager(actions=[retained_action])
+    manager_before = dict(manager.actions)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    action_name = f"managed_duplicate_agent_{case.replace('-', '_')}"
+    action_fn = _make_duplicate_agent_action(case, action_name, body_calls)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        action(action_manager=manager)(action_fn)
+
+    _assert_duplicate_agent_error(exc_info, action_name, parameter_names)
+    assert manager.actions == manager_before
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case", "parameter_names"),
+    _DUPLICATE_AGENT_PARAMETER_CASES,
+)
+def test_action_manager_register_rejects_raw_duplicate_injected_agent_parameters(
+    case,
+    parameter_names,
+):
+    body_calls = []
+    retained_action = _make_named_managed_action(
+        f"retained_duplicate_agent_register_{case.replace('-', '_')}",
+        "retained",
+        body_calls,
+    )
+    manager = ActionManager(actions=[retained_action])
+    manager_before = dict(manager.actions)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    action_name = f"raw_duplicate_agent_{case.replace('-', '_')}"
+    action_fn = _make_duplicate_agent_action(case, action_name, body_calls)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        manager.register(action_fn)
+
+    _assert_duplicate_agent_error(exc_info, action_name, parameter_names)
+    assert manager.actions == manager_before
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case", "parameter_names"),
+    _DUPLICATE_AGENT_PARAMETER_CASES,
+)
+def test_action_manager_constructor_rejects_duplicate_injected_agent_parameters_atomically(
+    case,
+    parameter_names,
+):
+    body_calls = []
+    early_action = _make_named_managed_action(
+        f"early_duplicate_agent_constructor_{case.replace('-', '_')}",
+        "early",
+        body_calls,
+    )
+    action_name = f"constructor_duplicate_agent_{case.replace('-', '_')}"
+    action_fn = _make_duplicate_agent_action(case, action_name, body_calls)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    failed_manager = ActionManager.__new__(ActionManager)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        failed_manager.__init__(actions=[early_action, action_fn])
+
+    _assert_duplicate_agent_error(exc_info, action_name, parameter_names)
+    assert failed_manager.actions == {}
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case", "parameter_names"),
+    _DUPLICATE_AGENT_PARAMETER_CASES,
+)
+def test_action_manager_register_many_duplicate_injected_agent_parameters_is_atomic(
+    case,
+    parameter_names,
+):
+    body_calls = []
+    retained_action = _make_named_managed_action(
+        f"retained_duplicate_agent_batch_{case.replace('-', '_')}",
+        "retained",
+        body_calls,
+    )
+    early_action = _make_named_managed_action(
+        f"early_duplicate_agent_batch_{case.replace('-', '_')}",
+        "early",
+        body_calls,
+    )
+    manager = ActionManager(actions=[retained_action])
+    manager_before = dict(manager.actions)
+    registry_before = dict(_GLOBAL_ACTION_REGISTRY)
+    action_name = f"batch_duplicate_agent_{case.replace('-', '_')}"
+    action_fn = _make_duplicate_agent_action(case, action_name, body_calls)
+
+    with pytest.raises(ActionSignatureError) as exc_info:
+        manager.register_many([early_action, action_fn])
+
+    _assert_duplicate_agent_error(exc_info, action_name, parameter_names)
+    assert manager.actions == manager_before
+    assert early_action.__name__ not in manager.actions
+    assert not hasattr(action_fn, "__action_metadata__")
+    assert not hasattr(action_fn, "__action_schema__")
+    assert registry_before == _GLOBAL_ACTION_REGISTRY
+    assert body_calls == []
+
+
+def test_action_preserves_one_keyword_only_capitalized_agent_parameter():
+    body_calls = []
+
+    @action
+    def keyword_only_agent(value: str, *, Agent) -> str:  # noqa: N803
+        """Return a value.
+
+        Args:
+            value: Value to return.
+
+        Returns:
+            The provided value.
+        """
+        body_calls.append((Agent, value))
+        return value
+
+    manager = ActionManager(actions=[keyword_only_agent])
+    injected_agent = object()
+    result = manager.execute(
+        injected_agent,
+        ActionChoice(name="keyword_only_agent", arguments={"value": "accepted"}),
+    )
+
+    assert result == "accepted"
+    assert keyword_only_agent.__action_schema__["parameters"]["properties"] == {
+        "value": {"type": "string", "description": "Value to return."}
+    }
+    assert "Agent" not in keyword_only_agent.__action_metadata__.parameters
+    assert body_calls == [(injected_agent, "accepted")]
 
 
 def test_action_generates_metadata_and_schema_from_type_hints_and_docstring():
