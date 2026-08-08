@@ -13,7 +13,9 @@ def _memory_event_payloads(agent, event_type: str):
 
     contents = [entry.content for entry in entries]
     step_content = getattr(memory, "step_content", None)
-    if isinstance(step_content, dict):
+    if isinstance(step_content, dict) and not any(
+        step_content is content for content in contents
+    ):
         contents.append(step_content)
 
     for content in contents:
@@ -113,8 +115,7 @@ def get_dialogue_history(agent, max_messages: int = 5) -> str:
     """Extract and format recent dialogue from an agent's memory.
 
     This helper function supports both STLTMemory (short_term_memory) and
-    EpisodicMemory (memory_entries). It efficiently extracts the last N
-    dialogue messages by iterating in reverse order.
+    EpisodicMemory (memory_entries), including messages in the current step.
 
     Args:
         agent: The LLMAgent whose memory to extract dialogue from
@@ -123,52 +124,36 @@ def get_dialogue_history(agent, max_messages: int = 5) -> str:
     Returns:
         Formatted dialogue history string, or "No recent dialogue." if empty
     """
+    if max_messages <= 0:
+        return "No recent dialogue."
+
+    messages = list(_memory_event_payloads(agent, "message"))[-max_messages:]
     dialogue = []
+    for message in messages:
+        sender = message.get("sender", "Unknown")
+        msg = message.get("message", "")
 
-    # Support both STLTMemory and EpisodicMemory
-    memory_source = None
-    if hasattr(agent.memory, "short_term_memory"):
-        memory_source = agent.memory.short_term_memory
-    elif hasattr(agent.memory, "memory_entries"):
-        memory_source = agent.memory.memory_entries
+        if hasattr(sender, "unique_id"):
+            sender_name = f"{type(sender).__name__} {sender.unique_id}"
+        elif isinstance(sender, int) and not isinstance(sender, bool):
+            agent_obj = next(
+                (
+                    candidate
+                    for candidate in agent.model.agents
+                    if candidate.unique_id == sender
+                ),
+                None,
+            )
+            sender_name = (
+                f"{type(agent_obj).__name__} {sender}"
+                if agent_obj is not None
+                else f"Agent {sender}"
+            )
+        else:
+            sender_name = str(sender)
 
-    if memory_source:
-        # Iterate in reverse to efficiently get last N messages
-        # We check at most max_messages * 2 recent entries to account for
-        # non-dialogue entries (observations, movements, etc.)
-        entries_to_check = min(len(memory_source), max_messages * 2)
+        dialogue.append(f"- {sender_name}: {msg}")
 
-        for entry in reversed(list(memory_source)[-entries_to_check:]):
-            # Stop if we already have enough dialogue messages
-            if len(dialogue) >= max_messages:
-                break
-
-            # Check if entry.content is a dict and has 'message'
-            if isinstance(entry.content, dict) and "message" in entry.content:
-                sender = entry.content.get("sender", "Unknown")
-                msg = entry.content.get("message", "")
-
-                # Handle both agent objects and agent IDs
-                if hasattr(sender, "unique_id"):
-                    # sender is an agent object (from send_message())
-                    sender_name = f"{type(sender).__name__} {sender.unique_id}"
-                elif isinstance(sender, int):
-                    # sender is an ID (from speak_to action)
-                    # Try to find the agent by ID to get its type
-                    try:
-                        agent_obj = next(
-                            a for a in agent.model.agents if a.unique_id == sender
-                        )
-                        sender_name = f"{type(agent_obj).__name__} {sender}"
-                    except StopIteration:
-                        sender_name = f"Agent {sender}"
-                else:
-                    sender_name = str(sender)
-
-                dialogue.append(f"- {sender_name}: {msg}")
-
-    # Reverse to get chronological order (oldest first)
-    dialogue.reverse()
     return "\n".join(dialogue) if dialogue else "No recent dialogue."
 
 

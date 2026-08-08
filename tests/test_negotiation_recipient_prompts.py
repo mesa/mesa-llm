@@ -8,9 +8,12 @@ from mesa.model import Model
 from examples.negotiation.agents import (
     BuyerAgent,
     SellerAgent,
+    get_dialogue_history,
     get_eligible_recipients,
     get_recipient_prompt,
 )
+from mesa_llm.memory.episodic_memory import EpisodicMemory
+from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.reasoning.react import ReActReasoning
 
 
@@ -26,6 +29,43 @@ def _memory(*contents, step_content=None):
         short_term_memory=[SimpleNamespace(content=content) for content in contents],
         step_content=step_content,
     )
+
+
+def _dialogue_agent(memory_kind: str = "stlt"):
+    agent = SimpleNamespace(
+        model=SimpleNamespace(agents=[], steps=0),
+        step_prompt="",
+    )
+    if memory_kind == "stlt":
+        memory = STLTMemory(
+            agent=agent,
+            short_term_capacity=20,
+            consolidation_capacity=0,
+            display=False,
+            llm_model="openai/test",
+        )
+    else:
+        memory = EpisodicMemory(
+            agent=agent,
+            display=False,
+            llm_model="openai/test",
+        )
+        memory.grade_event_importance = Mock(return_value=3)
+    agent.memory = memory
+    return agent
+
+
+def _add_message(agent, sender, message: str):
+    agent.memory.add_to_memory(
+        "message",
+        {"sender": sender, "message": message, "recipients": []},
+    )
+
+
+def _finalize_stlt_step(agent, step: int):
+    agent.model.steps = step
+    agent.memory.process_step(pre_step=True)
+    agent.memory.process_step(pre_step=False)
 
 
 def _observation(*visible_labels: str):
@@ -88,6 +128,104 @@ def _assert_wait_only_memory(seller):
         },
         "result": "waited",
     }
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+def test_dialogue_history_flattens_one_message_added_through_real_memory_api(
+    memory_kind,
+):
+    sender = _example_agent("SellerAgent", 7)
+    agent = _dialogue_agent(memory_kind)
+    agent.model.agents = [sender]
+
+    _add_message(agent, sender.unique_id, "The price is 40.")
+    if memory_kind == "stlt":
+        _finalize_stlt_step(agent, 1)
+
+    assert get_dialogue_history(agent) == "- SellerAgent 7: The price is 40."
+
+
+def test_dialogue_history_preserves_chronology_across_entries_and_current_buffer():
+    matched_sender = _example_agent("SellerAgent", 7)
+    object_sender = _example_agent("BuyerAgent", 3)
+    agent = _dialogue_agent()
+    agent.model.agents = [matched_sender]
+
+    _add_message(agent, object_sender, "Object sender.")
+    _finalize_stlt_step(agent, 1)
+    _add_message(agent, matched_sender.unique_id, "Matching integer sender.")
+    _add_message(agent, 99, "Unknown integer sender.")
+    _finalize_stlt_step(agent, 2)
+    _add_message(agent, "external-feed", "Stable fallback sender.")
+
+    assert len(agent.memory.short_term_memory[0].content["message"]) == 1
+    assert len(agent.memory.short_term_memory[1].content["message"]) == 2
+    assert len(agent.memory.step_content["message"]) == 1
+    assert get_dialogue_history(agent) == "\n".join(
+        (
+            "- BuyerAgent 3: Object sender.",
+            "- SellerAgent 7: Matching integer sender.",
+            "- Agent 99: Unknown integer sender.",
+            "- external-feed: Stable fallback sender.",
+        )
+    )
+
+
+def test_dialogue_history_supports_legacy_single_dictionary_message_entry():
+    agent = _dialogue_agent()
+    agent.memory.step_content["message"] = {
+        "sender": 41,
+        "message": "Legacy shape.",
+        "recipients": [],
+    }
+    _finalize_stlt_step(agent, 1)
+
+    assert isinstance(agent.memory.short_term_memory[0].content["message"], dict)
+    assert get_dialogue_history(agent) == "- Agent 41: Legacy shape."
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+def test_dialogue_history_applies_max_messages_after_flattening(memory_kind):
+    agent = _dialogue_agent(memory_kind)
+    for number in range(1, 6):
+        _add_message(agent, "sender", f"message {number}")
+
+    assert get_dialogue_history(agent, max_messages=3) == "\n".join(
+        (
+            "- sender: message 3",
+            "- sender: message 4",
+            "- sender: message 5",
+        )
+    )
+
+
+def test_dialogue_history_does_not_double_count_shared_current_content():
+    agent = _dialogue_agent()
+    _add_message(agent, 5, "Count this once.")
+    _finalize_stlt_step(agent, 1)
+
+    finalized_content = agent.memory.short_term_memory[-1].content
+    agent.memory.step_content = finalized_content
+
+    assert agent.memory.step_content is finalized_content
+    assert get_dialogue_history(agent) == "- Agent 5: Count this once."
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+def test_dialogue_history_returns_empty_result_for_empty_real_memory(memory_kind):
+    agent = _dialogue_agent(memory_kind)
+
+    assert get_dialogue_history(agent) == "No recent dialogue."
+
+
+@pytest.mark.parametrize("max_messages", (0, -1))
+def test_dialogue_history_non_positive_limit_returns_empty_result(max_messages):
+    agent = _dialogue_agent()
+    _add_message(agent, 2, "Excluded by limit.")
+
+    assert (
+        get_dialogue_history(agent, max_messages=max_messages) == "No recent dialogue."
+    )
 
 
 def test_eligible_recipients_resolve_structured_ids_against_model_agents():
