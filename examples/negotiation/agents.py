@@ -1,7 +1,9 @@
 import json
 
-from mesa_llm.actions import ActionChoice, social_actions, teleport_to_location, wait
+from examples.negotiation.actions import speak_to
+from mesa_llm.actions import ActionChoice, teleport_to_location, wait
 from mesa_llm.llm_agent import LLMAgent
+from mesa_llm.reasoning.reasoning import Observation
 
 
 def _memory_event_payloads(agent, event_type: str):
@@ -51,6 +53,18 @@ def _recent_dialogue_partner_ids(agent) -> set:
             or action_choice.get("name") != "speak_to"
         ):
             continue
+
+        result = event.get("result")
+        if isinstance(result, dict) and "delivered" in result:
+            delivered = result["delivered"]
+            if isinstance(delivered, list | tuple):
+                partner_ids.update(
+                    recipient
+                    for recipient in delivered
+                    if not isinstance(recipient, bool)
+                )
+            continue
+
         arguments = action_choice.get("arguments")
         if not isinstance(arguments, dict):
             continue
@@ -89,6 +103,20 @@ def get_eligible_recipients(agent, observation, recipient_type: str) -> list[dic
         )
 
     return sorted(recipients, key=lambda recipient: recipient["unique_id"])
+
+
+def _get_current_eligible_recipient_ids(agent, recipient_type: str) -> list[int]:
+    """Recompute eligible recipient IDs from current simulation state."""
+    self_state, local_state = agent._build_observation()
+    observation = Observation(
+        step=agent.model.steps,
+        self_state=self_state,
+        local_state=local_state,
+    )
+    return [
+        recipient["unique_id"]
+        for recipient in get_eligible_recipients(agent, observation, recipient_type)
+    ]
 
 
 def get_recipient_prompt(recipients: list[dict]) -> str:
@@ -176,10 +204,14 @@ class SellerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            actions=[*social_actions(), wait],
+            actions=[speak_to, wait],
         )
 
         self.sales = 0
+
+    def _get_eligible_speak_to_recipient_ids(self) -> list[int]:
+        """Return currently eligible buyer IDs for local message delivery."""
+        return _get_current_eligible_recipient_ids(self, "BuyerAgent")
 
     def _seller_step_prompt(self, dialogue_history, eligible_buyers):
         return (
@@ -257,10 +289,14 @@ class BuyerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            actions=[teleport_to_location, *social_actions(), "buy_product"],
+            actions=[teleport_to_location, speak_to, "buy_product"],
         )
         self.budget = budget
         self.products = []
+
+    def _get_eligible_speak_to_recipient_ids(self) -> list[int]:
+        """Return currently eligible seller IDs for local message delivery."""
+        return _get_current_eligible_recipient_ids(self, "SellerAgent")
 
     def _buyer_step_prompt_and_actions(self, observation, dialogue_history):
         eligible_sellers = get_eligible_recipients(self, observation, "SellerAgent")

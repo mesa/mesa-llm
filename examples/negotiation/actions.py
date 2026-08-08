@@ -1,9 +1,64 @@
 from typing import TYPE_CHECKING
 
-from mesa_llm.actions import action
+from mesa_llm.actions import ActionManager, action
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
+
+
+_action_manager = ActionManager()
+
+
+@action(action_manager=_action_manager)
+def speak_to(
+    agent: "LLMAgent",
+    listener_agents_unique_ids: list[int],
+    message: str,
+) -> dict[str, list[int]]:
+    """Send a message only to currently eligible negotiation recipients.
+
+    Args:
+        agent: Provided automatically.
+        listener_agents_unique_ids: The requested recipient IDs.
+        message: The message to send.
+
+    Returns:
+        The requested, delivered, and skipped recipient IDs.
+    """
+    requested = list(listener_agents_unique_ids)
+    eligible_ids = set(agent._get_eligible_speak_to_recipient_ids())
+    recipients_by_id = {
+        candidate.unique_id: candidate for candidate in agent.model.agents
+    }
+
+    delivery_plan = []
+    delivered = []
+    skipped = []
+    for recipient_id in dict.fromkeys(requested):
+        recipient = recipients_by_id.get(recipient_id)
+        memory = getattr(recipient, "memory", None)
+        add_to_memory = getattr(memory, "add_to_memory", None)
+        if recipient_id not in eligible_ids or not callable(add_to_memory):
+            skipped.append(recipient_id)
+            continue
+
+        delivered.append(recipient_id)
+        delivery_plan.append(add_to_memory)
+
+    for add_to_memory in delivery_plan:
+        add_to_memory(
+            type="message",
+            content={
+                "message": message,
+                "sender": agent.unique_id,
+            },
+        )
+
+    return {
+        "requested": requested,
+        "delivered": delivered,
+        "skipped": skipped,
+    }
 
 
 @action

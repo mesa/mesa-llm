@@ -12,6 +12,8 @@ from examples.negotiation.agents import (
     get_eligible_recipients,
     get_recipient_prompt,
 )
+from mesa_llm.actions import ActionChoice
+from mesa_llm.actions import speak_to as builtin_speak_to
 from mesa_llm.memory.episodic_memory import EpisodicMemory
 from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.reasoning.react import ReActReasoning
@@ -85,6 +87,60 @@ def _seller_agent(monkeypatch):
     )
     seller.memory.display = False
     return seller
+
+
+def _buyer_agent(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    model = Model(rng=42)
+    buyer = BuyerAgent(
+        model=model,
+        reasoning=ReActReasoning,
+        llm_model="openai/test",
+        system_prompt="",
+        vision=1,
+        internal_state=["careful"],
+        budget=50,
+    )
+    buyer.memory.display = False
+    return buyer
+
+
+def _add_peer(model, agent_type: str):
+    peer_class = type(agent_type, (Agent,), {})
+    peer = peer_class(model)
+    peer.memory = SimpleNamespace(add_to_memory=Mock())
+    return peer
+
+
+def _set_visible_peers(agent, *peers, side_effect=None):
+    local_state = {f"{type(peer).__name__} {peer.unique_id}": {} for peer in peers}
+
+    def build_observation():
+        if side_effect is not None:
+            side_effect()
+        return {}, local_state
+
+    agent._build_observation = Mock(side_effect=build_observation)
+    return local_state
+
+
+def _speak_choice(requested_ids, message="Offer is 40."):
+    return ActionChoice(
+        name="speak_to",
+        arguments={
+            "listener_agents_unique_ids": requested_ids,
+            "message": message,
+        },
+    )
+
+
+def _assert_delivery_partition(result, requested, delivered, skipped):
+    assert result == {
+        "requested": requested,
+        "delivered": delivered,
+        "skipped": skipped,
+    }
+    assert list(result) == ["requested", "delivered", "skipped"]
 
 
 def _add_buyer(model):
@@ -226,6 +282,267 @@ def test_dialogue_history_non_positive_limit_returns_empty_result(max_messages):
     assert (
         get_dialogue_history(agent, max_messages=max_messages) == "No recent dialogue."
     )
+
+
+def test_seller_execute_action_filters_and_reports_complete_recipient_partition(
+    monkeypatch,
+):
+    seller = _seller_agent(monkeypatch)
+    visible_buyer = _add_peer(seller.model, "BuyerAgent")
+    recent_buyer = _add_peer(seller.model, "BuyerAgent")
+    wrong_type = _add_peer(seller.model, "SellerAgent")
+    off_topology_buyer = _add_peer(seller.model, "BuyerAgent")
+    _set_visible_peers(seller, visible_buyer)
+    seller.memory.add_to_memory(
+        "message",
+        {
+            "sender": recent_buyer.unique_id,
+            "message": "What is your price?",
+            "recipients": [seller.unique_id],
+        },
+    )
+    _forbid_action_selection(seller)
+
+    delivery_order = []
+    for recipient in (visible_buyer, recent_buyer):
+        recipient.memory.add_to_memory.side_effect = (
+            lambda *, type, content, recipient_id=recipient.unique_id: (
+                delivery_order.append(recipient_id)
+            )
+        )
+
+    nonexistent_id = 999_999
+    requested = [
+        recent_buyer.unique_id,
+        visible_buyer.unique_id,
+        recent_buyer.unique_id,
+        seller.unique_id,
+        wrong_type.unique_id,
+        off_topology_buyer.unique_id,
+        nonexistent_id,
+        visible_buyer.unique_id,
+        wrong_type.unique_id,
+    ]
+
+    result = seller.execute_action(
+        _speak_choice(requested),
+        actions=["speak_to"],
+    )
+
+    delivered = [recent_buyer.unique_id, visible_buyer.unique_id]
+    skipped = [
+        seller.unique_id,
+        wrong_type.unique_id,
+        off_topology_buyer.unique_id,
+        nonexistent_id,
+    ]
+    _assert_delivery_partition(result, requested, delivered, skipped)
+    assert seller._action_manager.available_actions(seller)["speak_to"] is not (
+        builtin_speak_to
+    )
+    seller._build_observation.assert_called_once_with()
+    assert delivery_order == delivered
+    for recipient in (visible_buyer, recent_buyer):
+        recipient.memory.add_to_memory.assert_called_once_with(
+            type="message",
+            content={"message": "Offer is 40.", "sender": seller.unique_id},
+        )
+    wrong_type.memory.add_to_memory.assert_not_called()
+    off_topology_buyer.memory.add_to_memory.assert_not_called()
+    seller.llm.generate.assert_not_called()
+    seller.llm.agenerate.assert_not_awaited()
+
+
+def test_seller_execute_action_reports_no_delivery_without_recipient_mutation(
+    monkeypatch,
+):
+    seller = _seller_agent(monkeypatch)
+    wrong_type = _add_peer(seller.model, "SellerAgent")
+    off_topology_buyer = _add_peer(seller.model, "BuyerAgent")
+    _set_visible_peers(seller)
+    _forbid_action_selection(seller)
+    nonexistent_id = 999_999
+    requested = [
+        seller.unique_id,
+        wrong_type.unique_id,
+        off_topology_buyer.unique_id,
+        nonexistent_id,
+        off_topology_buyer.unique_id,
+    ]
+
+    result = seller.execute_action(
+        _speak_choice(requested, message="Anyone there?"),
+        actions=["speak_to"],
+    )
+
+    skipped = [
+        seller.unique_id,
+        wrong_type.unique_id,
+        off_topology_buyer.unique_id,
+        nonexistent_id,
+    ]
+    _assert_delivery_partition(result, requested, [], skipped)
+    assert result["delivered"] == []
+    wrong_type.memory.add_to_memory.assert_not_called()
+    off_topology_buyer.memory.add_to_memory.assert_not_called()
+    assert "message" not in seller.memory.step_content
+
+
+@pytest.mark.asyncio
+async def test_seller_aexecute_action_uses_same_recipient_authorization(monkeypatch):
+    seller = _seller_agent(monkeypatch)
+    visible_buyer = _add_peer(seller.model, "BuyerAgent")
+    off_topology_buyer = _add_peer(seller.model, "BuyerAgent")
+    _set_visible_peers(seller, visible_buyer)
+    _forbid_action_selection(seller)
+    requested = [
+        visible_buyer.unique_id,
+        off_topology_buyer.unique_id,
+        visible_buyer.unique_id,
+    ]
+
+    result = await seller.aexecute_action(
+        _speak_choice(requested, message="Async offer."),
+        actions=["speak_to"],
+    )
+
+    _assert_delivery_partition(
+        result,
+        requested,
+        [visible_buyer.unique_id],
+        [off_topology_buyer.unique_id],
+    )
+    visible_buyer.memory.add_to_memory.assert_called_once_with(
+        type="message",
+        content={"message": "Async offer.", "sender": seller.unique_id},
+    )
+    off_topology_buyer.memory.add_to_memory.assert_not_called()
+    seller.llm.generate.assert_not_called()
+    seller.llm.agenerate.assert_not_awaited()
+
+
+def test_buyer_execute_action_uses_seller_specific_authorization(monkeypatch):
+    buyer = _buyer_agent(monkeypatch)
+    visible_seller = _add_peer(buyer.model, "SellerAgent")
+    wrong_type = _add_peer(buyer.model, "BuyerAgent")
+    off_topology_seller = _add_peer(buyer.model, "SellerAgent")
+    _set_visible_peers(buyer, visible_seller)
+    _forbid_action_selection(buyer)
+    nonexistent_id = 999_999
+    requested = [
+        visible_seller.unique_id,
+        wrong_type.unique_id,
+        off_topology_seller.unique_id,
+        nonexistent_id,
+        visible_seller.unique_id,
+    ]
+
+    result = buyer.execute_action(
+        _speak_choice(requested, message="What is the price?"),
+        actions=["speak_to"],
+    )
+
+    _assert_delivery_partition(
+        result,
+        requested,
+        [visible_seller.unique_id],
+        [
+            wrong_type.unique_id,
+            off_topology_seller.unique_id,
+            nonexistent_id,
+        ],
+    )
+    visible_seller.memory.add_to_memory.assert_called_once_with(
+        type="message",
+        content={"message": "What is the price?", "sender": buyer.unique_id},
+    )
+    wrong_type.memory.add_to_memory.assert_not_called()
+    off_topology_seller.memory.add_to_memory.assert_not_called()
+    buyer.llm.generate.assert_not_called()
+    buyer.llm.agenerate.assert_not_awaited()
+
+
+def test_recipient_partition_is_complete_before_first_delivery_mutation(monkeypatch):
+    seller = _seller_agent(monkeypatch)
+    first_buyer = _add_peer(seller.model, "BuyerAgent")
+    second_buyer = _add_peer(seller.model, "BuyerAgent")
+    off_topology_buyer = _add_peer(seller.model, "BuyerAgent")
+    events = []
+    local_state = _set_visible_peers(
+        seller,
+        first_buyer,
+        second_buyer,
+        side_effect=lambda: events.append("authorize"),
+    )
+    _forbid_action_selection(seller)
+
+    def mutate_topology_after_first_delivery(*, type, content):
+        del type, content
+        events.append(f"deliver:{first_buyer.unique_id}")
+        local_state[f"BuyerAgent {off_topology_buyer.unique_id}"] = {}
+
+    first_buyer.memory.add_to_memory.side_effect = mutate_topology_after_first_delivery
+    second_buyer.memory.add_to_memory.side_effect = lambda *, type, content: (
+        events.append(f"deliver:{second_buyer.unique_id}")
+    )
+    requested = [
+        first_buyer.unique_id,
+        off_topology_buyer.unique_id,
+        second_buyer.unique_id,
+    ]
+
+    result = seller.execute_action(
+        _speak_choice(requested),
+        actions=["speak_to"],
+    )
+
+    _assert_delivery_partition(
+        result,
+        requested,
+        [first_buyer.unique_id, second_buyer.unique_id],
+        [off_topology_buyer.unique_id],
+    )
+    assert events == [
+        "authorize",
+        f"deliver:{first_buyer.unique_id}",
+        f"deliver:{second_buyer.unique_id}",
+    ]
+    seller._build_observation.assert_called_once_with()
+    off_topology_buyer.memory.add_to_memory.assert_not_called()
+
+
+def test_recent_partner_tracking_uses_delivered_partition_not_raw_requested_ids(
+    monkeypatch,
+):
+    seller = _seller_agent(monkeypatch)
+    delivered_buyer = _add_peer(seller.model, "BuyerAgent")
+    unauthorized_buyer = _add_peer(seller.model, "BuyerAgent")
+    _set_visible_peers(seller, delivered_buyer)
+    _forbid_action_selection(seller)
+    requested = [delivered_buyer.unique_id, unauthorized_buyer.unique_id]
+
+    result = seller.execute_action(
+        _speak_choice(requested),
+        actions=["speak_to"],
+    )
+    recent_recipients = get_eligible_recipients(
+        seller,
+        _observation(),
+        "BuyerAgent",
+    )
+
+    _assert_delivery_partition(
+        result,
+        requested,
+        [delivered_buyer.unique_id],
+        [unauthorized_buyer.unique_id],
+    )
+    assert [recipient["unique_id"] for recipient in recent_recipients] == result[
+        "delivered"
+    ]
+    assert unauthorized_buyer.unique_id in result["skipped"]
+    delivered_buyer.memory.add_to_memory.assert_called_once()
+    unauthorized_buyer.memory.add_to_memory.assert_not_called()
 
 
 def test_eligible_recipients_resolve_structured_ids_against_model_agents():
