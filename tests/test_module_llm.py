@@ -1,11 +1,34 @@
+import asyncio
 import logging
 import os
 from unittest.mock import patch
 
 import pytest
-from litellm.exceptions import NotFoundError, RateLimitError
+from litellm.exceptions import (
+    APIConnectionError,
+    NotFoundError,
+    RateLimitError,
+    Timeout,
+)
+from tenacity import wait_none
 
 from mesa_llm.module_llm import ModuleLLM
+
+_RETRYABLE_TRANSPORT_ERRORS = (
+    APIConnectionError,
+    Timeout,
+    RateLimitError,
+)
+
+
+def _make_retryable_transport_error(error_type):
+    return error_type(
+        message="transient transport failure",
+        llm_provider="openai",
+        model="openai/gpt-4o",
+        max_retries=0,
+        num_retries=0,
+    )
 
 
 class TestModuleLLM:
@@ -194,6 +217,37 @@ class TestModuleLLM:
         )
         assert response is not None
 
+    @pytest.mark.parametrize(
+        "error_type",
+        _RETRYABLE_TRANSPORT_ERRORS,
+        ids=lambda error_type: error_type.__name__,
+    )
+    def test_generate_preserves_generic_retry_for_transport_errors(
+        self,
+        monkeypatch,
+        error_type,
+    ):
+        provider_calls = []
+        expected_response = object()
+
+        def _complete_after_transient_error(**kwargs):
+            provider_calls.append(kwargs)
+            if len(provider_calls) == 1:
+                raise _make_retryable_transport_error(error_type)
+            return expected_response
+
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.completion",
+            _complete_after_transient_error,
+        )
+        llm = ModuleLLM(llm_model="openai/gpt-4o")
+        generate_without_wait = ModuleLLM.generate.retry_with(wait=wait_none())
+
+        response = generate_without_wait(llm, prompt="Retry a generic request.")
+
+        assert response is expected_response
+        assert len(provider_calls) == 2
+
     def test_generate_rewrites_rate_limit_error_with_openai_docs(self, monkeypatch):
         original_error = RateLimitError(
             "per-minute limit hit", "openai", "openai/gpt-4o"
@@ -258,6 +312,42 @@ class TestModuleLLM:
             prompt=["Hello, how are you?", "What is the weather in Tokyo?"]
         )
         assert response is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error_type",
+        _RETRYABLE_TRANSPORT_ERRORS,
+        ids=lambda error_type: error_type.__name__,
+    )
+    async def test_agenerate_preserves_generic_retry_for_transport_errors(
+        self,
+        monkeypatch,
+        error_type,
+    ):
+        provider_calls = []
+        expected_response = object()
+
+        async def _complete_after_transient_error(**kwargs):
+            await asyncio.sleep(0)
+            provider_calls.append(kwargs)
+            if len(provider_calls) == 1:
+                raise _make_retryable_transport_error(error_type)
+            return expected_response
+
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.wait_exponential",
+            lambda **kwargs: wait_none(),
+        )
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.acompletion",
+            _complete_after_transient_error,
+        )
+        llm = ModuleLLM(llm_model="openai/gpt-4o")
+
+        response = await llm.agenerate(prompt="Retry a generic async request.")
+
+        assert response is expected_response
+        assert len(provider_calls) == 2
 
     @pytest.mark.asyncio
     async def test_agenerate_rewrites_rate_limit_error_with_openrouter_docs(

@@ -1,5 +1,8 @@
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from dotenv import load_dotenv
 from litellm import acompletion, completion, litellm
@@ -9,13 +12,19 @@ from litellm.exceptions import (
     RateLimitError,
     Timeout,
 )
-from tenacity import AsyncRetrying, retry, retry_if_exception_type, wait_exponential
+from tenacity import AsyncRetrying, retry, retry_if_exception, wait_exponential
 
 RETRYABLE_EXCEPTIONS = (
     APIConnectionError,
     Timeout,
     RateLimitError,
 )
+_ONE_SHOT_COMPLETION = ContextVar("mesa_llm_one_shot_completion", default=False)
+
+
+def _should_retry_completion(error: BaseException) -> bool:
+    return not _ONE_SHOT_COMPLETION.get() and isinstance(error, RETRYABLE_EXCEPTIONS)
+
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -180,9 +189,43 @@ class ModuleLLM:
             num_retries=error.num_retries,
         )
 
+    @contextmanager
+    def _one_shot_completion(self) -> Iterator[None]:
+        """Disable retry and fallback layers for one completion request."""
+        token = _ONE_SHOT_COMPLETION.set(True)
+        try:
+            yield
+        finally:
+            _ONE_SHOT_COMPLETION.reset(token)
+
+    def _build_completion_kwargs(
+        self,
+        messages: list[dict],
+        tool_schema: list[dict] | None,
+        tool_choice: str,
+        response_format: dict | object | None,
+        suppress_thinking: bool,
+    ) -> dict:
+        completion_kwargs = {
+            "model": self.llm_model,
+            "messages": messages,
+            "tools": tool_schema,
+            "tool_choice": tool_choice if tool_schema else None,
+            "response_format": response_format,
+        }
+        if suppress_thinking and self.llm_model.startswith(("ollama/", "ollama_chat/")):
+            completion_kwargs.update({"think": False, "drop_params": True})
+        if self.api_base:
+            completion_kwargs["api_base"] = self.api_base
+        if _ONE_SHOT_COMPLETION.get():
+            completion_kwargs.update(
+                {"num_retries": 0, "max_retries": 0, "fallbacks": []}
+            )
+        return completion_kwargs
+
     @retry(
         wait=wait_exponential(multiplier=1, min=1, max=60),
-        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        retry=retry_if_exception(_should_retry_completion),
         reraise=True,
     )
     def generate(
@@ -211,18 +254,13 @@ class ModuleLLM:
         """
 
         messages = self._build_messages(prompt, system_prompt=system_prompt)
-
-        completion_kwargs = {
-            "model": self.llm_model,
-            "messages": messages,
-            "tools": tool_schema,
-            "tool_choice": tool_choice if tool_schema else None,
-            "response_format": response_format,
-        }
-        if suppress_thinking and self.llm_model.startswith(("ollama/", "ollama_chat/")):
-            completion_kwargs.update({"think": False, "drop_params": True})
-        if self.api_base:
-            completion_kwargs["api_base"] = self.api_base
+        completion_kwargs = self._build_completion_kwargs(
+            messages,
+            tool_schema,
+            tool_choice,
+            response_format,
+            suppress_thinking,
+        )
 
         try:
             response = completion(**completion_kwargs)
@@ -252,23 +290,17 @@ class ModuleLLM:
         messages = self._build_messages(prompt, system_prompt=system_prompt)
         async for attempt in AsyncRetrying(
             wait=wait_exponential(multiplier=1, min=1, max=60),
-            retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+            retry=retry_if_exception(_should_retry_completion),
             reraise=True,
         ):
             with attempt:
-                completion_kwargs = {
-                    "model": self.llm_model,
-                    "messages": messages,
-                    "tools": tool_schema,
-                    "tool_choice": tool_choice if tool_schema else None,
-                    "response_format": response_format,
-                }
-                if suppress_thinking and self.llm_model.startswith(
-                    ("ollama/", "ollama_chat/")
-                ):
-                    completion_kwargs.update({"think": False, "drop_params": True})
-                if self.api_base:
-                    completion_kwargs["api_base"] = self.api_base
+                completion_kwargs = self._build_completion_kwargs(
+                    messages,
+                    tool_schema,
+                    tool_choice,
+                    response_format,
+                    suppress_thinking,
+                )
 
                 try:
                     response = await acompletion(**completion_kwargs)

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from litellm.exceptions import APIConnectionError, RateLimitError, Timeout
 from mesa.agent import Agent
 from mesa.discrete_space import OrthogonalMooreGrid
 from mesa.model import Model
@@ -609,6 +610,53 @@ def _make_local_action_choice_agent(
     return agent, local_increment_counter
 
 
+_ACTION_SELECTION_TRANSPORT_ERRORS = (
+    APIConnectionError,
+    Timeout,
+    RateLimitError,
+)
+
+
+def _make_action_selection_transport_error(error_type):
+    return error_type(
+        message="selection transport failure",
+        llm_provider="openai",
+        model="openai/gpt-4o",
+        max_retries=0,
+        num_retries=0,
+    )
+
+
+def _action_selection_state(agent):
+    return (
+        agent.counter,
+        tuple(agent.internal_state),
+        agent.model.steps,
+        tuple(agent.memory.short_term_memory),
+        dict(agent.memory.step_content),
+    )
+
+
+def _assert_normalized_action_selection_transport_error(
+    error,
+    error_type,
+):
+    assert type(error) is error_type
+    assert error.llm_provider == "openai"
+    assert error.model == "openai/gpt-4o"
+    assert error.num_retries == 0
+    assert error.max_retries == 0
+    assert "selection transport failure" in str(error)
+
+    if error_type is RateLimitError:
+        assert "Rate limit exceeded for model 'openai/gpt-4o'." in str(error)
+        assert "https://developers.openai.com/api/docs/guides/rate-limits" in str(error)
+    else:
+        assert str(error) == (
+            f"litellm.{error_type.__name__}: selection transport failure"
+        )
+
+
 @pytest.mark.parametrize(
     ("content", "expected_rationale"),
     [
@@ -727,6 +775,55 @@ def test_choose_action_invalid_output_makes_one_provider_request_without_tools(
     assert provider_kwargs["response_format"] is ActionChoice
     assert provider_kwargs["think"] is False
     assert agent.counter == 0
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    _ACTION_SELECTION_TRANSPORT_ERRORS,
+    ids=lambda error_type: error_type.__name__,
+)
+def test_act_transport_error_is_one_shot_and_mutation_free(
+    monkeypatch,
+    error_type,
+):
+    provider_calls = []
+    original_error = _make_action_selection_transport_error(error_type)
+
+    def _raise_transport_error(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("action selection retried after a transport error")
+        raise original_error
+
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.completion",
+        _raise_transport_error,
+    )
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("transport failure must prevent action execution")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(error_type) as exc_info:
+        agent.act("Choose and execute one local action.")
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is ActionChoice
+    _assert_normalized_action_selection_transport_error(
+        exc_info.value,
+        error_type,
+    )
+    assert _action_selection_state(agent) == state_before
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
 
 
 def test_act_extra_argument_fails_after_one_provider_request_before_mutation(
@@ -856,6 +953,68 @@ async def test_achoose_action_invalid_output_makes_one_provider_request_without_
     assert provider_kwargs["response_format"] is ActionChoice
     assert provider_kwargs["think"] is False
     assert agent.counter == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    _ACTION_SELECTION_TRANSPORT_ERRORS,
+    ids=lambda error_type: error_type.__name__,
+)
+async def test_aact_transport_error_is_one_shot_and_mutation_free(
+    monkeypatch,
+    error_type,
+):
+    provider_calls = []
+    original_error = _make_action_selection_transport_error(error_type)
+
+    async def _raise_transport_error(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError(
+                "async action selection retried after a transport error"
+            )
+        raise original_error
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.acompletion",
+        _raise_transport_error,
+    )
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("async action selection called execute_action()")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("transport failure must prevent action execution")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(error_type) as exc_info:
+        await agent.aact("Choose and execute one async local action.")
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is ActionChoice
+    _assert_normalized_action_selection_transport_error(
+        exc_info.value,
+        error_type,
+    )
+    assert _action_selection_state(agent) == state_before
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
 
 
 @pytest.mark.asyncio
