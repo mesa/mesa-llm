@@ -549,6 +549,22 @@ def _action_choice_response(content, reasoning_content=None):
     return SimpleNamespace(choices=[choice])
 
 
+_ACTION_CHOICE_CONTENT_ABSENT = object()
+
+
+def _action_choice_response_with_parsed(
+    *,
+    parsed,
+    content=_ACTION_CHOICE_CONTENT_ABSENT,
+):
+    message_fields = {"parsed": parsed}
+    if content is not _ACTION_CHOICE_CONTENT_ABSENT:
+        message_fields["content"] = content
+    message = SimpleNamespace(**message_fields)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(choices=[choice])
+
+
 def _close_possible_coroutine(result):
     possible_coroutine = getattr(result, "result", result)
     if asyncio.iscoroutine(possible_coroutine):
@@ -652,6 +668,53 @@ _ACTION_SELECTION_RESPONSE_FORMAT_CASES = (
 )
 
 
+_VALID_PARSED_ACTION_CHOICE = {
+    "name": "local_increment_counter",
+    "arguments": {"amount": "41"},
+    "rationale": "Keep this parsed rationale exactly.",
+}
+
+_DUPLICATE_TOP_LEVEL_NAME_JSON = (
+    '{"name":"ignored_duplicate_name",'
+    '"name":"local_increment_counter",'
+    '"arguments":{"amount":1},'
+    '"rationale":"Keep the raw name rationale exactly."}'
+)
+_DUPLICATE_TOP_LEVEL_ARGUMENTS_JSON = (
+    '{"name":"local_increment_counter",'
+    '"arguments":{"amount":999,"unexpected":"ignored duplicate"},'
+    '"arguments":{"amount":2},'
+    '"rationale":"Keep the raw arguments rationale exactly."}'
+)
+_DUPLICATE_NESTED_ARGUMENT_JSON = (
+    '{"name":"local_increment_counter",'
+    '"arguments":{"amount":999,"amount":3},'
+    '"rationale":"Keep the nested arguments rationale exactly."}'
+)
+
+_DUPLICATE_ACTION_CHOICE_JSON_OBJECTS = (
+    ("top-level-name", _DUPLICATE_TOP_LEVEL_NAME_JSON),
+    ("top-level-arguments", _DUPLICATE_TOP_LEVEL_ARGUMENTS_JSON),
+    ("nested-arguments", _DUPLICATE_NESTED_ARGUMENT_JSON),
+)
+_ACTION_CHOICE_JSON_ENVELOPES = (
+    ("plain", "", ""),
+    ("fenced", "```json\n", "\n```"),
+    ("embedded", "Selected action follows:\n", "\nEnd selected action."),
+)
+_DUPLICATE_ACTION_CHOICE_CONTENT_CASES = tuple(
+    pytest.param(prefix + object_text + suffix, id=f"{envelope_id}-{duplicate_id}")
+    for duplicate_id, object_text in _DUPLICATE_ACTION_CHOICE_JSON_OBJECTS
+    for envelope_id, prefix, suffix in _ACTION_CHOICE_JSON_ENVELOPES
+)
+
+_PARSED_ONLY_RAW_CONTENT_CASES = (
+    pytest.param(_ACTION_CHOICE_CONTENT_ABSENT, id="missing-content-attribute"),
+    pytest.param(None, id="none-raw-content"),
+    pytest.param(" \n\t ", id="blank-raw-content"),
+)
+
+
 def _make_action_selection_transport_error(error_type):
     return error_type(
         message="selection transport failure",
@@ -697,6 +760,16 @@ def _assert_action_selection_response_format(actual, expected):
         assert actual is ActionChoice
     else:
         assert actual == expected
+
+
+def _assert_one_shot_action_selection_provider_call(provider_calls):
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
 
 
 @pytest.mark.parametrize(
@@ -821,6 +894,112 @@ def test_choose_action_parses_local_json_fallbacks_and_validates_choice(
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["response_format"] is ActionChoice
     assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.parametrize("content", _DUPLICATE_ACTION_CHOICE_CONTENT_CASES)
+def test_choose_action_rejects_raw_duplicate_keys_before_valid_parsed_fallback(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    def _duplicate_completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content=content,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _duplicate_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("choose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        agent.choose_action("Reject duplicate keys in the raw action choice.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_act_rejects_raw_duplicate_keys_once_without_execution_or_recording(
+    monkeypatch,
+):
+    provider_calls = []
+
+    def _duplicate_completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content="```json\n" + _DUPLICATE_TOP_LEVEL_ARGUMENTS_JSON + "\n```",
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _duplicate_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("act must not execute a duplicate action choice")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        agent.act("Reject duplicate keys before executing an action.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize("content", _PARSED_ONLY_RAW_CONTENT_CASES)
+def test_choose_action_uses_parsed_fallback_only_when_raw_content_is_unavailable(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    def _parsed_completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError(
+                "parsed-only action choice triggered an implicit retry"
+            )
+        return _action_choice_response_with_parsed(
+            content=content,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _parsed_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("choose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    choice = agent.choose_action("Use parsed data only without usable raw content.")
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 41},
+        rationale="Keep this parsed rationale exactly.",
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1103,6 +1282,149 @@ async def test_achoose_action_parses_local_json_fallbacks_without_tools(content)
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["response_format"] is ActionChoice
     assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_rejects_raw_duplicate_keys_before_valid_parsed_fallback(
+    monkeypatch,
+):
+    provider_calls = []
+
+    async def _duplicate_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content=(
+                "Selected action follows:\n"
+                + _DUPLICATE_NESTED_ARGUMENT_JSON
+                + "\nEnd selected action."
+            ),
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _duplicate_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        await agent.achoose_action("Reject duplicate keys in the raw action choice.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aact_rejects_raw_duplicate_keys_once_without_execution_or_recording(
+    monkeypatch,
+):
+    provider_calls = []
+
+    async def _duplicate_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content=_DUPLICATE_TOP_LEVEL_NAME_JSON,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _duplicate_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("aact must not call execute_action")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("aact must not execute a duplicate action choice")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        await agent.aact("Reject duplicate keys before executing an action.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", _PARSED_ONLY_RAW_CONTENT_CASES)
+async def test_achoose_action_uses_parsed_fallback_when_raw_content_is_unavailable(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    async def _parsed_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError(
+                "parsed-only action choice triggered an implicit retry"
+            )
+        return _action_choice_response_with_parsed(
+            content=content,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _parsed_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    choice = await agent.achoose_action(
+        "Use parsed data only without usable raw content."
+    )
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 41},
+        rationale="Keep this parsed rationale exactly.",
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
 
 
 @pytest.mark.asyncio

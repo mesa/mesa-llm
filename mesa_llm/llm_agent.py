@@ -45,6 +45,20 @@ class _AmbiguousActionChoiceJSONError(ValueError):
     """Raised when an LLM response contains more than one action JSON object."""
 
 
+def _load_action_choice_json(content: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in data:
+                raise ValueError(
+                    f"LLM action choice response contains duplicate JSON key {key!r}."
+                )
+            data[key] = value
+        return data
+
+    return json.loads(content, object_pairs_hook=reject_duplicate_keys)
+
+
 if TYPE_CHECKING:  # pragma: no cover
     from mesa_llm.recording.simulation_recorder import SimulationRecorder
 
@@ -358,6 +372,15 @@ class LLMAgent(Agent):
 
     def _parse_action_choice_response(self, response: Any) -> ActionChoice:
         message = response.choices[0].message
+        missing_content = object()
+        content = getattr(message, "content", missing_content)
+        has_raw_content = content is not missing_content and content is not None
+        if isinstance(content, str):
+            has_raw_content = bool(content.strip())
+
+        if has_raw_content:
+            return self._action_choice_from_content(content)
+
         parsed = getattr(message, "parsed", None)
         if parsed is not None:
             if isinstance(parsed, ActionChoice):
@@ -367,7 +390,11 @@ class LLMAgent(Agent):
             if hasattr(parsed, "model_dump"):
                 return ActionChoice(**parsed.model_dump())
 
-        content = getattr(message, "content", message)
+        if content is missing_content:
+            content = message
+        return self._action_choice_from_content(content)
+
+    def _action_choice_from_content(self, content: Any) -> ActionChoice:
         if isinstance(content, ActionChoice):
             return content
         if isinstance(content, dict):
@@ -406,7 +433,7 @@ class LLMAgent(Agent):
             return []
 
         try:
-            data = json.loads(stripped_content)
+            data = _load_action_choice_json(stripped_content)
         except json.JSONDecodeError:
             pass
         else:
@@ -420,7 +447,7 @@ class LLMAgent(Agent):
         candidates: list[dict[str, Any]] = []
         for object_text in self._iter_json_object_strings(stripped_content):
             try:
-                data = json.loads(object_text)
+                data = _load_action_choice_json(object_text)
             except json.JSONDecodeError:
                 continue
             if isinstance(data, dict):
