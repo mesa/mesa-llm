@@ -582,6 +582,7 @@ def _assert_rejects_async_action_without_unawaited_warning(call):
 
 def _make_local_action_choice_agent(
     llm_model: str = "gemini/gemini-2.0-flash",
+    api_base: str | None = None,
 ):
     class DummyModel(Model):
         def __init__(self):
@@ -604,6 +605,7 @@ def _make_local_action_choice_agent(
         DummyModel(),
         reasoning=ReActReasoning,
         llm_model=llm_model,
+        api_base=api_base,
         actions=[local_increment_counter],
     )
     agent.counter = 0
@@ -614,6 +616,39 @@ _ACTION_SELECTION_TRANSPORT_ERRORS = (
     APIConnectionError,
     Timeout,
     RateLimitError,
+)
+
+_ACTION_SELECTION_RESPONSE_FORMAT_CASES = (
+    pytest.param(
+        "openai/gpt-4o",
+        None,
+        {"type": "json_object"},
+        id="openai-json-object",
+    ),
+    pytest.param(
+        "openai/strict-compatible-model",
+        "http://strict-openai-compatible.test/v1",
+        {"type": "json_object"},
+        id="custom-api-base-openai-json-object",
+    ),
+    pytest.param(
+        "gemini/gemini-2.0-flash",
+        None,
+        ActionChoice,
+        id="gemini-action-choice",
+    ),
+    pytest.param(
+        "ollama/llama3.2:3b",
+        None,
+        ActionChoice,
+        id="ollama-action-choice",
+    ),
+    pytest.param(
+        "ollama_chat/llama3.2:3b",
+        None,
+        ActionChoice,
+        id="ollama-chat-action-choice",
+    ),
 )
 
 
@@ -655,6 +690,76 @@ def _assert_normalized_action_selection_transport_error(
         assert str(error) == (
             f"litellm.{error_type.__name__}: selection transport failure"
         )
+
+
+def _assert_action_selection_response_format(actual, expected):
+    if expected is ActionChoice:
+        assert actual is ActionChoice
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("llm_model", "api_base", "expected_response_format"),
+    _ACTION_SELECTION_RESPONSE_FORMAT_CASES,
+)
+def test_choose_action_routes_response_format_and_validates_raw_json_locally(
+    monkeypatch,
+    llm_model,
+    api_base,
+    expected_response_format,
+):
+    provider_calls = []
+
+    def _raw_json_completion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "9"},
+                    "rationale": "Validate this raw provider JSON locally.",
+                }
+            )
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _raw_json_completion)
+    agent, _ = _make_local_action_choice_agent(
+        llm_model=llm_model,
+        api_base=api_base,
+    )
+    generate = Mock(wraps=agent.llm.generate)
+    agent.llm.generate = generate
+
+    choice = agent.choose_action("Choose one local action.")
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 9},
+        rationale="Validate this raw provider JSON locally.",
+    )
+    assert agent.counter == 0
+
+    generate.assert_called_once()
+    selection_kwargs = generate.call_args.kwargs
+    assert selection_kwargs["tool_schema"] is None
+    assert selection_kwargs["tool_choice"] == "none"
+    assert selection_kwargs["suppress_thinking"] is True
+    _assert_action_selection_response_format(
+        selection_kwargs["response_format"],
+        expected_response_format,
+    )
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is selection_kwargs["response_format"]
+    if api_base is not None:
+        assert provider_kwargs["api_base"] == api_base
 
 
 @pytest.mark.parametrize(
@@ -816,7 +921,7 @@ def test_act_transport_error_is_one_shot_and_mutation_free(
     assert provider_kwargs["fallbacks"] == []
     assert provider_kwargs["tools"] is None
     assert provider_kwargs["tool_choice"] is None
-    assert provider_kwargs["response_format"] is ActionChoice
+    assert provider_kwargs["response_format"] == {"type": "json_object"}
     _assert_normalized_action_selection_transport_error(
         exc_info.value,
         error_type,
@@ -887,6 +992,76 @@ def test_choose_action_prefers_final_content_over_reasoning_json():
     assert choice.arguments == {"amount": 8}
     assert choice.rationale == "Use final content."
     assert agent.counter == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("llm_model", "api_base", "expected_response_format"),
+    _ACTION_SELECTION_RESPONSE_FORMAT_CASES,
+)
+async def test_achoose_action_routes_response_format_and_validates_raw_json_locally(
+    monkeypatch,
+    llm_model,
+    api_base,
+    expected_response_format,
+):
+    provider_calls = []
+
+    async def _raw_json_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "10"},
+                    "rationale": "Validate this async provider JSON locally.",
+                }
+            )
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _raw_json_acompletion)
+    agent, _ = _make_local_action_choice_agent(
+        llm_model=llm_model,
+        api_base=api_base,
+    )
+    agenerate = AsyncMock(wraps=agent.llm.agenerate)
+    agent.llm.agenerate = agenerate
+
+    choice = await agent.achoose_action("Choose one async local action.")
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 10},
+        rationale="Validate this async provider JSON locally.",
+    )
+    assert agent.counter == 0
+
+    agenerate.assert_awaited_once()
+    selection_kwargs = agenerate.call_args.kwargs
+    assert selection_kwargs["tool_schema"] is None
+    assert selection_kwargs["tool_choice"] == "none"
+    assert selection_kwargs["suppress_thinking"] is True
+    _assert_action_selection_response_format(
+        selection_kwargs["response_format"],
+        expected_response_format,
+    )
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is selection_kwargs["response_format"]
+    if api_base is not None:
+        assert provider_kwargs["api_base"] == api_base
+    sync_completion.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1005,7 +1180,7 @@ async def test_aact_transport_error_is_one_shot_and_mutation_free(
     assert provider_kwargs["fallbacks"] == []
     assert provider_kwargs["tools"] is None
     assert provider_kwargs["tool_choice"] is None
-    assert provider_kwargs["response_format"] is ActionChoice
+    assert provider_kwargs["response_format"] == {"type": "json_object"}
     _assert_normalized_action_selection_transport_error(
         exc_info.value,
         error_type,

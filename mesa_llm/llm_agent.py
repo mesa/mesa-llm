@@ -283,7 +283,7 @@ class LLMAgent(Agent):
                 prompt=action_prompt,
                 tool_schema=None,
                 tool_choice="none",
-                response_format=ActionChoice,
+                response_format=self._action_choice_response_format(),
                 system_prompt=system_prompt,
                 suppress_thinking=True,
             )
@@ -313,12 +313,17 @@ class LLMAgent(Agent):
                 prompt=action_prompt,
                 tool_schema=None,
                 tool_choice="none",
-                response_format=ActionChoice,
+                response_format=self._action_choice_response_format(),
                 system_prompt=system_prompt,
                 suppress_thinking=True,
             )
         action_choice = self._parse_action_choice_response(response)
         return self._action_manager.validate(self, action_choice, actions=actions)
+
+    def _action_choice_response_format(self) -> dict[str, str] | type[ActionChoice]:
+        if self.llm.llm_model.startswith("openai/"):
+            return {"type": "json_object"}
+        return ActionChoice
 
     def _build_action_choice_prompt(
         self,

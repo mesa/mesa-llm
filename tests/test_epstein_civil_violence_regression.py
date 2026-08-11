@@ -9,7 +9,6 @@ from mesa.space import MultiGrid
 
 from examples.epstein_civil_violence.actions import arrest_citizen
 from examples.epstein_civil_violence.agents import Citizen, CitizenState, Cop
-from mesa_llm.actions import ActionChoice
 from mesa_llm.reasoning.react import ReActReasoning
 from mesa_llm.reasoning.reasoning import Observation
 
@@ -249,7 +248,7 @@ def assert_eligible_arrest_prompt(call, *, observation, eligible_ids):
 def assert_provider_action_call(call, *, observation, eligible_citizen_id=None):
     assert call.kwargs["tool_schema"] is None
     assert call.kwargs["tool_choice"] == "none"
-    assert call.kwargs["response_format"] is ActionChoice
+    assert call.kwargs["response_format"] == {"type": "json_object"}
     assert call.kwargs["suppress_thinking"] is True
 
     instructional_prompt_text = instructional_prompt_text_from_call(
