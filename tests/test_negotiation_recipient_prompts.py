@@ -134,13 +134,32 @@ def _speak_choice(requested_ids, message="Offer is 40."):
     )
 
 
-def _assert_delivery_partition(result, requested, delivered, skipped):
+def _assert_delivery_partition(result, requested, delivered, skipped, failed=()):
     assert result == {
         "requested": requested,
         "delivered": delivered,
         "skipped": skipped,
+        "failed": list(failed),
     }
-    assert list(result) == ["requested", "delivered", "skipped"]
+    assert list(result) == ["requested", "delivered", "skipped", "failed"]
+
+
+def _assert_action_result_recorded(agent, choice, result):
+    expected_event = {
+        "action": choice.model_dump(),
+        "result": result,
+    }
+    assert agent.memory.step_content["action"][-1] == expected_event
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_event,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+class _NegotiationDeliveryAbort(BaseException):
+    pass
 
 
 def _add_buyer(model):
@@ -292,7 +311,9 @@ def test_seller_execute_action_filters_and_reports_complete_recipient_partition(
     recent_buyer = _add_peer(seller.model, "BuyerAgent")
     wrong_type = _add_peer(seller.model, "SellerAgent")
     off_topology_buyer = _add_peer(seller.model, "BuyerAgent")
-    _set_visible_peers(seller, visible_buyer)
+    unusable_buyer = _add_peer(seller.model, "BuyerAgent")
+    unusable_buyer.memory = SimpleNamespace(add_to_memory=None)
+    _set_visible_peers(seller, visible_buyer, unusable_buyer)
     seller.memory.add_to_memory(
         "message",
         {
@@ -318,25 +339,28 @@ def test_seller_execute_action_filters_and_reports_complete_recipient_partition(
         recent_buyer.unique_id,
         seller.unique_id,
         wrong_type.unique_id,
+        unusable_buyer.unique_id,
         off_topology_buyer.unique_id,
         nonexistent_id,
         visible_buyer.unique_id,
+        unusable_buyer.unique_id,
         wrong_type.unique_id,
     ]
 
-    result = seller.execute_action(
-        _speak_choice(requested),
-        actions=["speak_to"],
-    )
+    seller.recorder = SimpleNamespace(record_event=Mock())
+    choice = _speak_choice(requested)
+    result = seller.execute_action(choice, actions=["speak_to"])
 
     delivered = [recent_buyer.unique_id, visible_buyer.unique_id]
     skipped = [
         seller.unique_id,
         wrong_type.unique_id,
+        unusable_buyer.unique_id,
         off_topology_buyer.unique_id,
         nonexistent_id,
     ]
     _assert_delivery_partition(result, requested, delivered, skipped)
+    _assert_action_result_recorded(seller, choice, result)
     assert seller._action_manager.available_actions(seller)["speak_to"] is not (
         builtin_speak_to
     )
@@ -349,6 +373,7 @@ def test_seller_execute_action_filters_and_reports_complete_recipient_partition(
         )
     wrong_type.memory.add_to_memory.assert_not_called()
     off_topology_buyer.memory.add_to_memory.assert_not_called()
+    assert unusable_buyer.memory.add_to_memory is None
     seller.llm.generate.assert_not_called()
     seller.llm.agenerate.assert_not_awaited()
 
@@ -401,10 +426,9 @@ async def test_seller_aexecute_action_uses_same_recipient_authorization(monkeypa
         visible_buyer.unique_id,
     ]
 
-    result = await seller.aexecute_action(
-        _speak_choice(requested, message="Async offer."),
-        actions=["speak_to"],
-    )
+    seller.recorder = SimpleNamespace(record_event=Mock())
+    choice = _speak_choice(requested, message="Async offer.")
+    result = await seller.aexecute_action(choice, actions=["speak_to"])
 
     _assert_delivery_partition(
         result,
@@ -412,6 +436,7 @@ async def test_seller_aexecute_action_uses_same_recipient_authorization(monkeypa
         [visible_buyer.unique_id],
         [off_topology_buyer.unique_id],
     )
+    _assert_action_result_recorded(seller, choice, result)
     visible_buyer.memory.add_to_memory.assert_called_once_with(
         type="message",
         content={"message": "Async offer.", "sender": seller.unique_id},
@@ -419,6 +444,110 @@ async def test_seller_aexecute_action_uses_same_recipient_authorization(monkeypa
     off_topology_buyer.memory.add_to_memory.assert_not_called()
     seller.llm.generate.assert_not_called()
     seller.llm.agenerate.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "delivered_indexes", "failed_indexes"),
+    [
+        pytest.param(("success", "success"), (0, 1), (), id="both-succeed"),
+        pytest.param(("success", "failure"), (0,), (1,), id="second-fails"),
+        pytest.param(("failure", "success"), (1,), (0,), id="first-fails"),
+        pytest.param(("failure", "failure"), (), (0, 1), id="both-fail"),
+    ],
+)
+def test_negotiation_speak_to_attempts_unique_recipients_and_reports_failures(
+    monkeypatch,
+    outcomes,
+    delivered_indexes,
+    failed_indexes,
+):
+    seller = _seller_agent(monkeypatch)
+    created_first = _add_peer(seller.model, "BuyerAgent")
+    created_second = _add_peer(seller.model, "BuyerAgent")
+    recipients = [created_second, created_first]
+    _set_visible_peers(seller, *recipients)
+    _forbid_action_selection(seller)
+    attempts = []
+    message_events = []
+
+    def delivery_effect(recipient, outcome):
+        def add_to_memory(*, type, content):
+            attempts.append(recipient.unique_id)
+            if outcome == "failure":
+                raise RuntimeError(f"memory {recipient.unique_id} failed")
+            message_events.append(
+                {
+                    "recipient": recipient.unique_id,
+                    "type": type,
+                    "content": content,
+                }
+            )
+
+        return add_to_memory
+
+    for recipient, outcome in zip(recipients, outcomes, strict=True):
+        recipient.memory.add_to_memory.side_effect = delivery_effect(
+            recipient,
+            outcome,
+        )
+
+    requested = [
+        recipients[0].unique_id,
+        recipients[1].unique_id,
+        recipients[0].unique_id,
+        recipients[1].unique_id,
+    ]
+    choice = _speak_choice(requested, message="Attempt every offer.")
+
+    result = seller.execute_action(choice, actions=["speak_to"])
+
+    delivered = [recipients[index].unique_id for index in delivered_indexes]
+    failed = [recipients[index].unique_id for index in failed_indexes]
+    _assert_delivery_partition(result, requested, delivered, [], failed)
+    assert attempts == [recipient.unique_id for recipient in recipients]
+    assert [event["recipient"] for event in message_events] == delivered
+    assert all(event["type"] == "message" for event in message_events)
+    assert all(
+        event["content"]
+        == {"message": "Attempt every offer.", "sender": seller.unique_id}
+        for event in message_events
+    )
+    for recipient in recipients:
+        recipient.memory.add_to_memory.assert_called_once()
+    assert seller.memory.step_content["action"][-1] == {
+        "action": choice.model_dump(),
+        "result": result,
+    }
+
+
+def test_negotiation_speak_to_propagates_base_exception_without_recording_action(
+    monkeypatch,
+):
+    seller = _seller_agent(monkeypatch)
+    aborting_buyer = _add_peer(seller.model, "BuyerAgent")
+    later_buyer = _add_peer(seller.model, "BuyerAgent")
+    _set_visible_peers(seller, aborting_buyer, later_buyer)
+    _forbid_action_selection(seller)
+    seller.recorder = SimpleNamespace(record_event=Mock())
+    abort = _NegotiationDeliveryAbort("recipient aborted")
+    aborting_buyer.memory.add_to_memory.side_effect = abort
+    choice = _speak_choice(
+        [
+            aborting_buyer.unique_id,
+            later_buyer.unique_id,
+            aborting_buyer.unique_id,
+        ],
+        message="This offer aborts.",
+    )
+
+    with pytest.raises(_NegotiationDeliveryAbort) as exc_info:
+        seller.execute_action(choice, actions=["speak_to"])
+
+    assert exc_info.value is abort
+    aborting_buyer.memory.add_to_memory.assert_called_once()
+    later_buyer.memory.add_to_memory.assert_not_called()
+    assert "action" not in seller.memory.step_content
+    seller.recorder.record_event.assert_not_called()
 
 
 def test_buyer_execute_action_uses_seller_specific_authorization(monkeypatch):

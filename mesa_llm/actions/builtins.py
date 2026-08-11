@@ -305,7 +305,11 @@ def teleport_to_location(
 
 
 @action
-def speak_to(agent: Any, listener_agents_unique_ids: list[int], message: str) -> str:
+def speak_to(
+    agent: Any,
+    listener_agents_unique_ids: list[int],
+    message: str,
+) -> dict[str, list[int]]:
     """
     Send a message to specified recipients.
 
@@ -320,7 +324,7 @@ def speak_to(agent: Any, listener_agents_unique_ids: list[int], message: str) ->
         message: The message to send.
 
     Returns:
-        A string describing delivery status.
+        The requested, delivered, skipped, and failed recipient IDs.
     """
     if isinstance(listener_agents_unique_ids, str):
         try:
@@ -331,49 +335,54 @@ def speak_to(agent: Any, listener_agents_unique_ids: list[int], message: str) ->
                 for x in listener_agents_unique_ids.strip("[]").split(",")
                 if x.strip()
             ]
-    listener_agents_unique_ids = [
-        int(uid) for uid in (listener_agents_unique_ids or [])
-    ]
+    requested = [int(uid) for uid in (listener_agents_unique_ids or [])]
+    recipients_by_id = {
+        candidate.unique_id: candidate for candidate in agent.model.agents
+    }
 
-    listener_agents = [
-        listener_agent
-        for listener_agent in agent.model.agents
-        if listener_agent.unique_id in listener_agents_unique_ids
-        and listener_agent.unique_id != agent.unique_id
-    ]
-
-    delivered_ids = []
-    skipped_ids = []
-
-    for recipient in listener_agents:
-        if not hasattr(recipient, "memory"):
-            skipped_ids.append(recipient.unique_id)
-            logger.warning(
-                "Agent %s has no memory attribute; skipping speak_to.",
-                recipient.unique_id,
-            )
+    delivered = []
+    skipped = []
+    failed = []
+    for recipient_id in dict.fromkeys(requested):
+        recipient = recipients_by_id.get(recipient_id)
+        if recipient is None or recipient_id == agent.unique_id:
+            skipped.append(recipient_id)
             continue
-        delivered_ids.append(recipient.unique_id)
-        recipient.memory.add_to_memory(
-            type="message",
-            content={
-                "message": message,
-                "sender": agent.unique_id,
-            },
-        )
 
-    status_parts = []
-    if delivered_ids:
-        status_parts.append(f"sent message {message!r} to {delivered_ids}")
-    if skipped_ids:
-        status_parts.append(
-            f"skipped {skipped_ids} because they have no `memory` attribute"
-        )
+        try:
+            memory = getattr(recipient, "memory", None)
+            add_to_memory = getattr(memory, "add_to_memory", None)
+            if not callable(add_to_memory):
+                skipped.append(recipient_id)
+                logger.warning(
+                    "Agent %s has no usable memory; skipping speak_to.",
+                    recipient_id,
+                )
+                continue
 
-    if not status_parts:
-        return f"Could not send message {message!r}: no matching recipients found."
+            add_to_memory(
+                type="message",
+                content={
+                    "message": message,
+                    "sender": agent.unique_id,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to deliver speak_to message from agent %s to agent %s.",
+                agent.unique_id,
+                recipient_id,
+            )
+            failed.append(recipient_id)
+        else:
+            delivered.append(recipient_id)
 
-    return "; ".join(status_parts)
+    return {
+        "requested": requested,
+        "delivered": delivered,
+        "skipped": skipped,
+        "failed": failed,
+    }
 
 
 def default_actions() -> tuple[Callable, ...]:

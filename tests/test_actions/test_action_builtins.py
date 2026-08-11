@@ -4,10 +4,13 @@ import logging
 import math
 from random import Random
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
+from mesa.agent import Agent
 from mesa.discrete_space import OrthogonalMooreGrid, OrthogonalVonNeumannGrid
+from mesa.model import Model
 from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
 
 from mesa_llm.actions import (
@@ -21,6 +24,8 @@ from mesa_llm.actions import (
     teleport_to_location,
     wait,
 )
+from mesa_llm.llm_agent import LLMAgent
+from mesa_llm.reasoning.react import ReActReasoning
 
 
 class DummyModel:
@@ -68,6 +73,83 @@ def _execute_spatial(agent, name: str, arguments: dict):
 
 def _execute_social(agent, arguments: dict):
     return _execute(agent, "speak_to", arguments, social_actions())
+
+
+def _assert_delivery_result(result, requested, delivered, skipped, failed):
+    assert result == {
+        "requested": requested,
+        "delivered": delivered,
+        "skipped": skipped,
+        "failed": failed,
+    }
+    assert list(result) == ["requested", "delivered", "skipped", "failed"]
+
+
+class _DeliveryAbort(BaseException):
+    pass
+
+
+def _llm_speak_test_case(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    model = Model(rng=42)
+    sender = LLMAgent(
+        model=model,
+        reasoning=ReActReasoning,
+        actions=[speak_to],
+    )
+    sender.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(),
+    )
+    sender.recorder = SimpleNamespace(record_event=Mock())
+
+    recipient_class = type("RecipientAgent", (Agent,), {})
+    failed_recipient = recipient_class(model)
+    delivered_recipient = recipient_class(model)
+    message_events = []
+
+    failed_recipient.memory = SimpleNamespace(
+        add_to_memory=Mock(side_effect=RuntimeError("recipient memory failed"))
+    )
+
+    def record_message_event(*, type, content):
+        message_events.append(
+            {
+                "recipient": delivered_recipient.unique_id,
+                "type": type,
+                "content": content,
+            }
+        )
+
+    delivered_recipient.memory = SimpleNamespace(
+        add_to_memory=Mock(side_effect=record_message_event)
+    )
+    requested = [
+        failed_recipient.unique_id,
+        delivered_recipient.unique_id,
+        failed_recipient.unique_id,
+    ]
+    choice = ActionChoice(
+        name="speak_to",
+        arguments={
+            "listener_agents_unique_ids": requested,
+            "message": "Recorded delivery.",
+        },
+    )
+    expected_result = {
+        "requested": requested,
+        "delivered": [delivered_recipient.unique_id],
+        "skipped": [],
+        "failed": [failed_recipient.unique_id],
+    }
+    return SimpleNamespace(
+        sender=sender,
+        failed_recipient=failed_recipient,
+        delivered_recipient=delivered_recipient,
+        message_events=message_events,
+        choice=choice,
+        expected_result=expected_result,
+    )
 
 
 def _validate_spatial(agent, name: str, arguments: dict):
@@ -568,7 +650,228 @@ def test_speak_to_records_on_recipients(mocker):
     assert content["message"] == message
     assert content["sender"] == sender.unique_id
     assert "recipients" not in content
-    assert ret == "sent message 'Hello there' to [11, 12]"
+    _assert_delivery_result(ret, [10, 11, 12], [11, 12], [10], [])
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "delivered_indexes", "failed_indexes"),
+    [
+        pytest.param(("success", "success"), (0, 1), (), id="both-succeed"),
+        pytest.param(("success", "failure"), (0,), (1,), id="second-fails"),
+        pytest.param(("failure", "success"), (1,), (0,), id="first-fails"),
+        pytest.param(("failure", "failure"), (), (0, 1), id="both-fail"),
+    ],
+)
+def test_speak_to_attempts_unique_recipients_in_requested_order_and_reports_failures(
+    mocker,
+    outcomes,
+    delivered_indexes,
+    failed_indexes,
+):
+    model = DummyModel()
+    sender = DummyAgent(unique_id=1, model=model)
+    recipients = [
+        DummyAgent(unique_id=2, model=model),
+        DummyAgent(unique_id=3, model=model),
+    ]
+    attempts = []
+    message_events = []
+
+    def delivery_effect(recipient, outcome):
+        def add_to_memory(*, type, content):
+            attempts.append(recipient.unique_id)
+            if outcome == "failure":
+                raise RuntimeError(f"memory {recipient.unique_id} failed")
+            message_events.append(
+                {
+                    "recipient": recipient.unique_id,
+                    "type": type,
+                    "content": content,
+                }
+            )
+
+        return add_to_memory
+
+    for recipient, outcome in zip(recipients, outcomes, strict=True):
+        recipient.memory = SimpleNamespace(
+            add_to_memory=mocker.Mock(side_effect=delivery_effect(recipient, outcome))
+        )
+
+    model.agents = [recipients[1], sender, recipients[0]]
+    requested = [
+        recipients[0].unique_id,
+        recipients[1].unique_id,
+        recipients[0].unique_id,
+        recipients[1].unique_id,
+    ]
+
+    result = _execute_social(
+        sender,
+        {
+            "listener_agents_unique_ids": requested,
+            "message": "Try every recipient.",
+        },
+    )
+
+    delivered = [recipients[index].unique_id for index in delivered_indexes]
+    failed = [recipients[index].unique_id for index in failed_indexes]
+    _assert_delivery_result(result, requested, delivered, [], failed)
+    assert attempts == [recipient.unique_id for recipient in recipients]
+    assert [event["recipient"] for event in message_events] == delivered
+    assert all(event["type"] == "message" for event in message_events)
+    assert all(
+        event["content"]
+        == {"message": "Try every recipient.", "sender": sender.unique_id}
+        for event in message_events
+    )
+    for recipient in recipients:
+        recipient.memory.add_to_memory.assert_called_once()
+
+
+def test_speak_to_preserves_raw_request_and_skips_each_unusable_target_once(mocker):
+    model = DummyModel()
+    sender = DummyAgent(unique_id=10, model=model)
+    delivered_recipient = DummyAgent(unique_id=11, model=model)
+    missing_memory = DummyAgent(unique_id=12, model=model)
+    none_memory = DummyAgent(unique_id=13, model=model)
+    noncallable_memory = DummyAgent(unique_id=14, model=model)
+    delivered_recipient.memory = SimpleNamespace(add_to_memory=mocker.Mock())
+    none_memory.memory = None
+    noncallable_memory.memory = SimpleNamespace(add_to_memory="not callable")
+    model.agents = [
+        noncallable_memory,
+        delivered_recipient,
+        sender,
+        none_memory,
+        missing_memory,
+    ]
+    nonexistent_id = 999_999
+    requested = [
+        nonexistent_id,
+        delivered_recipient.unique_id,
+        sender.unique_id,
+        missing_memory.unique_id,
+        delivered_recipient.unique_id,
+        none_memory.unique_id,
+        noncallable_memory.unique_id,
+        nonexistent_id,
+    ]
+
+    result = _execute_social(
+        sender,
+        {
+            "listener_agents_unique_ids": requested,
+            "message": "Only one target can receive this.",
+        },
+    )
+
+    _assert_delivery_result(
+        result,
+        requested,
+        [delivered_recipient.unique_id],
+        [
+            nonexistent_id,
+            sender.unique_id,
+            missing_memory.unique_id,
+            none_memory.unique_id,
+            noncallable_memory.unique_id,
+        ],
+        [],
+    )
+    delivered_recipient.memory.add_to_memory.assert_called_once_with(
+        type="message",
+        content={
+            "message": "Only one target can receive this.",
+            "sender": sender.unique_id,
+        },
+    )
+
+
+def test_speak_to_propagates_base_exception_and_stops_later_delivery_attempts(mocker):
+    model = DummyModel()
+    sender = DummyAgent(unique_id=20, model=model)
+    aborting_recipient = DummyAgent(unique_id=21, model=model)
+    later_recipient = DummyAgent(unique_id=22, model=model)
+    abort = _DeliveryAbort("recipient aborted")
+    aborting_recipient.memory = SimpleNamespace(
+        add_to_memory=mocker.Mock(side_effect=abort)
+    )
+    later_recipient.memory = SimpleNamespace(add_to_memory=mocker.Mock())
+    model.agents = [sender, later_recipient, aborting_recipient]
+
+    with pytest.raises(_DeliveryAbort) as exc_info:
+        _execute_social(
+            sender,
+            {
+                "listener_agents_unique_ids": [
+                    aborting_recipient.unique_id,
+                    later_recipient.unique_id,
+                    aborting_recipient.unique_id,
+                ],
+                "message": "This delivery aborts.",
+            },
+        )
+
+    assert exc_info.value is abort
+    aborting_recipient.memory.add_to_memory.assert_called_once()
+    later_recipient.memory.add_to_memory.assert_not_called()
+
+
+def test_llm_agent_execute_action_records_structured_speak_to_result(monkeypatch):
+    case = _llm_speak_test_case(monkeypatch)
+
+    result = case.sender.execute_action(case.choice)
+
+    assert result == case.expected_result
+    assert list(result) == ["requested", "delivered", "skipped", "failed"]
+    expected_event = {
+        "action": case.choice.model_dump(),
+        "result": result,
+    }
+    case.sender.memory.add_to_memory.assert_called_once_with(
+        type="action",
+        content=expected_event,
+    )
+    case.sender.memory.aadd_to_memory.assert_not_awaited()
+    case.sender.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_event,
+        agent_id=case.sender.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+    case.failed_recipient.memory.add_to_memory.assert_called_once()
+    case.delivered_recipient.memory.add_to_memory.assert_called_once()
+    assert [event["recipient"] for event in case.message_events] == result["delivered"]
+
+
+@pytest.mark.asyncio
+async def test_llm_agent_aexecute_action_records_structured_speak_to_result(
+    monkeypatch,
+):
+    case = _llm_speak_test_case(monkeypatch)
+
+    result = await case.sender.aexecute_action(case.choice)
+
+    assert result == case.expected_result
+    assert list(result) == ["requested", "delivered", "skipped", "failed"]
+    expected_event = {
+        "action": case.choice.model_dump(),
+        "result": result,
+    }
+    case.sender.memory.aadd_to_memory.assert_awaited_once_with(
+        type="action",
+        content=expected_event,
+    )
+    case.sender.memory.add_to_memory.assert_not_called()
+    case.sender.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_event,
+        agent_id=case.sender.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+    case.failed_recipient.memory.add_to_memory.assert_called_once()
+    case.delivered_recipient.memory.add_to_memory.assert_called_once()
+    assert [event["recipient"] for event in case.message_events] == result["delivered"]
 
 
 def test_speak_to_rejects_single_free_text_id_before_execution(mocker):
@@ -1395,10 +1698,7 @@ def test_speak_to_skips_non_llm_recipient(mocker):
     assert call_kwargs["content"]["message"] == "Hello both"
     assert "recipients" not in call_kwargs["content"]
 
-    assert ret == (
-        "sent message 'Hello both' to [2]; "
-        "skipped [3] because they have no `memory` attribute"
-    )
+    _assert_delivery_result(ret, [2, 3], [2], [3], [])
 
 
 def test_speak_to_warns_for_non_llm_recipient(mocker, caplog):
@@ -1421,7 +1721,7 @@ def test_speak_to_warns_for_non_llm_recipient(mocker, caplog):
         "11" in record.message and "memory" in record.message
         for record in caplog.records
     )
-    assert ret == "skipped [11] because they have no `memory` attribute"
+    _assert_delivery_result(ret, [11], [], [11], [])
 
 
 def test_speak_to_returns_clear_message_when_no_valid_recipients():
@@ -1438,9 +1738,7 @@ def test_speak_to_returns_clear_message_when_no_valid_recipients():
         },
     )
 
-    assert (
-        ret == "Could not send message 'Anyone there?': no matching recipients found."
-    )
+    _assert_delivery_result(ret, [20, 999], [], [20, 999], [])
 
 
 def test_migrated_actions_reject_missing_extra_and_narrowed_out_inputs():

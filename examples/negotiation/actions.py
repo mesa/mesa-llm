@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING
 
 from mesa_llm.actions import ActionManager, action
@@ -7,6 +8,7 @@ if TYPE_CHECKING:
 
 
 _action_manager = ActionManager()
+logger = logging.getLogger(__name__)
 
 
 @action(action_manager=_action_manager)
@@ -23,41 +25,56 @@ def speak_to(
         message: The message to send.
 
     Returns:
-        The requested, delivered, and skipped recipient IDs.
+        The requested, delivered, skipped, and failed recipient IDs.
     """
-    requested = list(listener_agents_unique_ids)
+    requested = [int(recipient_id) for recipient_id in listener_agents_unique_ids]
     eligible_ids = set(agent._get_eligible_speak_to_recipient_ids())
     recipients_by_id = {
         candidate.unique_id: candidate for candidate in agent.model.agents
     }
 
-    delivery_plan = []
     delivered = []
     skipped = []
+    failed = []
     for recipient_id in dict.fromkeys(requested):
         recipient = recipients_by_id.get(recipient_id)
-        memory = getattr(recipient, "memory", None)
-        add_to_memory = getattr(memory, "add_to_memory", None)
-        if recipient_id not in eligible_ids or not callable(add_to_memory):
+        if recipient is None or recipient is agent:
             skipped.append(recipient_id)
             continue
 
-        delivered.append(recipient_id)
-        delivery_plan.append(add_to_memory)
+        if recipient_id not in eligible_ids:
+            skipped.append(recipient_id)
+            continue
 
-    for add_to_memory in delivery_plan:
-        add_to_memory(
-            type="message",
-            content={
-                "message": message,
-                "sender": agent.unique_id,
-            },
-        )
+        try:
+            memory = getattr(recipient, "memory", None)
+            add_to_memory = getattr(memory, "add_to_memory", None)
+            if not callable(add_to_memory):
+                skipped.append(recipient_id)
+                continue
+
+            add_to_memory(
+                type="message",
+                content={
+                    "message": message,
+                    "sender": agent.unique_id,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to deliver speak_to message from agent %s to agent %s.",
+                agent.unique_id,
+                recipient_id,
+            )
+            failed.append(recipient_id)
+        else:
+            delivered.append(recipient_id)
 
     return {
         "requested": requested,
         "delivered": delivered,
         "skipped": skipped,
+        "failed": failed,
     }
 
 
