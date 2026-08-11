@@ -4643,6 +4643,90 @@ def _make_send_message_model(monkeypatch):
     return sender, recipient
 
 
+_MESSAGE_MEMORY_ABSENT = object()
+_MESSAGE_MODES = ("sync", "async")
+
+
+class _MessageDeliveryAbort(BaseException):
+    pass
+
+
+class _MessageMemoryDescriptorFailure:
+    def __init__(self, unique_id, error):
+        self.unique_id = unique_id
+        self.error = error
+
+    @property
+    def memory(self):
+        raise self.error
+
+
+class _MessageWriterDescriptorFailure:
+    def __init__(self, error):
+        self.error = error
+
+    @property
+    def add_to_memory(self):
+        raise self.error
+
+    @property
+    def aadd_to_memory(self):
+        raise self.error
+
+
+def _make_message_recipient(unique_id, memory=_MESSAGE_MEMORY_ABSENT):
+    recipient = SimpleNamespace(unique_id=unique_id)
+    if memory is not _MESSAGE_MEMORY_ABSENT:
+        recipient.memory = memory
+    return recipient
+
+
+def _message_memory(mode, writer):
+    method = "add_to_memory" if mode == "sync" else "aadd_to_memory"
+    return SimpleNamespace(**{method: writer})
+
+
+def _message_writer(mode, events, label, *, error=None, observer=None):
+    def record(*, type, content):
+        events.append(label)
+        if observer is not None:
+            observer(type, content)
+        if error is not None:
+            raise error
+
+    async def arecord(*, type, content):
+        return record(type=type, content=content)
+
+    return (
+        Mock(side_effect=record) if mode == "sync" else AsyncMock(side_effect=arecord)
+    )
+
+
+async def _call_send_message(mode, sender, message, recipients):
+    if mode == "sync":
+        return sender.send_message(message, recipients)
+    return await sender.asend_message(message, recipients)
+
+
+def _assert_message_call(mode, writer, message, *, recipients=_MESSAGE_MEMORY_ABSENT):
+    content = {"message": message, "sender": 10}
+    if recipients is not _MESSAGE_MEMORY_ABSENT:
+        content["recipients"] = recipients
+    assertion = (
+        writer.assert_called_once_with
+        if mode == "sync"
+        else writer.assert_awaited_once_with
+    )
+    assertion(type="message", content=content)
+
+
+def _snapshot_message_content(content):
+    snapshot = dict(content)
+    if "recipients" in snapshot:
+        snapshot["recipients"] = list(snapshot["recipients"])
+    return snapshot
+
+
 def test_send_message_stores_serializable_ids(monkeypatch):
     """send_message stores sender/recipients as unique_ids, not Agent objects."""
     sender, recipient = _make_send_message_model(monkeypatch)
@@ -4743,7 +4827,8 @@ def test_send_message_skips_non_llm_recipient(monkeypatch, caplog):
         result = sender.send_message("hello", recipients=[recipient, skipped])
 
     assert result == (
-        "sent message 'hello' to [20]; skipped [30] because they have no `memory` attribute"
+        "sent message 'hello' to [20]; "
+        "skipped [30] because they have no usable memory method"
     )
     assert len(recorded_calls) == 2
     sender_call = next(call for label, call in recorded_calls if label == "sender")
@@ -4788,7 +4873,8 @@ async def test_asend_message_skips_non_llm_recipient(monkeypatch, caplog):
         result = await sender.asend_message("hello", recipients=[recipient, skipped])
 
     assert result == (
-        "sent message 'hello' to [20]; skipped [30] because they have no `memory` attribute"
+        "sent message 'hello' to [20]; "
+        "skipped [30] because they have no usable memory method"
     )
     assert len(recorded_calls) == 2
     sender_call = next(call for label, call in recorded_calls if label == "sender")
@@ -4801,6 +4887,443 @@ async def test_asend_message_skips_non_llm_recipient(monkeypatch, caplog):
         "30" in record.message and "send_message" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_deduplicates_first_unique_id(monkeypatch, mode):
+    sender, first = _make_send_message_model(monkeypatch)
+    events = []
+    first_writer = _message_writer(mode, events, "recipient-20")
+    first.memory = _message_memory(mode, first_writer)
+    duplicate_writer = _message_writer(mode, events, "duplicate-20")
+    duplicate = _make_message_recipient(20, _message_memory(mode, duplicate_writer))
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(mode, sender, "dedup", [first, first, duplicate])
+
+    assert result == "sent message 'dedup' to [20]"
+    _assert_message_call(mode, first_writer, "dedup")
+    duplicate_writer.assert_not_called()
+    _assert_message_call(mode, sender_writer, "dedup", recipients=[20])
+    assert events == ["recipient-20", "sender"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_ignores_self(monkeypatch, mode):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(mode, sender, "self", [sender, sender])
+
+    assert result == "Could not send message 'self': no matching recipients found."
+    _assert_message_call(mode, sender_writer, "self", recipients=[])
+    assert events == ["sender"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+@pytest.mark.parametrize(
+    "memory_state",
+    ["absent", "none", "missing-writer", "noncallable-writer"],
+)
+async def test_send_message_skips_unusable_recipient_writer(
+    monkeypatch, caplog, mode, memory_state
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    memory = {
+        "none": None,
+        "missing-writer": SimpleNamespace(),
+        "noncallable-writer": _message_memory(mode, "not callable"),
+    }.get(memory_state, _MESSAGE_MEMORY_ABSENT)
+    recipient = _make_message_recipient(30, memory)
+    events = []
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.WARNING, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "skip", [recipient])
+
+    assert result == "skipped [30] because they have no usable memory method"
+    _assert_message_call(mode, sender_writer, "skip", recipients=[])
+    warnings_for_recipient = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "30" in record.getMessage()
+    ]
+    assert len(warnings_for_recipient) == 1
+
+
+_MESSAGE_RECIPIENT_FAILURE_CASES = [
+    pytest.param(
+        ((20, "writer-failure"), (21, "ok")),
+        "sent message 'partition' to [21]; failed to deliver to [20]",
+        [21],
+        [20],
+        id="failure-before-success",
+    ),
+    pytest.param(
+        ((20, "ok"), (21, "writer-failure")),
+        "sent message 'partition' to [20]; failed to deliver to [21]",
+        [20],
+        [21],
+        id="success-before-failure",
+    ),
+    pytest.param(
+        ((20, "writer-failure"), (21, "writer-failure"), (22, "ok")),
+        "sent message 'partition' to [22]; failed to deliver to [20, 21]",
+        [22],
+        [20, 21],
+        id="multiple-failures",
+    ),
+    pytest.param(
+        ((20, "memory-descriptor"), (21, "ok")),
+        "sent message 'partition' to [21]; failed to deliver to [20]",
+        [21],
+        [20],
+        id="memory-descriptor-exception",
+    ),
+    pytest.param(
+        ((20, "writer-descriptor"), (21, "ok")),
+        "sent message 'partition' to [21]; failed to deliver to [20]",
+        [21],
+        [20],
+        id="writer-descriptor-exception",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+@pytest.mark.parametrize(
+    ("outcomes", "expected_status", "delivered_ids", "failed_ids"),
+    _MESSAGE_RECIPIENT_FAILURE_CASES,
+)
+async def test_send_message_partitions_recipient_exceptions_and_continues(
+    monkeypatch,
+    caplog,
+    mode,
+    outcomes,
+    expected_status,
+    delivered_ids,
+    failed_ids,
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    recipients = []
+    writers = []
+    for recipient_id, outcome in outcomes:
+        error_type = (
+            AttributeError
+            if outcome in {"memory-descriptor", "writer-descriptor"}
+            else RuntimeError
+        )
+        error = error_type(f"recipient {recipient_id} failed")
+        if outcome == "memory-descriptor":
+            recipient = _MessageMemoryDescriptorFailure(recipient_id, error)
+        elif outcome == "writer-descriptor":
+            recipient = _make_message_recipient(
+                recipient_id, _MessageWriterDescriptorFailure(error)
+            )
+        else:
+            writer = _message_writer(
+                mode,
+                events,
+                f"recipient-{recipient_id}",
+                error=error if outcome == "writer-failure" else None,
+            )
+            writers.append(writer)
+            recipient = _make_message_recipient(
+                recipient_id, _message_memory(mode, writer)
+            )
+        recipients.append(recipient)
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.ERROR, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "partition", recipients)
+
+    assert result == expected_status
+    for writer in writers:
+        assert writer.call_count == 1
+    assert events[-1] == "sender"
+    _assert_message_call(mode, sender_writer, "partition", recipients=delivered_ids)
+    error_records = [
+        record for record in caplog.records if record.levelno >= logging.ERROR
+    ]
+    assert len(error_records) == len(failed_ids)
+    for recipient_id in failed_ids:
+        assert any(str(recipient_id) in record.getMessage() for record in error_records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_recipient_baseexception_aborts_remaining_work(
+    monkeypatch, mode
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    abort = _MessageDeliveryAbort("recipient delivery aborted")
+    first_writer = _message_writer(mode, events, "recipient-20")
+    aborting_writer = _message_writer(mode, events, "recipient-21", error=abort)
+    later_writer = _message_writer(mode, events, "recipient-22")
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+    recipients = [
+        _make_message_recipient(20, _message_memory(mode, first_writer)),
+        _make_message_recipient(21, _message_memory(mode, aborting_writer)),
+        _make_message_recipient(22, _message_memory(mode, later_writer)),
+    ]
+
+    with pytest.raises(_MessageDeliveryAbort) as exc_info:
+        await _call_send_message(mode, sender, "abort", recipients)
+
+    assert exc_info.value is abort
+    assert events == ["recipient-20", "recipient-21"]
+    assert first_writer.call_count == aborting_writer.call_count == 1
+    later_writer.assert_not_called()
+    sender_writer.assert_not_called()
+
+
+_SENDER_HISTORY_FAILURE_CASES = [
+    pytest.param(mode, state, id=f"{mode}-{state}")
+    for mode in _MESSAGE_MODES
+    for state in (
+        "missing-memory",
+        "none-memory",
+        "missing-writer",
+        "noncallable-writer",
+        "memory-descriptor-exception",
+        "writer-descriptor-exception",
+        "writer-exception",
+    )
+] + [pytest.param("async", "nonawaitable", id="async-nonawaitable")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "sender_state"), _SENDER_HISTORY_FAILURE_CASES)
+async def test_send_message_reports_sender_history_failures(
+    monkeypatch, caplog, mode, sender_state
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    recipient_writer = _message_writer(mode, events, "recipient-20")
+    recipient = _make_message_recipient(20, _message_memory(mode, recipient_writer))
+    sender_error = RuntimeError(f"sender {sender_state} failed")
+    sender_writer = None
+
+    if sender_state == "missing-memory":
+        del sender.memory
+    elif sender_state == "none-memory":
+        sender.memory = None
+    elif sender_state == "missing-writer":
+        sender.memory = SimpleNamespace()
+    elif sender_state == "noncallable-writer":
+        sender.memory = _message_memory(mode, "not callable")
+    elif sender_state == "memory-descriptor-exception":
+
+        def fail_memory_descriptor(_sender):
+            raise sender_error
+
+        monkeypatch.setattr(
+            type(sender), "memory", property(fail_memory_descriptor), raising=False
+        )
+    elif sender_state == "writer-descriptor-exception":
+        sender.memory = _MessageWriterDescriptorFailure(sender_error)
+    elif sender_state == "nonawaitable":
+        sender_writer = Mock(return_value=None)
+        sender.memory = SimpleNamespace(aadd_to_memory=sender_writer)
+    else:
+        sender_writer = _message_writer(mode, events, "sender", error=sender_error)
+        sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.ERROR, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "history", [recipient])
+
+    assert result == (
+        "sent message 'history' to [20]; "
+        "sender history recording failed after recipient delivery"
+    )
+    _assert_message_call(mode, recipient_writer, "history")
+    if sender_state == "writer-exception":
+        _assert_message_call(mode, sender_writer, "history", recipients=[20])
+    elif sender_state == "nonawaitable":
+        sender_writer.assert_called_once_with(
+            type="message",
+            content={"message": "history", "sender": 10, "recipients": [20]},
+        )
+    assert any(
+        record.levelno >= logging.ERROR and "10" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_reports_sender_history_exception_without_delivery(
+    monkeypatch, caplog, mode
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    sender_writer = _message_writer(
+        mode,
+        events,
+        "sender",
+        error=RuntimeError("sender history failed"),
+    )
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.ERROR, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "empty", [])
+
+    assert result == (
+        "Could not send message 'empty': no matching recipients found.; "
+        "sender history recording failed after recipient delivery"
+    )
+    _assert_message_call(mode, sender_writer, "empty", recipients=[])
+    assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_sender_history_baseexception_propagates(monkeypatch, mode):
+    sender, recipient = _make_send_message_model(monkeypatch)
+    events = []
+    recipient_writer = _message_writer(mode, events, "recipient-20")
+    recipient.memory = _message_memory(mode, recipient_writer)
+    abort = _MessageDeliveryAbort("sender history aborted")
+    sender_writer = _message_writer(mode, events, "sender", error=abort)
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with pytest.raises(_MessageDeliveryAbort) as exc_info:
+        await _call_send_message(mode, sender, "history abort", [recipient])
+
+    assert exc_info.value is abort
+    assert events == ["recipient-20", "sender"]
+    assert recipient_writer.call_count == sender_writer.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_payloads_are_isolated(monkeypatch, mode):
+    sender, first = _make_send_message_model(monkeypatch)
+    events = []
+    observed = {}
+
+    def mutate_first(_type, content):
+        observed["first"] = _snapshot_message_content(content)
+        content.update(message="recipient mutation", sender=-1, recipients=[999])
+
+    def observe_second(_type, content):
+        observed["second"] = _snapshot_message_content(content)
+
+    def mutate_sender(_type, content):
+        observed["sender"] = _snapshot_message_content(content)
+        content["message"] = "sender mutation"
+        content["recipients"].append(999)
+
+    first_writer = _message_writer(mode, events, "recipient-20", observer=mutate_first)
+    first.memory = _message_memory(mode, first_writer)
+    second_writer = _message_writer(
+        mode, events, "recipient-21", observer=observe_second
+    )
+    second = _make_message_recipient(21, _message_memory(mode, second_writer))
+    sender_writer = _message_writer(mode, events, "sender", observer=mutate_sender)
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(mode, sender, "isolation", [first, second])
+
+    assert result == "sent message 'isolation' to [20, 21]"
+    assert observed == {
+        "first": {"message": "isolation", "sender": 10},
+        "second": {"message": "isolation", "sender": 10},
+        "sender": {
+            "message": "isolation",
+            "sender": 10,
+            "recipients": [20, 21],
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_mixed_status_has_all_clauses_in_frozen_order(
+    monkeypatch, mode
+):
+    sender, delivered = _make_send_message_model(monkeypatch)
+    events = []
+    delivered_writer = _message_writer(mode, events, "recipient-20")
+    delivered.memory = _message_memory(mode, delivered_writer)
+    duplicate_writer = _message_writer(mode, events, "duplicate-20")
+    duplicate = _make_message_recipient(20, _message_memory(mode, duplicate_writer))
+    skipped = _make_message_recipient(30, None)
+    failed_writer = _message_writer(
+        mode,
+        events,
+        "recipient-40",
+        error=RuntimeError("recipient 40 failed"),
+    )
+    failed = _make_message_recipient(40, _message_memory(mode, failed_writer))
+    later_writer = _message_writer(mode, events, "recipient-50")
+    later = _make_message_recipient(50, _message_memory(mode, later_writer))
+    sender_writer = _message_writer(
+        mode,
+        events,
+        "sender",
+        error=RuntimeError("sender history failed"),
+    )
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(
+        mode,
+        sender,
+        "mixed",
+        [sender, delivered, duplicate, skipped, failed, later],
+    )
+
+    assert result == (
+        "sent message 'mixed' to [20, 50]; "
+        "skipped [30] because they have no usable memory method; "
+        "failed to deliver to [40]; "
+        "sender history recording failed after recipient delivery"
+    )
+    duplicate_writer.assert_not_called()
+    _assert_message_call(mode, sender_writer, "mixed", recipients=[20, 50])
+
+
+@pytest.mark.asyncio
+async def test_send_message_async_never_falls_back_to_sync_memory_writer(
+    monkeypatch,
+):
+    sender, recipient = _make_send_message_model(monkeypatch)
+    sender_sync = Mock()
+    sender_async = AsyncMock()
+    sender.memory = SimpleNamespace(
+        add_to_memory=sender_sync, aadd_to_memory=sender_async
+    )
+    recipient_sync = Mock()
+    recipient_async = AsyncMock()
+    recipient.memory = SimpleNamespace(
+        add_to_memory=recipient_sync, aadd_to_memory=recipient_async
+    )
+    fallback = Mock()
+    sync_only = _make_message_recipient(30, SimpleNamespace(add_to_memory=fallback))
+
+    result = await sender.asend_message("async only", [recipient, sync_only])
+
+    assert result == (
+        "sent message 'async only' to [20]; "
+        "skipped [30] because they have no usable memory method"
+    )
+    _assert_message_call("async", recipient_async, "async only")
+    _assert_message_call("async", sender_async, "async only", recipients=[20])
+    recipient_sync.assert_not_called()
+    sender_sync.assert_not_called()
+    fallback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

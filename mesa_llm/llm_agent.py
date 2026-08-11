@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import warnings
@@ -575,19 +576,49 @@ class LLMAgent(Agent):
         if observer_errors:
             raise ActionPostCommitError(action_choice, result, observer_errors)
 
+    def _plan_message_recipients(
+        self, recipients: list[Agent]
+    ) -> list[tuple[int, Agent]]:
+        """Return unique non-self recipients in first-occurrence order."""
+        planned_recipients = []
+        seen_ids = set()
+        for recipient in recipients:
+            if recipient is self:
+                continue
+            recipient_id = recipient.unique_id
+            if recipient_id in seen_ids:
+                continue
+            seen_ids.add(recipient_id)
+            planned_recipients.append((recipient_id, recipient))
+        return planned_recipients
+
     def _format_message_status(
-        self, message: str, delivered_ids: list[int], skipped_ids: list[int]
+        self,
+        message: str,
+        delivered_ids: list[int],
+        skipped_ids: list[int],
+        *,
+        failed_ids: list[int],
+        sender_history_failed: bool,
     ) -> str:
-        """Format direct-message delivery status to match the speak_to action."""
+        """Format direct-message delivery and sender-history status."""
         status_parts = []
         if delivered_ids:
             status_parts.append(f"sent message {message!r} to {delivered_ids}")
         if skipped_ids:
             status_parts.append(
-                f"skipped {skipped_ids} because they have no `memory` attribute"
+                f"skipped {skipped_ids} because they have no usable memory method"
             )
-        if not status_parts:
-            return f"Could not send message {message!r}: no matching recipients found."
+        if failed_ids:
+            status_parts.append(f"failed to deliver to {failed_ids}")
+        if not delivered_ids and not skipped_ids and not failed_ids:
+            status_parts.append(
+                f"Could not send message {message!r}: no matching recipients found."
+            )
+        if sender_history_failed:
+            status_parts.append(
+                "sender history recording failed after recipient delivery"
+            )
         return "; ".join(status_parts)
 
     async def aapply_plan(self, plan: Plan) -> list[dict]:
@@ -790,33 +821,95 @@ class LLMAgent(Agent):
         """
         delivered_ids = []
         skipped_ids = []
-        for recipient in recipients:
-            if recipient is self:
-                continue
-            if not hasattr(recipient, "memory"):
-                skipped_ids.append(recipient.unique_id)
-                logger.warning(
-                    "Agent %s has no memory attribute; skipping send_message.",
-                    recipient.unique_id,
+        failed_ids = []
+        planned_recipients = self._plan_message_recipients(recipients)
+        for recipient_id, recipient in planned_recipients:
+            try:
+                try:
+                    recipient_memory = recipient.memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient, "memory")
+                    except AttributeError:
+                        recipient_memory = None
+                    else:
+                        raise
+                if recipient_memory is None:
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable async memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                try:
+                    writer = recipient_memory.aadd_to_memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient_memory, "aadd_to_memory")
+                    except AttributeError:
+                        writer = None
+                    else:
+                        raise
+                if not callable(writer):
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable async memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                await writer(
+                    type="message",
+                    content={
+                        "message": message,
+                        "sender": self.unique_id,
+                    },
+                )
+            except Exception:
+                failed_ids.append(recipient_id)
+                logger.exception(
+                    "Message delivery from sender %s to recipient %s failed.",
+                    self.unique_id,
+                    recipient_id,
                 )
                 continue
-            delivered_ids.append(recipient.unique_id)
-            await recipient.memory.aadd_to_memory(
+            delivered_ids.append(recipient_id)
+
+        sender_history_failed = False
+        try:
+            sender_memory = self.memory
+            if sender_memory is None:
+                raise AttributeError("Sender has no memory.")
+            sender_writer = sender_memory.aadd_to_memory
+            if not callable(sender_writer):
+                raise TypeError("Sender async memory writer is not callable.")
+            await sender_writer(
                 type="message",
                 content={
                     "message": message,
                     "sender": self.unique_id,
+                    "recipients": delivered_ids.copy(),
                 },
             )
-        await self.memory.aadd_to_memory(
-            type="message",
-            content={
-                "message": message,
-                "sender": self.unique_id,
-                "recipients": delivered_ids,
-            },
+        except Exception:
+            sender_history_failed = True
+            logger.exception(
+                "Sender %s history recording failed after recipient delivery.",
+                self.unique_id,
+            )
+
+        return self._format_message_status(
+            message,
+            delivered_ids,
+            skipped_ids,
+            failed_ids=failed_ids,
+            sender_history_failed=sender_history_failed,
         )
-        return self._format_message_status(message, delivered_ids, skipped_ids)
 
     def send_message(self, message: str, recipients: list[Agent]) -> str:
         """
@@ -824,33 +917,95 @@ class LLMAgent(Agent):
         """
         delivered_ids = []
         skipped_ids = []
-        for recipient in recipients:
-            if recipient is self:
-                continue
-            if not hasattr(recipient, "memory"):
-                skipped_ids.append(recipient.unique_id)
-                logger.warning(
-                    "Agent %s has no memory attribute; skipping send_message.",
-                    recipient.unique_id,
+        failed_ids = []
+        planned_recipients = self._plan_message_recipients(recipients)
+        for recipient_id, recipient in planned_recipients:
+            try:
+                try:
+                    recipient_memory = recipient.memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient, "memory")
+                    except AttributeError:
+                        recipient_memory = None
+                    else:
+                        raise
+                if recipient_memory is None:
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable sync memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                try:
+                    writer = recipient_memory.add_to_memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient_memory, "add_to_memory")
+                    except AttributeError:
+                        writer = None
+                    else:
+                        raise
+                if not callable(writer):
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable sync memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                writer(
+                    type="message",
+                    content={
+                        "message": message,
+                        "sender": self.unique_id,
+                    },
+                )
+            except Exception:
+                failed_ids.append(recipient_id)
+                logger.exception(
+                    "Message delivery from sender %s to recipient %s failed.",
+                    self.unique_id,
+                    recipient_id,
                 )
                 continue
-            delivered_ids.append(recipient.unique_id)
-            recipient.memory.add_to_memory(
+            delivered_ids.append(recipient_id)
+
+        sender_history_failed = False
+        try:
+            sender_memory = self.memory
+            if sender_memory is None:
+                raise AttributeError("Sender has no memory.")
+            sender_writer = sender_memory.add_to_memory
+            if not callable(sender_writer):
+                raise TypeError("Sender sync memory writer is not callable.")
+            sender_writer(
                 type="message",
                 content={
                     "message": message,
                     "sender": self.unique_id,
+                    "recipients": delivered_ids.copy(),
                 },
             )
-        self.memory.add_to_memory(
-            type="message",
-            content={
-                "message": message,
-                "sender": self.unique_id,
-                "recipients": delivered_ids,
-            },
+        except Exception:
+            sender_history_failed = True
+            logger.exception(
+                "Sender %s history recording failed after recipient delivery.",
+                self.unique_id,
+            )
+
+        return self._format_message_status(
+            message,
+            delivered_ids,
+            skipped_ids,
+            failed_ids=failed_ids,
+            sender_history_failed=sender_history_failed,
         )
-        return self._format_message_status(message, delivered_ids, skipped_ids)
 
     async def apre_step(self):
         """
