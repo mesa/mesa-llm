@@ -33,11 +33,15 @@ def _memory(*contents, step_content=None):
     )
 
 
-def _dialogue_agent(memory_kind: str = "stlt"):
-    agent = SimpleNamespace(
-        model=SimpleNamespace(agents=[], steps=0),
-        step_prompt="",
-    )
+def _dialogue_agent(
+    memory_kind: str = "stlt",
+    *,
+    agent_type: str = "DialogueAgent",
+    unique_id: int = 1,
+):
+    agent = _example_agent(agent_type, unique_id)
+    agent.model = SimpleNamespace(agents=[], steps=0)
+    agent.step_prompt = ""
     if memory_kind == "stlt":
         memory = STLTMemory(
             agent=agent,
@@ -68,6 +72,34 @@ def _finalize_stlt_step(agent, step: int):
     agent.model.steps = step
     agent.memory.process_step(pre_step=True)
     agent.memory.process_step(pre_step=False)
+
+
+def _add_finalized_memory_event(agent, step: int, event_type: str, content: dict):
+    agent.model.steps = step
+    agent.memory.add_to_memory(event_type, content)
+    if isinstance(agent.memory, STLTMemory):
+        _finalize_stlt_step(agent, step)
+
+
+def _successful_speak_action_event(
+    message: str,
+    *,
+    requested=(2,),
+    delivered=(2,),
+    skipped=(),
+    failed=(),
+):
+    requested_ids = list(requested)
+    choice = _speak_choice(requested_ids, message=message)
+    return {
+        "action": choice.model_dump(),
+        "result": {
+            "requested": requested_ids,
+            "delivered": list(delivered),
+            "skipped": list(skipped),
+            "failed": list(failed),
+        },
+    }
 
 
 def _observation(*visible_labels: str):
@@ -301,6 +333,310 @@ def test_dialogue_history_non_positive_limit_returns_empty_result(max_messages):
     assert (
         get_dialogue_history(agent, max_messages=max_messages) == "No recent dialogue."
     )
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+def test_rf_a6_dialogue_history_merges_incoming_and_delivered_speech_in_order(
+    memory_kind,
+):
+    buyer = _dialogue_agent(
+        memory_kind,
+        agent_type="BuyerAgent",
+        unique_id=4,
+    )
+    seller = _example_agent("SellerAgent", 7)
+    buyer.model.agents = [buyer, seller]
+
+    _add_finalized_memory_event(
+        buyer,
+        1,
+        "message",
+        {
+            "sender": seller.unique_id,
+            "message": "The opening price is 40.",
+            "recipients": [buyer.unique_id],
+        },
+    )
+    _add_finalized_memory_event(
+        buyer,
+        2,
+        "action",
+        _successful_speak_action_event(
+            "Can you lower it?",
+            requested=(seller.unique_id, 404, 8, 9),
+            delivered=(seller.unique_id, 404),
+            skipped=(8,),
+            failed=(9,),
+        ),
+    )
+    _add_finalized_memory_event(
+        buyer,
+        3,
+        "message",
+        {
+            "sender": 99,
+            "message": "An external counteroffer.",
+            "recipients": [buyer.unique_id],
+        },
+    )
+    buyer.model.steps = 4
+    buyer.memory.add_to_memory(
+        "action",
+        _successful_speak_action_event(
+            "I can pay 35.",
+            requested=(seller.unique_id,),
+            delivered=(seller.unique_id,),
+        ),
+    )
+
+    assert get_dialogue_history(buyer) == "\n".join(
+        (
+            "- SellerAgent 7: The opening price is 40.",
+            "- BuyerAgent 4 to [SellerAgent 7, Agent 404]: Can you lower it?",
+            "- Agent 99: An external counteroffer.",
+            "- BuyerAgent 4 to [SellerAgent 7]: I can pay 35.",
+        )
+    )
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+def test_rf_a6_dialogue_history_applies_limit_after_merged_traversal(memory_kind):
+    seller = _dialogue_agent(
+        memory_kind,
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+    events = (
+        (
+            "message",
+            {"sender": buyer.unique_id, "message": "Incoming one."},
+        ),
+        (
+            "action",
+            _successful_speak_action_event(
+                "Outgoing two.",
+                requested=(buyer.unique_id,),
+                delivered=(buyer.unique_id,),
+            ),
+        ),
+        (
+            "message",
+            {"sender": "external-feed", "message": "Incoming three."},
+        ),
+        (
+            "action",
+            _successful_speak_action_event(
+                "Outgoing four.",
+                requested=(buyer.unique_id,),
+                delivered=(buyer.unique_id,),
+            ),
+        ),
+        (
+            "message",
+            {"sender": buyer.unique_id, "message": "Incoming five."},
+        ),
+    )
+    for step, (event_type, content) in enumerate(events, start=1):
+        if memory_kind == "stlt" and step == len(events):
+            seller.model.steps = step
+            seller.memory.add_to_memory(event_type, content)
+        else:
+            _add_finalized_memory_event(seller, step, event_type, content)
+
+    assert get_dialogue_history(seller, max_messages=3) == "\n".join(
+        (
+            "- external-feed: Incoming three.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Outgoing four.",
+            "- BuyerAgent 7: Incoming five.",
+        )
+    )
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "skipped-only",
+        "failed-only",
+        "empty-delivery",
+        "malformed-action",
+        "missing-message",
+        "malformed-result",
+        "malformed-delivered",
+        "unrelated-action",
+        "legacy-missing-result",
+        "legacy-unknown-result",
+    ),
+)
+def test_rf_a6_dialogue_history_excludes_non_delivered_action_snapshots(
+    scenario,
+    memory_kind,
+):
+    agent = _dialogue_agent(
+        memory_kind,
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    event = _successful_speak_action_event(
+        f"Excluded {scenario}.",
+        requested=(7,),
+        delivered=(),
+    )
+
+    if scenario == "skipped-only":
+        event["result"]["skipped"] = [7]
+    elif scenario == "failed-only":
+        event["result"]["failed"] = [7]
+    elif scenario == "malformed-action":
+        event["action"] = "speak_to"
+        event["result"]["delivered"] = [7]
+    elif scenario == "missing-message":
+        del event["action"]["arguments"]["message"]
+        event["result"]["delivered"] = [7]
+    elif scenario == "malformed-result":
+        event["result"] = ["delivered", 7]
+    elif scenario == "malformed-delivered":
+        event["result"]["delivered"] = 7
+    elif scenario == "unrelated-action":
+        event["action"]["name"] = "wait"
+        event["result"]["delivered"] = [7]
+    elif scenario == "legacy-missing-result":
+        del event["result"]
+    elif scenario == "legacy-unknown-result":
+        event["result"] = "sent message to recipient"
+
+    _add_finalized_memory_event(agent, 1, "action", event)
+
+    assert get_dialogue_history(agent) == "No recent dialogue."
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+def test_final_a6_equal_actions_remain_distinct_while_current_alias_is_deduplicated(
+    memory_kind,
+):
+    agent = _dialogue_agent(
+        memory_kind,
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    for step in (1, 2):
+        _add_finalized_memory_event(
+            agent,
+            step,
+            "action",
+            _successful_speak_action_event(
+                "The price is still 40.",
+                requested=(7,),
+                delivered=(7,),
+            ),
+        )
+
+    entries = (
+        agent.memory.short_term_memory
+        if memory_kind == "stlt"
+        else agent.memory.memory_entries
+    )
+    assert entries[0].content == entries[1].content
+    assert entries[0].content is not entries[1].content
+    agent.memory.step_content = entries[-1].content
+
+    assert get_dialogue_history(agent) == "\n".join(
+        (
+            "- SellerAgent 5 to [Agent 7]: The price is still 40.",
+            "- SellerAgent 5 to [Agent 7]: The price is still 40.",
+        )
+    )
+
+
+@pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
+@pytest.mark.parametrize(
+    ("actor_kind", "peer_type", "message"),
+    (
+        pytest.param(
+            "seller",
+            "BuyerAgent",
+            "My delivered offer is 40.",
+            id="seller",
+        ),
+        pytest.param(
+            "buyer",
+            "SellerAgent",
+            "My delivered counteroffer is 35.",
+            id="buyer",
+        ),
+    ),
+)
+def test_final_a6_next_prompt_includes_own_speech_without_sender_message_or_llm_call(
+    monkeypatch,
+    actor_kind,
+    peer_type,
+    message,
+    memory_kind,
+):
+    actor = (
+        _seller_agent(monkeypatch)
+        if actor_kind == "seller"
+        else _buyer_agent(monkeypatch)
+    )
+    grading = None
+    if memory_kind == "episodic":
+        actor.memory = EpisodicMemory(
+            agent=actor,
+            display=False,
+            llm_model="openai/test",
+        )
+        grading = Mock(return_value=3)
+        actor.memory.grade_event_importance = grading
+    else:
+        assert isinstance(actor.memory, STLTMemory)
+
+    peer = _add_peer(actor.model, peer_type)
+    _set_visible_peers(actor, peer)
+    _forbid_action_selection(actor)
+    result = actor.execute_action(
+        _speak_choice([peer.unique_id], message=message),
+        actions=["speak_to"],
+    )
+
+    _assert_delivery_partition(
+        result,
+        [peer.unique_id],
+        [peer.unique_id],
+        [],
+    )
+    if memory_kind == "stlt":
+        assert list(actor.memory.step_content) == ["action"]
+        assert len(actor.memory.step_content["action"]) == 1
+    else:
+        assert len(actor.memory.memory_entries) == 1
+        assert set(actor.memory.memory_entries[0].content) == {"action"}
+        assert grading.call_count == 1
+
+    observation = _observation(f"{peer_type} {peer.unique_id}")
+    actor.generate_obs = Mock(return_value=observation)
+    actor.act = Mock(return_value="ignored action result")
+
+    actor.step()
+
+    own_line = (
+        f"- {type(actor).__name__} {actor.unique_id} "
+        f"to [{peer_type} {peer.unique_id}]: {message}"
+    )
+    prompt = actor.act.call_args.kwargs["prompt"][1]
+    assert prompt.count(own_line) == 1
+    if memory_kind == "stlt":
+        assert "message" not in actor.memory.step_content
+    else:
+        assert all(
+            "message" not in entry.content for entry in actor.memory.memory_entries
+        )
+        assert grading.call_count == 1
+    actor.llm.generate.assert_not_called()
+    actor.llm.agenerate.assert_not_awaited()
+    actor.memory.llm.generate.assert_not_called()
+    actor.memory.llm.agenerate.assert_not_awaited()
 
 
 def test_seller_execute_action_filters_and_reports_complete_recipient_partition(

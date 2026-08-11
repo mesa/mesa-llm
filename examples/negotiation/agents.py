@@ -29,6 +29,32 @@ def _memory_event_payloads(agent, event_type: str):
         yield from (payload for payload in payloads if isinstance(payload, dict))
 
 
+def _dialogue_event_payloads(agent):
+    """Yield stored message and action payloads in insertion order."""
+    memory = agent.memory
+    entries = getattr(memory, "short_term_memory", None)
+    if entries is None:
+        entries = getattr(memory, "memory_entries", ())
+
+    contents = [entry.content for entry in entries]
+    step_content = getattr(memory, "step_content", None)
+    if isinstance(step_content, dict) and not any(
+        step_content is content for content in contents
+    ):
+        contents.append(step_content)
+
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        for event_type, payloads in content.items():
+            if event_type not in ("message", "action"):
+                continue
+            event_payloads = payloads if isinstance(payloads, list) else [payloads]
+            for payload in event_payloads:
+                if isinstance(payload, dict):
+                    yield event_type, payload
+
+
 def _recent_dialogue_partner_ids(agent) -> set:
     """Return structured sender/recipient IDs from recent dialogue events."""
     partner_ids = set()
@@ -155,34 +181,82 @@ def get_dialogue_history(agent, max_messages: int = 5) -> str:
     if max_messages <= 0:
         return "No recent dialogue."
 
-    messages = list(_memory_event_payloads(agent, "message"))[-max_messages:]
     dialogue = []
-    for message in messages:
-        sender = message.get("sender", "Unknown")
-        msg = message.get("message", "")
+    for event_type, event in _dialogue_event_payloads(agent):
+        if event_type == "message":
+            sender = event.get("sender", "Unknown")
+            msg = event.get("message", "")
 
-        if hasattr(sender, "unique_id"):
-            sender_name = f"{type(sender).__name__} {sender.unique_id}"
-        elif isinstance(sender, int) and not isinstance(sender, bool):
-            agent_obj = next(
+            if hasattr(sender, "unique_id"):
+                sender_name = f"{type(sender).__name__} {sender.unique_id}"
+            elif isinstance(sender, int) and not isinstance(sender, bool):
+                agent_obj = next(
+                    (
+                        candidate
+                        for candidate in agent.model.agents
+                        if candidate.unique_id == sender
+                    ),
+                    None,
+                )
+                sender_name = (
+                    f"{type(agent_obj).__name__} {sender}"
+                    if agent_obj is not None
+                    else f"Agent {sender}"
+                )
+            else:
+                sender_name = str(sender)
+
+            dialogue.append(f"- {sender_name}: {msg}")
+            continue
+
+        action_choice = event.get("action")
+        if (
+            not isinstance(action_choice, dict)
+            or action_choice.get("name") != "speak_to"
+        ):
+            continue
+
+        arguments = action_choice.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        message = arguments.get("message")
+        if not isinstance(message, str):
+            continue
+
+        result = event.get("result")
+        if not isinstance(result, dict):
+            continue
+        delivered = result.get("delivered")
+        if (
+            not isinstance(delivered, list | tuple)
+            or not delivered
+            or not all(
+                isinstance(recipient_id, int) and not isinstance(recipient_id, bool)
+                for recipient_id in delivered
+            )
+        ):
+            continue
+
+        recipient_names = []
+        for recipient_id in delivered:
+            recipient = next(
                 (
                     candidate
                     for candidate in agent.model.agents
-                    if candidate.unique_id == sender
+                    if candidate.unique_id == recipient_id
                 ),
                 None,
             )
-            sender_name = (
-                f"{type(agent_obj).__name__} {sender}"
-                if agent_obj is not None
-                else f"Agent {sender}"
+            recipient_names.append(
+                f"{type(recipient).__name__} {recipient_id}"
+                if recipient is not None
+                else f"Agent {recipient_id}"
             )
-        else:
-            sender_name = str(sender)
 
-        dialogue.append(f"- {sender_name}: {msg}")
+        sender_name = f"{type(agent).__name__} {agent.unique_id}"
+        dialogue.append(f"- {sender_name} to [{', '.join(recipient_names)}]: {message}")
 
-    return "\n".join(dialogue) if dialogue else "No recent dialogue."
+    return "\n".join(dialogue[-max_messages:]) if dialogue else "No recent dialogue."
 
 
 class SellerAgent(LLMAgent):
