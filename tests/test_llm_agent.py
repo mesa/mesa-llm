@@ -2335,6 +2335,82 @@ class _ObserverAbort(BaseException):
     """Sentinel proving observer boundaries catch Exception, not BaseException."""
 
 
+class _A5SnapshotProbe:
+    """Control successive deepcopy outcomes without changing production seams."""
+
+    def __init__(self, outcomes=()):
+        self._outcomes = tuple(outcomes)
+        self.copy_attempts = 0
+
+    def __deepcopy__(self, memo):
+        attempt = self.copy_attempts
+        self.copy_attempts += 1
+        outcome = self._outcomes[attempt] if attempt < len(self._outcomes) else None
+        if outcome is not None:
+            raise outcome
+
+        snapshot = type(self)()
+        memo[id(self)] = snapshot
+        return snapshot
+
+
+_A5_SNAPSHOT_FAILURE_SCENARIOS = (
+    "memory-snapshot",
+    "recorder-snapshot",
+    "dual-snapshot",
+    "memory-snapshot-and-recorder-observer",
+    "memory-observer-and-recorder-snapshot",
+)
+
+
+def _make_a5_snapshot_failure_case(scenario):
+    memory_snapshot_error = RuntimeError("memory snapshot failed")
+    recorder_snapshot_error = LookupError("recorder snapshot failed")
+    memory_observer_error = ValueError("memory observer failed")
+    recorder_observer_error = OSError("recorder observer failed")
+
+    memory_snapshot_fails = scenario in {
+        "memory-snapshot",
+        "dual-snapshot",
+        "memory-snapshot-and-recorder-observer",
+    }
+    recorder_snapshot_fails = scenario in {
+        "recorder-snapshot",
+        "dual-snapshot",
+        "memory-observer-and-recorder-snapshot",
+    }
+    memory_observer_fails = scenario == "memory-observer-and-recorder-snapshot"
+    recorder_observer_fails = scenario == "memory-snapshot-and-recorder-observer"
+
+    expected_errors = {}
+    if memory_snapshot_fails:
+        expected_errors["memory"] = memory_snapshot_error
+    elif memory_observer_fails:
+        expected_errors["memory"] = memory_observer_error
+    if recorder_snapshot_fails:
+        expected_errors["recorder"] = recorder_snapshot_error
+    elif recorder_observer_fails:
+        expected_errors["recorder"] = recorder_observer_error
+
+    return SimpleNamespace(
+        probe=_A5SnapshotProbe(
+            (
+                memory_snapshot_error if memory_snapshot_fails else None,
+                recorder_snapshot_error if recorder_snapshot_fails else None,
+            )
+        ),
+        memory_observer_error=(
+            memory_observer_error if memory_observer_fails else None
+        ),
+        recorder_observer_error=(
+            recorder_observer_error if recorder_observer_fails else None
+        ),
+        expected_errors=expected_errors,
+        memory_should_run=not memory_snapshot_fails,
+        recorder_should_run=not recorder_snapshot_fails,
+    )
+
+
 def _make_sync_post_commit_agent(result):
     class DummyModel(Model):
         def __init__(self):
@@ -2352,7 +2428,7 @@ def _make_sync_post_commit_agent(result):
         """
         agent.action_calls += 1
         agent.timeline.append("action")
-        return result
+        return agent.committed_result
 
     agent = LLMAgent(
         DummyModel(),
@@ -2361,6 +2437,7 @@ def _make_sync_post_commit_agent(result):
     )
     agent.action_calls = 0
     agent.timeline = []
+    agent.committed_result = result
     choice = ActionChoice(
         name="pd03_sync_action",
         arguments={"amount": "2"},
@@ -2388,7 +2465,7 @@ def _make_async_post_commit_agent(result):
         await asyncio.sleep(0)
         agent.action_await_completions += 1
         agent.timeline.append("action")
-        return result
+        return agent.committed_result
 
     agent = LLMAgent(
         DummyModel(),
@@ -2398,6 +2475,7 @@ def _make_async_post_commit_agent(result):
     agent.action_calls = 0
     agent.action_await_completions = 0
     agent.timeline = []
+    agent.committed_result = result
     choice = ActionChoice(
         name="pd03_async_action",
         arguments={"amount": "2"},
@@ -2562,7 +2640,7 @@ def test_execute_action_reports_post_commit_observer_exceptions(
     memory_fails,
     recorder_fails,
 ):
-    result = object()
+    result = {"items": [{"state": "committed"}]}
     memory_error = RuntimeError("memory observer failed")
     recorder_error = ValueError("recorder observer failed")
     agent, choice = _make_sync_post_commit_agent(result)
@@ -2601,8 +2679,15 @@ def test_execute_action_reports_post_commit_observer_exceptions(
     assert agent.timeline == ["action", "memory", "recorder"]
     agent.memory.add_to_memory.assert_called_once()
     agent.recorder.record_event.assert_called_once()
-    assert agent.memory.add_to_memory.call_args.kwargs["content"]["result"] is result
-    assert agent.recorder.record_event.call_args.kwargs["content"]["result"] is result
+    memory_result = agent.memory.add_to_memory.call_args.kwargs["content"]["result"]
+    recorder_result = agent.recorder.record_event.call_args.kwargs["content"]["result"]
+    assert memory_result == result
+    assert recorder_result == result
+    assert memory_result is not result
+    assert recorder_result is not result
+    assert memory_result is not recorder_result
+    assert memory_result["items"] is not recorder_result["items"]
+    assert memory_result["items"][0] is not recorder_result["items"][0]
 
 
 @pytest.mark.asyncio
@@ -2618,7 +2703,7 @@ async def test_aexecute_action_reports_post_commit_observer_exceptions(
     memory_fails,
     recorder_fails,
 ):
-    result = object()
+    result = [{"details": {"state": "committed"}}]
     memory_error = RuntimeError("async memory observer failed")
     recorder_error = ValueError("async recorder observer failed")
     agent, choice = _make_async_post_commit_agent(result)
@@ -2659,8 +2744,243 @@ async def test_aexecute_action_reports_post_commit_observer_exceptions(
     agent.memory.aadd_to_memory.assert_awaited_once()
     agent.memory.add_to_memory.assert_not_called()
     agent.recorder.record_event.assert_called_once()
-    assert agent.memory.aadd_to_memory.call_args.kwargs["content"]["result"] is result
-    assert agent.recorder.record_event.call_args.kwargs["content"]["result"] is result
+    memory_result = agent.memory.aadd_to_memory.call_args.kwargs["content"]["result"]
+    recorder_result = agent.recorder.record_event.call_args.kwargs["content"]["result"]
+    assert memory_result == result
+    assert recorder_result == result
+    assert memory_result is not result
+    assert recorder_result is not result
+    assert memory_result is not recorder_result
+    assert memory_result[0] is not recorder_result[0]
+    assert memory_result[0]["details"] is not recorder_result[0]["details"]
+
+
+def test_rf_a5_execute_action_returns_original_and_isolates_observer_snapshots():
+    original = {"items": [{"details": {"state": "committed", "tags": ["seed"]}}]}
+    agent, choice = _make_sync_post_commit_agent(original)
+    memory_history = []
+    recorder_history = []
+
+    def remember(*, type, content):
+        assert type == "action"
+        memory_history.append(content)
+        details = content["result"]["items"][0]["details"]
+        details["state"] = "memory-mutated"
+        details["tags"].append("memory")
+
+    def record(event_type, *, content, **kwargs):
+        assert event_type == "action"
+        recorder_history.append(content)
+
+    agent.memory = SimpleNamespace(add_to_memory=Mock(side_effect=remember))
+    agent.recorder = SimpleNamespace(record_event=Mock(side_effect=record))
+
+    returned = agent.execute_action(choice)
+
+    assert returned is original
+    assert returned is agent.committed_result
+    memory_content = memory_history[0]
+    recorder_content = recorder_history[0]
+    memory_result = memory_content["result"]
+    recorder_result = recorder_content["result"]
+    assert memory_content is not recorder_content
+    assert memory_content["action"] is not recorder_content["action"]
+    assert (
+        memory_content["action"]["arguments"]
+        is not recorder_content["action"]["arguments"]
+    )
+    assert memory_result is not original
+    assert recorder_result is not original
+    assert memory_result is not recorder_result
+    assert memory_result["items"] is not recorder_result["items"]
+    assert memory_result["items"][0] is not recorder_result["items"][0]
+    assert (
+        memory_result["items"][0]["details"]
+        is not recorder_result["items"][0]["details"]
+    )
+    assert original["items"][0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+    }
+    assert recorder_result["items"][0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+    }
+
+    returned["items"][0]["details"]["state"] = "caller-mutated"
+    returned["items"][0]["details"]["tags"].append("caller")
+
+    assert memory_result["items"][0]["details"] == {
+        "state": "memory-mutated",
+        "tags": ["seed", "memory"],
+    }
+    assert recorder_result["items"][0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_a5_async_snapshots_precede_memory_await_and_isolate_history():
+    probe = _A5SnapshotProbe()
+    original = [
+        {
+            "details": {"state": "committed", "tags": ["seed"]},
+            "probe": probe,
+        }
+    ]
+    agent, choice = _make_async_post_commit_agent(original)
+    memory_started = asyncio.Event()
+    release_memory = asyncio.Event()
+    copy_attempts_at_memory_start = []
+    memory_history = []
+    recorder_history = []
+    recorder_state_at_entry = []
+
+    async def remember(*, type, content):
+        assert type == "action"
+        copy_attempts_at_memory_start.append(probe.copy_attempts)
+        memory_history.append(content)
+        content["result"][0]["details"]["observer"] = "memory"
+        memory_started.set()
+        await release_memory.wait()
+
+    def record(event_type, *, content, **kwargs):
+        assert event_type == "action"
+        recorder_state_at_entry.append(
+            (
+                content["result"][0]["details"]["state"],
+                list(content["result"][0]["details"]["tags"]),
+            )
+        )
+        recorder_history.append(content)
+        content["result"][0]["details"]["observer"] = "recorder"
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(
+            side_effect=AssertionError("async execution must not use sync memory")
+        ),
+        aadd_to_memory=AsyncMock(side_effect=remember),
+    )
+    agent.recorder = SimpleNamespace(record_event=Mock(side_effect=record))
+
+    execution = asyncio.create_task(agent.aexecute_action(choice))
+    try:
+        await asyncio.wait_for(memory_started.wait(), timeout=2)
+        original[0]["details"]["state"] = "caller-during-memory-await"
+        original[0]["details"]["tags"].append("caller-during-memory-await")
+    finally:
+        release_memory.set()
+    returned = await execution
+
+    assert returned is original
+    assert returned is agent.committed_result
+    assert copy_attempts_at_memory_start == [2]
+    assert recorder_state_at_entry == [("committed", ["seed"])]
+    memory_result = memory_history[0]["result"]
+    recorder_result = recorder_history[0]["result"]
+    assert memory_history[0] is not recorder_history[0]
+    assert memory_result is not original
+    assert recorder_result is not original
+    assert memory_result is not recorder_result
+    assert memory_result[0] is not recorder_result[0]
+    assert memory_result[0]["details"] is not recorder_result[0]["details"]
+    assert memory_result[0]["probe"] is not probe
+    assert recorder_result[0]["probe"] is not probe
+    assert memory_result[0]["probe"] is not recorder_result[0]["probe"]
+    assert memory_result[0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+        "observer": "memory",
+    }
+    assert recorder_result[0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+        "observer": "recorder",
+    }
+
+    returned[0]["details"]["state"] = "caller-after-return"
+    returned[0]["details"]["tags"].append("caller-after-return")
+
+    assert memory_result[0]["details"]["state"] == "committed"
+    assert memory_result[0]["details"]["tags"] == ["seed"]
+    assert recorder_result[0]["details"]["state"] == "committed"
+    assert recorder_result[0]["details"]["tags"] == ["seed"]
+
+
+@pytest.mark.parametrize("scenario", _A5_SNAPSHOT_FAILURE_SCENARIOS)
+def test_rf_a5_execute_action_labels_snapshot_and_observer_failures(scenario):
+    failure_case = _make_a5_snapshot_failure_case(scenario)
+    original = {"items": [{"probe": failure_case.probe}]}
+    agent, choice = _make_sync_post_commit_agent(original)
+    _install_sync_post_commit_observers(
+        agent,
+        memory_error=failure_case.memory_observer_error,
+        recorder_error=failure_case.recorder_observer_error,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        agent.execute_action(choice)
+
+    error = exc_info.value
+    assert error.result is original
+    assert error.result is agent.committed_result
+    assert set(error.observer_errors) == set(failure_case.expected_errors)
+    for observer, expected_error in failure_case.expected_errors.items():
+        assert error.observer_errors[observer] is expected_error
+    assert failure_case.probe.copy_attempts == 2
+    assert agent.action_calls == 1
+    expected_timeline = ["action"]
+    if failure_case.memory_should_run:
+        expected_timeline.append("memory")
+        agent.memory.add_to_memory.assert_called_once()
+    else:
+        agent.memory.add_to_memory.assert_not_called()
+    if failure_case.recorder_should_run:
+        expected_timeline.append("recorder")
+        agent.recorder.record_event.assert_called_once()
+    else:
+        agent.recorder.record_event.assert_not_called()
+    assert agent.timeline == expected_timeline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", _A5_SNAPSHOT_FAILURE_SCENARIOS)
+async def test_rf_a5_aexecute_action_labels_snapshot_and_observer_failures(scenario):
+    failure_case = _make_a5_snapshot_failure_case(scenario)
+    original = [{"probe": failure_case.probe}]
+    agent, choice = _make_async_post_commit_agent(original)
+    _install_async_post_commit_observers(
+        agent,
+        memory_error=failure_case.memory_observer_error,
+        recorder_error=failure_case.recorder_observer_error,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        await agent.aexecute_action(choice)
+
+    error = exc_info.value
+    assert error.result is original
+    assert error.result is agent.committed_result
+    assert set(error.observer_errors) == set(failure_case.expected_errors)
+    for observer, expected_error in failure_case.expected_errors.items():
+        assert error.observer_errors[observer] is expected_error
+    assert failure_case.probe.copy_attempts == 2
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    expected_timeline = ["action"]
+    if failure_case.memory_should_run:
+        expected_timeline.append("memory")
+        agent.memory.aadd_to_memory.assert_awaited_once()
+    else:
+        agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    if failure_case.recorder_should_run:
+        expected_timeline.append("recorder")
+        agent.recorder.record_event.assert_called_once()
+    else:
+        agent.recorder.record_event.assert_not_called()
+    assert agent.timeline == expected_timeline
 
 
 def test_execute_action_succeeds_without_optional_recorder():
@@ -2796,6 +3116,57 @@ async def test_aexecute_action_preserves_pre_commit_failures_without_observers()
         )
 
     assert exc_info.value is action_error
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_snapshot", ["memory", "recorder"])
+def test_rf_a5_execute_action_does_not_convert_snapshot_base_exceptions(
+    failing_snapshot,
+):
+    snapshot_abort = _ObserverAbort(f"sync {failing_snapshot} snapshot aborted")
+    outcomes = (
+        snapshot_abort if failing_snapshot == "memory" else None,
+        snapshot_abort if failing_snapshot == "recorder" else None,
+    )
+    probe = _A5SnapshotProbe(outcomes)
+    original = {"items": [{"probe": probe}]}
+    agent, choice = _make_sync_post_commit_agent(original)
+    _install_sync_post_commit_observers(agent)
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        agent.execute_action(choice)
+
+    assert exc_info.value is snapshot_abort
+    assert probe.copy_attempts == (1 if failing_snapshot == "memory" else 2)
+    assert agent.action_calls == 1
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_snapshot", ["memory", "recorder"])
+async def test_rf_a5_aexecute_action_does_not_convert_snapshot_base_exceptions(
+    failing_snapshot,
+):
+    snapshot_abort = _ObserverAbort(f"async {failing_snapshot} snapshot aborted")
+    outcomes = (
+        snapshot_abort if failing_snapshot == "memory" else None,
+        snapshot_abort if failing_snapshot == "recorder" else None,
+    )
+    probe = _A5SnapshotProbe(outcomes)
+    original = [{"probe": probe}]
+    agent, choice = _make_async_post_commit_agent(original)
+    _install_async_post_commit_observers(agent)
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        await agent.aexecute_action(choice)
+
+    assert exc_info.value is snapshot_abort
+    assert probe.copy_attempts == (1 if failing_snapshot == "memory" else 2)
     assert agent.action_calls == 1
     assert agent.action_await_completions == 1
     agent.memory.aadd_to_memory.assert_not_awaited()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import warnings
@@ -495,15 +496,31 @@ class LLMAgent(Agent):
             "result": result,
         }
         observer_errors: dict[str, Exception] = {}
+
+        memory_content: dict[str, Any] | None = None
         try:
-            self.memory.add_to_memory(type="action", content=content)
+            memory_content = copy.deepcopy(content)
         except Exception as error:
             observer_errors["memory"] = error
-        if self.recorder is not None:
+
+        recorder = self.recorder
+        recorder_content: dict[str, Any] | None = None
+        if recorder is not None:
             try:
-                self.recorder.record_event(
+                recorder_content = copy.deepcopy(content)
+            except Exception as error:
+                observer_errors["recorder"] = error
+
+        if memory_content is not None:
+            try:
+                self.memory.add_to_memory(type="action", content=memory_content)
+            except Exception as error:
+                observer_errors["memory"] = error
+        if recorder is not None and recorder_content is not None:
+            try:
+                recorder.record_event(
                     "action",
-                    content=content,
+                    content=recorder_content,
                     agent_id=self.unique_id,
                     metadata={"source": "LLMAgent.execute_action"},
                 )
@@ -522,15 +539,34 @@ class LLMAgent(Agent):
             "result": result,
         }
         observer_errors: dict[str, Exception] = {}
+
+        memory_content: dict[str, Any] | None = None
         try:
-            await self.memory.aadd_to_memory(type="action", content=content)
+            memory_content = copy.deepcopy(content)
         except Exception as error:
             observer_errors["memory"] = error
-        if self.recorder is not None:
+
+        recorder = self.recorder
+        recorder_content: dict[str, Any] | None = None
+        if recorder is not None:
             try:
-                self.recorder.record_event(
+                recorder_content = copy.deepcopy(content)
+            except Exception as error:
+                observer_errors["recorder"] = error
+
+        if memory_content is not None:
+            try:
+                await self.memory.aadd_to_memory(
+                    type="action",
+                    content=memory_content,
+                )
+            except Exception as error:
+                observer_errors["memory"] = error
+        if recorder is not None and recorder_content is not None:
+            try:
+                recorder.record_event(
                     "action",
-                    content=content,
+                    content=recorder_content,
                     agent_id=self.unique_id,
                     metadata={"source": "LLMAgent.execute_action"},
                 )
