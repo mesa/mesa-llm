@@ -17,6 +17,7 @@ from mesa.model import Model
 from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
 
 import mesa_llm.actions as action_exports
+import mesa_llm.llm_agent as llm_agent_module
 from mesa_llm import (
     ActionPostCommitError as RootActionPostCommitError,
 )
@@ -2819,6 +2820,149 @@ def _install_async_post_commit_observers(
         if recorder_present
         else None
     )
+
+
+def _make_final_a10_agent_deferred_result(kind, state):
+    if kind == "generator":
+
+        def deferred_result():
+            state.body_calls += 1
+            yield "deferred"
+
+    else:
+
+        async def deferred_result():
+            state.body_calls += 1
+            yield "deferred"
+
+    return deferred_result()
+
+
+def _install_final_a10_deepcopy_guard(monkeypatch):
+    deepcopy_spy = Mock(
+        side_effect=AssertionError(
+            "a rejected deferred result must not reach success deepcopy"
+        )
+    )
+    monkeypatch.setattr(
+        llm_agent_module,
+        "copy",
+        SimpleNamespace(deepcopy=deepcopy_spy),
+    )
+    return deepcopy_spy
+
+
+def _assert_final_a10_agent_precommit_failure(
+    agent,
+    kind,
+    deferred_result,
+    deepcopy_spy,
+):
+    assert agent.action_calls == 1
+    assert agent.timeline == ["action"]
+    frame = (
+        deferred_result.gi_frame if kind == "generator" else deferred_result.ag_frame
+    )
+    assert frame is None
+    deepcopy_spy.assert_not_called()
+    agent.memory.add_to_memory.assert_not_called()
+    if hasattr(agent.memory, "aadd_to_memory"):
+        agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "kind"),
+    [
+        pytest.param("execute_action", "generator", id="execute-action-generator"),
+        pytest.param("act", "async-generator", id="act-async-generator"),
+    ],
+)
+def test_final_a10_sync_agent_entrypoints_do_not_commit_deferred_results(
+    entrypoint,
+    kind,
+    monkeypatch,
+):
+    state = SimpleNamespace(body_calls=0)
+    deferred_result = _make_final_a10_agent_deferred_result(kind, state)
+    agent, choice = _make_sync_post_commit_agent(deferred_result)
+    _install_sync_post_commit_observers(agent)
+    deepcopy_spy = _install_final_a10_deepcopy_guard(monkeypatch)
+    if entrypoint == "act":
+        agent.choose_action = Mock(return_value=choice)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "execute_action":
+                agent.execute_action(choice)
+            else:
+                agent.act("Choose the deferred-result action.")
+
+        assert type(exc_info.value) is TypeError
+        assert not isinstance(exc_info.value, ActionPostCommitError)
+        assert choice.name in str(exc_info.value)
+        assert state.body_calls == 0
+        _assert_final_a10_agent_precommit_failure(
+            agent,
+            kind,
+            deferred_result,
+            deepcopy_spy,
+        )
+    finally:
+        if kind == "generator":
+            deferred_result.close()
+        else:
+            asyncio.run(deferred_result.aclose())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entrypoint", "kind"),
+    [
+        pytest.param(
+            "aexecute_action",
+            "async-generator",
+            id="aexecute-action-async-generator",
+        ),
+        pytest.param("aact", "generator", id="aact-generator"),
+    ],
+)
+async def test_final_a10_async_agent_entrypoints_do_not_commit_deferred_results(
+    entrypoint,
+    kind,
+    monkeypatch,
+):
+    state = SimpleNamespace(body_calls=0)
+    deferred_result = _make_final_a10_agent_deferred_result(kind, state)
+    agent, choice = _make_async_post_commit_agent(deferred_result)
+    _install_async_post_commit_observers(agent)
+    deepcopy_spy = _install_final_a10_deepcopy_guard(monkeypatch)
+    if entrypoint == "aact":
+        agent.achoose_action = AsyncMock(return_value=choice)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "aexecute_action":
+                await agent.aexecute_action(choice)
+            else:
+                await agent.aact("Choose the deferred-result action.")
+
+        assert type(exc_info.value) is TypeError
+        assert not isinstance(exc_info.value, ActionPostCommitError)
+        assert choice.name in str(exc_info.value)
+        assert agent.action_await_completions == 1
+        assert state.body_calls == 0
+        _assert_final_a10_agent_precommit_failure(
+            agent,
+            kind,
+            deferred_result,
+            deepcopy_spy,
+        )
+    finally:
+        if kind == "generator":
+            deferred_result.close()
+        else:
+            await deferred_result.aclose()
 
 
 def test_action_post_commit_error_has_established_public_exports():

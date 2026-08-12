@@ -296,8 +296,10 @@ def test_action_manager_register_many_rejects_declared_generator_atomically(kind
     assert body_calls == []
 
 
-def test_normal_action_returning_generator_remains_a_deferred_runtime_contract():
+def test_final_a10_normal_action_returning_generator_registers_then_runtime_rejects():
+    producer_calls = []
     body_calls = []
+    returned_results = []
     manager = ActionManager()
 
     @action(action_manager=manager)
@@ -307,20 +309,38 @@ def test_normal_action_returning_generator_remains_a_deferred_runtime_contract()
         Returns:
             A deferred generator result.
         """
-        body_calls.append(agent)
-        return (value for value in ("deferred",))
+        producer_calls.append(agent)
+
+        def deferred_body():
+            body_calls.append(agent)
+            yield "deferred"
+
+        result = deferred_body()
+        returned_results.append(result)
+        return result
 
     agent = object()
 
-    result = manager.execute(
-        agent,
-        ActionChoice(name="return_generator", arguments={}),
-    )
-
+    assert manager.actions == {"return_generator": return_generator}
+    assert return_generator.__action_schema__["name"] == "return_generator"
     assert not inspect.isgeneratorfunction(return_generator)
-    assert inspect.isgenerator(result)
-    assert body_calls == [agent]
-    assert list(result) == ["deferred"]
+
+    try:
+        with pytest.raises(TypeError, match="generator") as exc_info:
+            manager.execute(
+                agent,
+                ActionChoice(name="return_generator", arguments={}),
+            )
+
+        assert type(exc_info.value) is TypeError
+        assert "return_generator" in str(exc_info.value)
+        assert producer_calls == [agent]
+        assert body_calls == []
+        assert len(returned_results) == 1
+        assert returned_results[0].gi_frame is None
+    finally:
+        for result in returned_results:
+            result.close()
 
 
 @pytest.mark.parametrize(

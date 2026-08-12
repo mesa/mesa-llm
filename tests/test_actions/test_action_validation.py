@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import math
+import threading
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -10,7 +11,12 @@ from typing import TYPE_CHECKING, Annotated, Literal
 import numpy as np
 import pytest
 
-from mesa_llm.actions import ActionChoice, ActionManager, action
+from mesa_llm.actions import (
+    ActionChoice,
+    ActionManager,
+    ActionPostCommitError,
+    action,
+)
 from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
 
 if TYPE_CHECKING:
@@ -27,6 +33,101 @@ def restore_global_action_registry():
     yield
     _GLOBAL_ACTION_REGISTRY.clear()
     _GLOBAL_ACTION_REGISTRY.update(original_registry)
+
+
+_FINAL_A10_DEFERRED_KINDS = ("generator", "async-generator")
+
+
+class _FinalA10CleanupAbort(BaseException):
+    pass
+
+
+class _FinalA10UnformattableCleanupArgument:
+    def __str__(self):
+        raise RuntimeError("cleanup argument __str__ failed")
+
+    def __repr__(self):
+        raise RuntimeError("cleanup argument __repr__ failed")
+
+
+class _FinalA10Iterator:
+    def __init__(self):
+        self.next_calls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.next_calls += 1
+        raise StopIteration
+
+
+class _FinalA10Result:
+    pass
+
+
+_FINAL_A10_COMPLETED_RESULT_FACTORIES = (
+    pytest.param("execute", lambda: ["completed"], id="execute-list"),
+    pytest.param("aexecute", lambda: ("completed",), id="aexecute-tuple"),
+    pytest.param(
+        "execute",
+        lambda: {"status": "completed"},
+        id="execute-dict",
+    ),
+    pytest.param(
+        "aexecute",
+        lambda: iter(["completed"]),
+        id="aexecute-list-iterator",
+    ),
+    pytest.param("execute", _FinalA10Iterator, id="execute-custom-iterator"),
+    pytest.param("aexecute", _FinalA10Result, id="aexecute-custom-result"),
+)
+
+
+def _make_final_a10_deferred_result(kind, state, cleanup_error=None):
+    if kind == "generator":
+
+        def deferred_result():
+            state.body_calls += 1
+            try:
+                yield "deferred"
+            finally:
+                state.cleanup_calls += 1
+                if cleanup_error is not None:
+                    raise cleanup_error
+
+    else:
+
+        async def deferred_result():
+            state.body_calls += 1
+            try:
+                yield "deferred"
+            finally:
+                state.cleanup_calls += 1
+                if cleanup_error is not None:
+                    raise cleanup_error
+
+    return deferred_result()
+
+
+def _assert_final_a10_deferred_result_closed(kind, result):
+    frame = result.gi_frame if kind == "generator" else result.ag_frame
+    assert frame is None
+
+
+def _assert_final_a10_deferred_result_error(error, action_name):
+    assert type(error) is TypeError
+    message = str(error)
+    assert action_name in message
+    assert "generator" in message.casefold()
+
+
+def _assert_final_a10_safe_cleanup_note(error, cleanup_error_type):
+    notes = getattr(error, "__notes__", ())
+    assert len(notes) == 1
+    assert type(notes[0]) is str
+    assert cleanup_error_type.__name__ in notes[0]
+    assert any(word in notes[0].casefold() for word in ("cleanup", "close"))
 
 
 def test_action_choice_constructs_with_default_rationale():
@@ -767,6 +868,446 @@ def test_validate_does_not_execute_action_or_mutate_state():
     assert validated.name == "mutating_action"
     assert agent.called is False
     assert model.counter == 0
+
+
+def test_final_a10_execute_rejects_and_closes_async_generator_in_sync_context():
+    kind = "async-generator"
+    state = SimpleNamespace(
+        producer_calls=0,
+        body_calls=0,
+        cleanup_calls=0,
+        result=None,
+    )
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a10_sync_deferred(agent) -> object:
+        """Return a deferred result from an ordinary synchronous callable."""
+        del agent
+        state.producer_calls += 1
+        state.result = _make_final_a10_deferred_result(kind, state)
+        return state.result
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            manager.execute(
+                SimpleNamespace(),
+                ActionChoice(name="final_a10_sync_deferred", arguments={}),
+            )
+
+        _assert_final_a10_deferred_result_error(
+            exc_info.value,
+            "final_a10_sync_deferred",
+        )
+        assert state.producer_calls == 1
+        assert state.body_calls == 0
+        assert state.cleanup_calls == 0
+        _assert_final_a10_deferred_result_closed(kind, state.result)
+    finally:
+        if state.result is not None:
+            if kind == "generator":
+                with suppress(BaseException):
+                    state.result.close()
+            else:
+                with suppress(BaseException):
+                    asyncio.run(state.result.aclose())
+
+
+@pytest.mark.asyncio
+async def test_final_a10_execute_rejects_async_generator_in_active_loop_without_offloading(
+    monkeypatch,
+):
+    state = SimpleNamespace(
+        producer_calls=0,
+        body_calls=0,
+        cleanup_calls=0,
+        result=None,
+    )
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a10_active_loop_async_generator(agent) -> object:
+        """Return an async generator while an event loop is already running."""
+        del agent
+        state.producer_calls += 1
+        state.result = _make_final_a10_deferred_result("async-generator", state)
+        return state.result
+
+    forbidden_calls = []
+
+    def forbidden(mechanism):
+        def fail(*args, **kwargs):
+            del args, kwargs
+            forbidden_calls.append(mechanism)
+            raise AssertionError(f"unexpected deferred-result cleanup via {mechanism}")
+
+        return fail
+
+    loop = asyncio.get_running_loop()
+    tasks_before = asyncio.all_tasks(loop)
+    original_task_factory = loop.get_task_factory()
+    loop.set_task_factory(forbidden("event-loop task"))
+    monkeypatch.setattr(asyncio, "run", forbidden("nested asyncio.run"))
+    monkeypatch.setattr(asyncio, "Runner", forbidden("nested asyncio.Runner"))
+    monkeypatch.setattr(asyncio, "new_event_loop", forbidden("nested event loop"))
+    monkeypatch.setattr(threading.Thread, "start", forbidden("thread"))
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            manager.execute(
+                SimpleNamespace(),
+                ActionChoice(
+                    name="final_a10_active_loop_async_generator",
+                    arguments={},
+                ),
+            )
+
+        _assert_final_a10_deferred_result_error(
+            exc_info.value,
+            "final_a10_active_loop_async_generator",
+        )
+        assert forbidden_calls == []
+        assert asyncio.all_tasks(loop) == tasks_before
+        assert state.producer_calls == 1
+        assert state.body_calls == 0
+        assert state.cleanup_calls == 0
+        assert state.result.ag_frame is not None
+        notes = getattr(exc_info.value, "__notes__", ())
+        assert len(notes) == 1
+        assert "not closed" in notes[0]
+        assert "event loop" in notes[0]
+    finally:
+        loop.set_task_factory(original_task_factory)
+        if state.result is not None:
+            with suppress(BaseException):
+                await state.result.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", _FINAL_A10_DEFERRED_KINDS)
+@pytest.mark.parametrize(
+    "producer",
+    [
+        pytest.param("sync", id="sync-callable"),
+        pytest.param("async", id="async-function-awaited"),
+        pytest.param("sync-coroutine", id="sync-callable-coroutine-awaited"),
+    ],
+)
+async def test_final_a10_aexecute_rejects_deferred_results_at_each_boundary(
+    kind,
+    producer,
+):
+    state = SimpleNamespace(
+        producer_calls=0,
+        await_completions=0,
+        body_calls=0,
+        cleanup_calls=0,
+        result=None,
+    )
+    manager = ActionManager()
+
+    def completed_deferred_result():
+        state.result = _make_final_a10_deferred_result(kind, state)
+        return state.result
+
+    if producer == "sync":
+
+        def producer_action(agent) -> object:
+            """Return a deferred result from a synchronous action."""
+            del agent
+            state.producer_calls += 1
+            return completed_deferred_result()
+
+    elif producer == "async":
+
+        async def producer_action(agent) -> object:
+            """Return a deferred result after awaiting an async action."""
+            del agent
+            state.producer_calls += 1
+            await asyncio.sleep(0)
+            state.await_completions += 1
+            return completed_deferred_result()
+
+    else:
+
+        def producer_action(agent) -> object:
+            """Return a coroutine which resolves to a deferred result."""
+            del agent
+            state.producer_calls += 1
+
+            async def complete_production():
+                await asyncio.sleep(0)
+                state.await_completions += 1
+                return completed_deferred_result()
+
+            return complete_production()
+
+    action_name = f"final_a10_{producer.replace('-', '_')}_{kind.replace('-', '_')}"
+    producer_action.__name__ = action_name
+    producer_action = action(action_manager=manager)(producer_action)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            await manager.aexecute(
+                SimpleNamespace(),
+                ActionChoice(name=action_name, arguments={}),
+            )
+
+        _assert_final_a10_deferred_result_error(exc_info.value, action_name)
+        assert manager.actions[action_name] is producer_action
+        assert state.producer_calls == 1
+        assert state.await_completions == (producer != "sync")
+        assert state.body_calls == 0
+        assert state.cleanup_calls == 0
+        _assert_final_a10_deferred_result_closed(kind, state.result)
+    finally:
+        if state.result is not None:
+            if kind == "generator":
+                with suppress(BaseException):
+                    state.result.close()
+            else:
+                with suppress(BaseException):
+                    await state.result.aclose()
+
+
+@pytest.mark.parametrize("kind", _FINAL_A10_DEFERRED_KINDS)
+@pytest.mark.parametrize("cleanup_failure", ["exception", "base-exception"])
+def test_final_a10_execute_started_deferred_cleanup_failure_contract(
+    kind,
+    cleanup_failure,
+):
+    cleanup_error = (
+        RuntimeError(f"{kind} cleanup failed")
+        if cleanup_failure == "exception"
+        else _FinalA10CleanupAbort(f"{kind} cleanup aborted")
+    )
+    state = SimpleNamespace(
+        producer_calls=0,
+        body_calls=0,
+        cleanup_calls=0,
+        result=None,
+    )
+    state.result = _make_final_a10_deferred_result(kind, state, cleanup_error)
+    if kind == "generator":
+        first_value = next(state.result)
+    else:
+        first_step = anext(state.result)
+        with pytest.raises(StopIteration) as exc_info:
+            first_step.send(None)
+        first_value = exc_info.value.value
+    assert first_value == "deferred"
+
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a10_sync_started_deferred(agent) -> object:
+        """Return a started deferred result to synchronous execution."""
+        del agent
+        state.producer_calls += 1
+        return state.result
+
+    choice = ActionChoice(name="final_a10_sync_started_deferred", arguments={})
+    expected_error = (
+        TypeError if cleanup_failure == "exception" else _FinalA10CleanupAbort
+    )
+
+    try:
+        with pytest.raises(expected_error) as exc_info:
+            manager.execute(SimpleNamespace(), choice)
+
+        if cleanup_failure == "exception":
+            _assert_final_a10_deferred_result_error(
+                exc_info.value,
+                "final_a10_sync_started_deferred",
+            )
+            notes = getattr(exc_info.value, "__notes__", ())
+            assert len(notes) == 1
+            assert str(cleanup_error) in notes[0]
+            assert any(word in notes[0].casefold() for word in ("cleanup", "close"))
+        else:
+            assert exc_info.value is cleanup_error
+
+        assert state.producer_calls == 1
+        assert state.body_calls == 1
+        assert state.cleanup_calls == 1
+        _assert_final_a10_deferred_result_closed(kind, state.result)
+    finally:
+        if kind == "generator":
+            with suppress(BaseException):
+                state.result.close()
+        else:
+            with suppress(BaseException):
+                asyncio.run(state.result.aclose())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", _FINAL_A10_DEFERRED_KINDS)
+@pytest.mark.parametrize("cleanup_failure", ["exception", "base-exception"])
+async def test_final_a10_deferred_result_cleanup_failure_contract(
+    kind,
+    cleanup_failure,
+):
+    cleanup_error = (
+        RuntimeError(f"{kind} cleanup failed")
+        if cleanup_failure == "exception"
+        else _FinalA10CleanupAbort(f"{kind} cleanup aborted")
+    )
+    state = SimpleNamespace(
+        producer_calls=0,
+        body_calls=0,
+        cleanup_calls=0,
+        result=None,
+    )
+    state.result = _make_final_a10_deferred_result(kind, state, cleanup_error)
+    if kind == "generator":
+        assert next(state.result) == "deferred"
+    else:
+        assert await anext(state.result) == "deferred"
+
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a10_started_deferred(agent) -> object:
+        """Return an already-started deferred result for cleanup observation."""
+        del agent
+        state.producer_calls += 1
+        return state.result
+
+    choice = ActionChoice(name="final_a10_started_deferred", arguments={})
+
+    try:
+        if cleanup_failure == "exception":
+            with pytest.raises(TypeError) as exc_info:
+                await manager.aexecute(SimpleNamespace(), choice)
+
+            _assert_final_a10_deferred_result_error(
+                exc_info.value,
+                "final_a10_started_deferred",
+            )
+            notes = getattr(exc_info.value, "__notes__", ())
+            assert len(notes) == 1
+            assert str(cleanup_error) in notes[0]
+            assert any(word in notes[0].casefold() for word in ("cleanup", "close"))
+        else:
+            with pytest.raises(_FinalA10CleanupAbort) as exc_info:
+                await manager.aexecute(SimpleNamespace(), choice)
+
+            assert exc_info.value is cleanup_error
+
+        assert state.producer_calls == 1
+        assert state.body_calls == 1
+        assert state.cleanup_calls == 1
+        _assert_final_a10_deferred_result_closed(kind, state.result)
+    finally:
+        if kind == "generator":
+            with suppress(BaseException):
+                state.result.close()
+        else:
+            with suppress(BaseException):
+                await state.result.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "entrypoint"),
+    [
+        pytest.param("generator", "execute", id="execute-generator"),
+        pytest.param(
+            "async-generator",
+            "aexecute",
+            id="aexecute-async-generator",
+        ),
+    ],
+)
+async def test_final_a10_unformattable_cleanup_exception_preserves_primary_error(
+    kind,
+    entrypoint,
+):
+    cleanup_argument = _FinalA10UnformattableCleanupArgument()
+    cleanup_error = RuntimeError(cleanup_argument)
+    with pytest.raises(RuntimeError, match="__str__ failed"):
+        str(cleanup_error)
+    with pytest.raises(RuntimeError, match="__repr__ failed"):
+        repr(cleanup_error)
+
+    state = SimpleNamespace(
+        producer_calls=0,
+        body_calls=0,
+        cleanup_calls=0,
+        result=None,
+    )
+    state.result = _make_final_a10_deferred_result(kind, state, cleanup_error)
+    if kind == "generator":
+        assert next(state.result) == "deferred"
+    else:
+        assert await anext(state.result) == "deferred"
+
+    manager = ActionManager()
+
+    def producer_action(agent) -> object:
+        """Return a started deferred result with hostile cleanup diagnostics."""
+        del agent
+        state.producer_calls += 1
+        return state.result
+
+    action_name = f"final_a10_{entrypoint}_unformattable_cleanup"
+    producer_action.__name__ = action_name
+    producer_action = action(action_manager=manager)(producer_action)
+    choice = ActionChoice(name=action_name, arguments={})
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "execute":
+                manager.execute(SimpleNamespace(), choice)
+            else:
+                await manager.aexecute(SimpleNamespace(), choice)
+
+        _assert_final_a10_deferred_result_error(exc_info.value, action_name)
+        assert not isinstance(exc_info.value, ActionPostCommitError)
+        _assert_final_a10_safe_cleanup_note(exc_info.value, type(cleanup_error))
+        assert manager.actions[action_name] is producer_action
+        assert state.producer_calls == 1
+        assert state.body_calls == 1
+        assert state.cleanup_calls == 1
+        _assert_final_a10_deferred_result_closed(kind, state.result)
+    finally:
+        if kind == "generator":
+            with suppress(BaseException):
+                state.result.close()
+        else:
+            with suppress(BaseException):
+                await state.result.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution", "result_factory"),
+    _FINAL_A10_COMPLETED_RESULT_FACTORIES,
+)
+async def test_final_a10_manager_accepts_non_generator_completed_results(
+    execution,
+    result_factory,
+):
+    expected = result_factory()
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a10_completed_control(agent) -> object:
+        """Return a completed non-generator control result."""
+        del agent
+        return expected
+
+    choice = ActionChoice(name="final_a10_completed_control", arguments={})
+    if execution == "execute":
+        returned = manager.execute(SimpleNamespace(), choice)
+    else:
+        returned = await manager.aexecute(SimpleNamespace(), choice)
+
+    assert returned is expected
+    if isinstance(expected, _FinalA10Iterator):
+        assert expected.next_calls == 0
+    elif type(expected).__name__ == "list_iterator":
+        assert expected.__length_hint__() == 1
 
 
 @pytest.mark.asyncio

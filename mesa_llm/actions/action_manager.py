@@ -309,6 +309,7 @@ class ActionManager:
             actions=actions,
             reject_async_callable=True,
         )
+        self._reject_generator_action_result(choice.name, result)
         if inspect.isawaitable(result):
             self._close_awaitable_if_safe(result)
             raise self._synchronous_awaitable_error(choice.name)
@@ -351,6 +352,101 @@ class ActionManager:
             )
         )
 
+    def _generator_action_result_error(self, action_name: str) -> TypeError:
+        return TypeError(
+            style(
+                f"Action {action_name!r} must return one completed result; "
+                "generator and async-generator results are not supported as "
+                "actions.",
+                color="red",
+            )
+        )
+
+    def _note_generator_cleanup_failure(
+        self,
+        primary_error: TypeError,
+        result_kind: str,
+        cleanup_error: Exception,
+    ) -> None:
+        try:
+            cleanup_text = str(cleanup_error)
+        except BaseException:
+            try:
+                cleanup_text = repr(cleanup_error)
+            except BaseException:
+                cleanup_text = "<unprintable cleanup exception>"
+
+        primary_error.add_note(
+            f"Cleanup of the rejected {result_kind} result failed with "
+            f"{type(cleanup_error).__name__}: {cleanup_text}"
+        )
+
+    def _reject_generator_action_result(
+        self,
+        action_name: str,
+        result: Any,
+    ) -> None:
+        if not (inspect.isgenerator(result) or inspect.isasyncgen(result)):
+            return
+
+        primary_error = self._generator_action_result_error(action_name)
+        result_kind = "generator" if inspect.isgenerator(result) else "async-generator"
+
+        if result_kind == "generator":
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_generator_cleanup_failure(
+                    primary_error,
+                    result_kind,
+                    cleanup_error,
+                )
+            raise primary_error
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(result.aclose())
+            except Exception as cleanup_error:
+                self._note_generator_cleanup_failure(
+                    primary_error,
+                    result_kind,
+                    cleanup_error,
+                )
+        else:
+            # Synchronous execution cannot await aclose() without nesting the
+            # active loop or scheduling cleanup beyond this execution boundary.
+            primary_error.add_note(
+                "The rejected async-generator result was not closed because "
+                "synchronous ActionManager.execute(...) cannot await aclose() "
+                "while an event loop is already running in this thread."
+            )
+        raise primary_error
+
+    async def _areject_generator_action_result(
+        self,
+        action_name: str,
+        result: Any,
+    ) -> None:
+        if not (inspect.isgenerator(result) or inspect.isasyncgen(result)):
+            return
+
+        primary_error = self._generator_action_result_error(action_name)
+        result_kind = "generator" if inspect.isgenerator(result) else "async-generator"
+        try:
+            if result_kind == "generator":
+                result.close()
+            else:
+                await result.aclose()
+        except Exception as cleanup_error:
+            self._note_generator_cleanup_failure(
+                primary_error,
+                result_kind,
+                cleanup_error,
+            )
+        raise primary_error
+
     async def aexecute(
         self,
         agent: Any,
@@ -358,9 +454,15 @@ class ActionManager:
         actions: ActionSelection | object = _UNSET,
     ) -> Any:
         """Validate and asynchronously execute one configured action locally."""
-        _, result = self._call_validated_action(agent, action_choice, actions=actions)
+        choice, result = self._call_validated_action(
+            agent,
+            action_choice,
+            actions=actions,
+        )
+        await self._areject_generator_action_result(choice.name, result)
         if inspect.isawaitable(result):
-            return await result
+            result = await result
+            await self._areject_generator_action_result(choice.name, result)
         return result
 
     def _coerce_action_choice(
