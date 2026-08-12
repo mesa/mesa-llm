@@ -2852,6 +2852,20 @@ def _install_final_a10_deepcopy_guard(monkeypatch):
     return deepcopy_spy
 
 
+def _install_final_a11_deepcopy_guard(monkeypatch):
+    deepcopy_spy = Mock(
+        side_effect=AssertionError(
+            "a nested awaitable must not reach successful-action deepcopy"
+        )
+    )
+    monkeypatch.setattr(
+        llm_agent_module,
+        "copy",
+        SimpleNamespace(deepcopy=deepcopy_spy),
+    )
+    return deepcopy_spy
+
+
 def _assert_final_a10_agent_precommit_failure(
     agent,
     kind,
@@ -2963,6 +2977,101 @@ async def test_final_a10_async_agent_entrypoints_do_not_commit_deferred_results(
             deferred_result.close()
         else:
             await deferred_result.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        pytest.param("aexecute_action", id="aexecute-action"),
+        pytest.param("aact", id="aact-one-shot-selection"),
+    ],
+)
+async def test_final_a11_async_agent_entrypoints_reject_nested_awaitable_precommit(
+    entrypoint,
+    monkeypatch,
+):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def final_a11_agent_nested_action(agent) -> object:
+        """Return a nested coroutine after the supported action await."""
+        agent.action_calls += 1
+        await asyncio.sleep(0)
+        agent.action_await_completions += 1
+        agent.outer_mutations += 1
+
+        async def mutate_inner():
+            agent.inner_mutations += 1
+            return "nested completed"
+
+        agent.nested_result = mutate_inner()
+        return agent.nested_result
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[final_a11_agent_nested_action],
+    )
+    agent.action_calls = 0
+    agent.action_await_completions = 0
+    agent.outer_mutations = 0
+    agent.inner_mutations = 0
+    agent.nested_result = None
+    choice = ActionChoice(
+        name="final_a11_agent_nested_action",
+        arguments={},
+        rationale="Exercise the completed-result boundary.",
+    )
+    if entrypoint == "aexecute_action":
+        agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    else:
+        agent.memory = SimpleNamespace(
+            add_to_memory=Mock(),
+            aadd_to_memory=AsyncMock(),
+        )
+        agent.achoose_action = AsyncMock(return_value=choice)
+    agent.recorder = Mock()
+    deepcopy_spy = _install_final_a11_deepcopy_guard(monkeypatch)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "aexecute_action":
+                await agent.aexecute_action(choice)
+            else:
+                await agent.aact("Choose the nested-result action once.")
+
+        error = exc_info.value
+        assert type(error) is TypeError
+        assert not isinstance(error, ActionPostCommitError)
+        message = str(error).casefold()
+        assert choice.name.casefold() in message
+        assert "one completed result" in message
+        assert "nested awaitable" in message
+        assert agent.action_calls == 1
+        assert agent.action_await_completions == 1
+        assert agent.outer_mutations == 1
+        assert agent.inner_mutations == 0
+        assert agent.nested_result.cr_frame is None
+        await asyncio.sleep(0)
+        assert agent.inner_mutations == 0
+        deepcopy_spy.assert_not_called()
+        if entrypoint == "aexecute_action":
+            assert "action" not in agent.memory.step_content
+        else:
+            agent.achoose_action.assert_awaited_once_with(
+                "Choose the nested-result action once.",
+                actions=_ACTIONS_UNSET,
+                system_prompt=None,
+            )
+            agent.memory.add_to_memory.assert_not_called()
+            agent.memory.aadd_to_memory.assert_not_awaited()
+        agent.recorder.record_event.assert_not_called()
+    finally:
+        if agent.nested_result is not None and agent.nested_result.cr_frame is not None:
+            agent.nested_result.close()
 
 
 def test_action_post_commit_error_has_established_public_exports():

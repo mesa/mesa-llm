@@ -66,6 +66,36 @@ class _FinalA10Result:
     pass
 
 
+class _FinalA11CleanupAbort(BaseException):
+    pass
+
+
+class _FinalA11CustomAwaitable:
+    def __init__(self, result):
+        self.result = result
+        self.await_calls = 0
+
+    def __await__(self):
+        self.await_calls += 1
+
+        async def resolve():
+            return self.result
+
+        return resolve().__await__()
+
+
+class _FinalA11CancelFailureFuture(asyncio.Future):
+    def __init__(self, cleanup_error):
+        super().__init__()
+        self.cleanup_error = cleanup_error
+        self.cancel_calls = 0
+
+    def cancel(self, msg=None):
+        del msg
+        self.cancel_calls += 1
+        raise self.cleanup_error
+
+
 _FINAL_A10_COMPLETED_RESULT_FACTORIES = (
     pytest.param("execute", lambda: ["completed"], id="execute-list"),
     pytest.param("aexecute", lambda: ("completed",), id="aexecute-tuple"),
@@ -128,6 +158,16 @@ def _assert_final_a10_safe_cleanup_note(error, cleanup_error_type):
     assert type(notes[0]) is str
     assert cleanup_error_type.__name__ in notes[0]
     assert any(word in notes[0].casefold() for word in ("cleanup", "close"))
+
+
+def _assert_final_a11_nested_awaitable_error(error, action_name):
+    assert type(error) is TypeError
+    assert not isinstance(error, ActionPostCommitError)
+    message = str(error).casefold()
+    assert action_name.casefold() in message
+    assert "one completed result" in message
+    assert "nested awaitable" in message
+    assert any(word in message for word in ("unsupported", "not supported"))
 
 
 def test_action_choice_constructs_with_default_rationale():
@@ -1308,6 +1348,428 @@ async def test_final_a10_manager_accepts_non_generator_completed_results(
         assert expected.next_calls == 0
     elif type(expected).__name__ == "list_iterator":
         assert expected.__length_hint__() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "producer",
+    [
+        pytest.param("async", id="async-action"),
+        pytest.param("sync-coroutine", id="sync-callable-coroutine"),
+    ],
+)
+async def test_final_a11_aexecute_rejects_and_closes_nested_native_coroutine(
+    producer,
+    recwarn,
+):
+    state = SimpleNamespace(
+        producer_calls=0,
+        await_completions=0,
+        outer_mutations=0,
+        inner_mutations=0,
+        nested=None,
+    )
+    manager = ActionManager()
+
+    def make_nested_coroutine(agent):
+        async def mutate_inner():
+            agent.inner_mutations += 1
+            return "nested completed"
+
+        agent.nested = mutate_inner()
+        return agent.nested
+
+    if producer == "async":
+
+        async def producer_action(agent) -> object:
+            """Return a nested coroutine after the supported async boundary."""
+            agent.producer_calls += 1
+            await asyncio.sleep(0)
+            agent.await_completions += 1
+            agent.outer_mutations += 1
+            return make_nested_coroutine(agent)
+
+    else:
+
+        def producer_action(agent) -> object:
+            """Return one coroutine which resolves to a nested coroutine."""
+            agent.producer_calls += 1
+
+            async def complete_outer():
+                await asyncio.sleep(0)
+                agent.await_completions += 1
+                agent.outer_mutations += 1
+                return make_nested_coroutine(agent)
+
+            return complete_outer()
+
+    action_name = f"final_a11_{producer.replace('-', '_')}_native"
+    producer_action.__name__ = action_name
+    producer_action = action(action_manager=manager)(producer_action)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            await manager.aexecute(
+                state,
+                ActionChoice(name=action_name, arguments={}),
+            )
+
+        _assert_final_a11_nested_awaitable_error(exc_info.value, action_name)
+        assert manager.actions[action_name] is producer_action
+        assert state.producer_calls == 1
+        assert state.await_completions == 1
+        assert state.outer_mutations == 1
+        assert state.inner_mutations == 0
+        assert state.nested.cr_frame is None
+        await asyncio.sleep(0)
+        assert state.inner_mutations == 0
+    finally:
+        if state.nested is not None and state.nested.cr_frame is not None:
+            state.nested.close()
+
+    gc.collect()
+    assert not [
+        warning for warning in recwarn if "was never awaited" in str(warning.message)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_a11_aexecute_cancels_nested_future():
+    state = SimpleNamespace(producer_calls=0, nested=None)
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a11_nested_future(agent) -> object:
+        """Return a Future which resolves to another Future."""
+        agent.producer_calls += 1
+        loop = asyncio.get_running_loop()
+        outer = loop.create_future()
+        agent.nested = loop.create_future()
+        outer.set_result(agent.nested)
+        return outer
+
+    with pytest.raises(TypeError) as exc_info:
+        await manager.aexecute(
+            state,
+            ActionChoice(name="final_a11_nested_future", arguments={}),
+        )
+
+    _assert_final_a11_nested_awaitable_error(
+        exc_info.value,
+        "final_a11_nested_future",
+    )
+    assert state.producer_calls == 1
+    assert state.nested.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_final_a11_aexecute_cancels_nested_task_without_claiming_rollback():
+    release_mutation = asyncio.Event()
+    nested_started = asyncio.Event()
+    state = SimpleNamespace(
+        producer_calls=0,
+        mutations=0,
+        outer=None,
+        nested=None,
+    )
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a11_nested_task(agent) -> object:
+        """Return a Task which resolves to an independently scheduled Task."""
+        agent.producer_calls += 1
+
+        async def mutate_after_release():
+            nested_started.set()
+            await release_mutation.wait()
+            agent.mutations += 1
+
+        async def resolve_to_nested():
+            await asyncio.sleep(0)
+            return agent.nested
+
+        agent.nested = asyncio.create_task(mutate_after_release())
+        agent.outer = asyncio.create_task(resolve_to_nested())
+        return agent.outer
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            await manager.aexecute(
+                state,
+                ActionChoice(name="final_a11_nested_task", arguments={}),
+            )
+
+        _assert_final_a11_nested_awaitable_error(
+            exc_info.value,
+            "final_a11_nested_task",
+        )
+        assert state.producer_calls == 1
+        assert nested_started.is_set()
+        assert state.nested.cancelling() > 0
+        with pytest.raises(asyncio.CancelledError):
+            await state.nested
+        assert state.nested.cancelled()
+        release_mutation.set()
+        await asyncio.sleep(0)
+        assert state.mutations == 0
+    finally:
+        release_mutation.set()
+        for task in (state.outer, state.nested):
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.asyncio
+async def test_final_a11_aexecute_rejects_current_task_without_self_cancellation():
+    state = SimpleNamespace(producer_calls=0, returned_task=None)
+    manager = ActionManager()
+    execution_task = asyncio.current_task()
+    assert execution_task is not None
+    cancelling_before = execution_task.cancelling()
+
+    @action(action_manager=manager)
+    async def final_a11_current_task(agent) -> object:
+        """Return the Task currently executing ActionManager.aexecute."""
+        agent.producer_calls += 1
+        agent.returned_task = asyncio.current_task()
+        return agent.returned_task
+
+    with pytest.raises(TypeError) as exc_info:
+        await manager.aexecute(
+            state,
+            ActionChoice(name="final_a11_current_task", arguments={}),
+        )
+
+    error = exc_info.value
+    _assert_final_a11_nested_awaitable_error(error, "final_a11_current_task")
+    assert state.producer_calls == 1
+    assert state.returned_task is execution_task
+    assert execution_task.cancelling() == cancelling_before
+    notes = getattr(error, "__notes__", ())
+    assert len(notes) == 1
+    note = notes[0].casefold()
+    assert "cancel" in note
+    assert any(word in note for word in ("current", "self"))
+    assert any(word in note for word in ("unsafe", "skipped", "not"))
+
+    await asyncio.sleep(0)
+    assert execution_task.cancelling() == cancelling_before
+
+
+@pytest.mark.asyncio
+async def test_final_a11_aexecute_rejects_custom_nested_awaitable_without_driving_it():
+    nested = _FinalA11CustomAwaitable("must not execute")
+    outer = _FinalA11CustomAwaitable(nested)
+    state = SimpleNamespace(producer_calls=0)
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    def final_a11_custom_awaitable(agent) -> object:
+        """Return a custom awaitable which resolves to another awaitable."""
+        agent.producer_calls += 1
+        return outer
+
+    with pytest.raises(TypeError) as exc_info:
+        await manager.aexecute(
+            state,
+            ActionChoice(name="final_a11_custom_awaitable", arguments={}),
+        )
+
+    error = exc_info.value
+    _assert_final_a11_nested_awaitable_error(
+        error,
+        "final_a11_custom_awaitable",
+    )
+    assert state.producer_calls == 1
+    assert outer.await_calls == 1
+    assert nested.await_calls == 0
+    notes = getattr(error, "__notes__", ())
+    assert len(notes) == 1
+    assert "cleanup" in notes[0].casefold()
+    assert any(word in notes[0].casefold() for word in ("cannot", "no safe", "not"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    [
+        pytest.param("exception", id="cleanup-exception"),
+        pytest.param("base-exception", id="cleanup-base-exception"),
+    ],
+)
+async def test_final_a11_nested_future_cleanup_failure_contract(cleanup_failure):
+    cleanup_error = (
+        RuntimeError("nested Future cancellation failed")
+        if cleanup_failure == "exception"
+        else _FinalA11CleanupAbort("nested Future cancellation aborted")
+    )
+    state = SimpleNamespace(producer_calls=0, nested=None)
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    async def final_a11_cancel_failure(agent) -> object:
+        """Return a nested Future whose cancellation raises."""
+        agent.producer_calls += 1
+        agent.nested = _FinalA11CancelFailureFuture(cleanup_error)
+        return agent.nested
+
+    try:
+        if cleanup_failure == "exception":
+            with pytest.raises(TypeError) as exc_info:
+                await manager.aexecute(
+                    state,
+                    ActionChoice(name="final_a11_cancel_failure", arguments={}),
+                )
+
+            error = exc_info.value
+            _assert_final_a11_nested_awaitable_error(
+                error,
+                "final_a11_cancel_failure",
+            )
+            notes = getattr(error, "__notes__", ())
+            assert len(notes) == 1
+            assert type(cleanup_error).__name__ in notes[0]
+            assert str(cleanup_error) in notes[0]
+            assert any(word in notes[0].casefold() for word in ("cleanup", "cancel"))
+        else:
+            with pytest.raises(_FinalA11CleanupAbort) as exc_info:
+                await manager.aexecute(
+                    state,
+                    ActionChoice(name="final_a11_cancel_failure", arguments={}),
+                )
+
+            assert exc_info.value is cleanup_error
+
+        assert state.producer_calls == 1
+        assert state.nested.cancel_calls == 1
+    finally:
+        if state.nested is not None and not state.nested.done():
+            asyncio.Future.cancel(state.nested)
+
+
+@pytest.mark.asyncio
+async def test_final_a11_nested_coroutine_cleanup_does_not_schedule_or_offload(
+    monkeypatch,
+):
+    state = SimpleNamespace(producer_calls=0, inner_calls=0, nested=None)
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    async def final_a11_no_background_cleanup(agent) -> object:
+        """Return a nested coroutine for cleanup-boundary observation."""
+        agent.producer_calls += 1
+
+        async def inner():
+            agent.inner_calls += 1
+
+        agent.nested = inner()
+        return agent.nested
+
+    forbidden_calls = []
+
+    def forbidden(mechanism):
+        def fail(*args, **kwargs):
+            del args, kwargs
+            forbidden_calls.append(mechanism)
+            raise AssertionError(f"unexpected nested-awaitable cleanup via {mechanism}")
+
+        return fail
+
+    loop = asyncio.get_running_loop()
+    tasks_before = asyncio.all_tasks(loop)
+    original_task_factory = loop.get_task_factory()
+    loop.set_task_factory(forbidden("event-loop task"))
+    monkeypatch.setattr(asyncio, "run", forbidden("nested asyncio.run"))
+    monkeypatch.setattr(asyncio, "Runner", forbidden("nested asyncio.Runner"))
+    monkeypatch.setattr(asyncio, "new_event_loop", forbidden("nested event loop"))
+    monkeypatch.setattr(threading.Thread, "start", forbidden("thread"))
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            await manager.aexecute(
+                state,
+                ActionChoice(name="final_a11_no_background_cleanup", arguments={}),
+            )
+
+        _assert_final_a11_nested_awaitable_error(
+            exc_info.value,
+            "final_a11_no_background_cleanup",
+        )
+        assert forbidden_calls == []
+        assert asyncio.all_tasks(loop) == tasks_before
+        assert state.producer_calls == 1
+        assert state.inner_calls == 0
+        assert state.nested.cr_frame is None
+    finally:
+        loop.set_task_factory(original_task_factory)
+        if state.nested is not None and state.nested.cr_frame is not None:
+            state.nested.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("producer", "result_factory"),
+    [
+        pytest.param("async", lambda: "completed", id="async-string"),
+        pytest.param("async", lambda: ["completed"], id="async-list"),
+        pytest.param(
+            "async",
+            lambda: {"status": "completed"},
+            id="async-dict",
+        ),
+        pytest.param(
+            "sync-coroutine",
+            lambda: {"status": "completed"},
+            id="sync-callable-one-coroutine",
+        ),
+    ],
+)
+async def test_final_a11_aexecute_preserves_completed_result_controls(
+    producer,
+    result_factory,
+):
+    expected = result_factory()
+    state = SimpleNamespace(producer_calls=0, await_completions=0)
+    manager = ActionManager()
+
+    if producer == "async":
+
+        async def completed_action(agent) -> object:
+            """Resolve an asynchronous action to one completed result."""
+            agent.producer_calls += 1
+            await asyncio.sleep(0)
+            agent.await_completions += 1
+            return expected
+
+    else:
+
+        def completed_action(agent) -> object:
+            """Return one coroutine which resolves to a completed result."""
+            agent.producer_calls += 1
+
+            async def complete():
+                await asyncio.sleep(0)
+                agent.await_completions += 1
+                return expected
+
+            return complete()
+
+    action_name = f"final_a11_completed_{producer.replace('-', '_')}"
+    completed_action.__name__ = action_name
+    completed_action = action(action_manager=manager)(completed_action)
+
+    returned = await manager.aexecute(
+        state,
+        ActionChoice(name=action_name, arguments={}),
+    )
+
+    assert manager.actions[action_name] is completed_action
+    assert returned is expected
+    assert state.producer_calls == 1
+    assert state.await_completions == 1
 
 
 @pytest.mark.asyncio
