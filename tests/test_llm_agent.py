@@ -628,6 +628,37 @@ def _make_local_action_choice_agent(
     return agent, local_increment_counter
 
 
+def _make_nested_action_choice_agent():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def local_accept_payload(
+        agent,
+        payload: dict[str, list[dict[str, str]]],
+    ) -> str:
+        """Accept a nested payload.
+
+        Args:
+            payload: Nested object and array data to accept.
+
+        Returns:
+            Acceptance confirmation.
+        """
+        agent.counter += 1
+        return "accepted"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        llm_model="openai/gpt-4o",
+        actions=[local_accept_payload],
+    )
+    agent.counter = 0
+    return agent
+
+
 _ACTION_SELECTION_TRANSPORT_ERRORS = (
     APIConnectionError,
     Timeout,
@@ -714,6 +745,90 @@ _PARSED_ONLY_RAW_CONTENT_CASES = (
     pytest.param(" \n\t ", id="blank-raw-content"),
 )
 
+_NO_PARSED_ACTION_CHOICE = object()
+_VALID_RAW_ACTION_CHOICE_JSON = json.dumps(
+    {
+        "name": "local_increment_counter",
+        "arguments": {"amount": 1},
+        "rationale": "Use the complete action choice.",
+    },
+    separators=(",", ":"),
+)
+_FINAL_A8_REJECTION_CASES = (
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + '\n{"name":',
+        _NO_PARSED_ACTION_CHOICE,
+        id="valid-plus-incomplete-second",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + "\n}",
+        _NO_PARSED_ACTION_CHOICE,
+        id="unmatched-closing-brace",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + '\n{"name":"local_increment_counter',
+        _NO_PARSED_ACTION_CHOICE,
+        id="second-unterminated-string",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + '\n{"name":"local_increment_counter\\',
+        _NO_PARSED_ACTION_CHOICE,
+        id="second-unfinished-escape",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + "\n" + _VALID_RAW_ACTION_CHOICE_JSON,
+        _NO_PARSED_ACTION_CHOICE,
+        id="complete-second-object",
+    ),
+    pytest.param(
+        '{"name":"local_increment_counter","arguments":{"amount":1},'
+        '"rationale":"cut off"',
+        _NO_PARSED_ACTION_CHOICE,
+        id="standalone-truncated-object",
+    ),
+    pytest.param(
+        '{"name":"local_increment_counter","arguments":{"amount":1,},'
+        '"rationale":"malformed"}',
+        _NO_PARSED_ACTION_CHOICE,
+        id="malformed-balanced-candidate",
+    ),
+    pytest.param(
+        "invalid nonblank raw action choice",
+        _VALID_PARSED_ACTION_CHOICE,
+        id="invalid-raw-with-valid-parsed",
+    ),
+)
+
+_VALID_NESTED_ACTION_ARGUMENTS = {
+    "payload": {
+        "items": [
+            {"text": "Braces are string data: {left} and } right."},
+            {"text": 'Escaped quotes remain string data: "choose this".'},
+        ]
+    }
+}
+_VALID_NESTED_ACTION_CHOICE_JSON = json.dumps(
+    {
+        "name": "local_accept_payload",
+        "arguments": _VALID_NESTED_ACTION_ARGUMENTS,
+        "rationale": 'Nested arrays, braces, and "quotes" are valid.',
+    },
+    separators=(",", ":"),
+)
+_FINAL_A8_VALID_CONTROL_CASES = (
+    pytest.param(_VALID_NESTED_ACTION_CHOICE_JSON, id="plain"),
+    pytest.param(
+        "```json\n" + _VALID_NESTED_ACTION_CHOICE_JSON + "\n```",
+        id="fenced",
+    ),
+    pytest.param(
+        "Selected action follows:\n"
+        + _VALID_NESTED_ACTION_CHOICE_JSON
+        + "\nEnd selected action.",
+        id="prose-embedded",
+    ),
+)
+
 
 def _make_action_selection_transport_error(error_type):
     return error_type(
@@ -770,6 +885,39 @@ def _assert_one_shot_action_selection_provider_call(provider_calls):
     assert provider_kwargs["fallbacks"] == []
     assert provider_kwargs["tools"] is None
     assert provider_kwargs["tool_choice"] is None
+
+
+def _final_a8_action_choice_response(content, parsed):
+    if parsed is _NO_PARSED_ACTION_CHOICE:
+        return _action_choice_response(content)
+    return _action_choice_response_with_parsed(content=content, parsed=parsed)
+
+
+def _guard_action_selection_side_effects(agent):
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("rejected action choice must not execute")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("rejected action choice must not execute")
+    )
+    agent.memory.add_to_memory = Mock(
+        side_effect=AssertionError("rejected action choice must not reach memory")
+    )
+    agent.memory.aadd_to_memory = AsyncMock(
+        side_effect=AssertionError("rejected action choice must not reach memory")
+    )
+    return _action_selection_state(agent)
+
+
+def _assert_no_action_selection_side_effects(agent, state_before):
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -894,6 +1042,67 @@ def test_choose_action_parses_local_json_fallbacks_and_validates_choice(
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["response_format"] is ActionChoice
     assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.parametrize("entrypoint", ["choose_action", "act"])
+@pytest.mark.parametrize(("content", "parsed"), _FINAL_A8_REJECTION_CASES)
+def test_final_a8_sync_entrypoints_reject_invalid_or_ambiguous_raw_content_once(
+    monkeypatch,
+    entrypoint,
+    content,
+    parsed,
+):
+    provider_calls = []
+
+    def _completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("invalid action choice triggered a retry or repair")
+        return _final_a8_action_choice_response(content, parsed)
+
+    async_completion = AsyncMock(
+        side_effect=AssertionError("sync action selection called acompletion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", async_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    generate = Mock(wraps=agent.llm.generate)
+    agent.llm.generate = generate
+    state_before = _guard_action_selection_side_effects(agent)
+
+    with pytest.raises(ValueError):
+        getattr(agent, entrypoint)("Reject structurally invalid action output.")
+
+    generate.assert_called_once()
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+    async_completion.assert_not_awaited()
+
+
+@pytest.mark.parametrize("content", _FINAL_A8_VALID_CONTROL_CASES)
+def test_final_a8_choose_action_accepts_nested_string_and_envelope_controls_once(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    def _completion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(content)
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _completion)
+    agent = _make_nested_action_choice_agent()
+    state_before = _guard_action_selection_side_effects(agent)
+
+    choice = agent.choose_action("Choose the nested payload action.")
+
+    assert choice == ActionChoice(
+        name="local_accept_payload",
+        arguments=_VALID_NESTED_ACTION_ARGUMENTS,
+        rationale='Nested arrays, braces, and "quotes" are valid.',
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
 
 
 @pytest.mark.parametrize("content", _DUPLICATE_ACTION_CHOICE_CONTENT_CASES)
@@ -1282,6 +1491,76 @@ async def test_achoose_action_parses_local_json_fallbacks_without_tools(content)
     assert call_kwargs["tool_choice"] == "none"
     assert call_kwargs["response_format"] is ActionChoice
     assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["achoose_action", "aact"])
+@pytest.mark.parametrize(("content", "parsed"), _FINAL_A8_REJECTION_CASES)
+async def test_final_a8_async_entrypoints_reject_invalid_or_ambiguous_raw_content_once(
+    monkeypatch,
+    entrypoint,
+    content,
+    parsed,
+):
+    provider_calls = []
+
+    async def _acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("invalid action choice triggered a retry or repair")
+        return _final_a8_action_choice_response(content, parsed)
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agenerate = AsyncMock(wraps=agent.llm.agenerate)
+    agent.llm.agenerate = agenerate
+    state_before = _guard_action_selection_side_effects(agent)
+
+    with pytest.raises(ValueError):
+        await getattr(agent, entrypoint)("Reject structurally invalid action output.")
+
+    agenerate.assert_awaited_once()
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+    sync_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", _FINAL_A8_VALID_CONTROL_CASES)
+async def test_final_a8_achoose_action_accepts_nested_string_and_envelope_controls_once(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    async def _acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        return _action_choice_response(content)
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _acompletion)
+    agent = _make_nested_action_choice_agent()
+    state_before = _guard_action_selection_side_effects(agent)
+
+    choice = await agent.achoose_action("Choose the nested payload action.")
+
+    assert choice == ActionChoice(
+        name="local_accept_payload",
+        arguments=_VALID_NESTED_ACTION_ARGUMENTS,
+        rationale='Nested arrays, braces, and "quotes" are valid.',
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+    sync_completion.assert_not_called()
 
 
 @pytest.mark.asyncio

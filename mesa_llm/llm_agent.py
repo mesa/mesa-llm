@@ -448,10 +448,7 @@ class LLMAgent(Agent):
 
         candidates: list[dict[str, Any]] = []
         for object_text in self._iter_json_object_strings(stripped_content):
-            try:
-                data = _load_action_choice_json(object_text)
-            except json.JSONDecodeError:
-                continue
+            data = _load_action_choice_json(object_text)
             if isinstance(data, dict):
                 candidates.append(data)
         return candidates
@@ -473,17 +470,33 @@ class LLMAgent(Agent):
                     in_string = False
                 continue
 
-            if char == '"':
+            if depth and char == '"':
                 in_string = True
             elif char == "{":
                 if depth == 0:
                     start = index
                 depth += 1
-            elif char == "}" and depth:
+            elif char == "}":
+                if depth == 0:
+                    raise ValueError(
+                        "LLM action choice response contains an unmatched closing "
+                        "brace."
+                    )
                 depth -= 1
                 if depth == 0 and start is not None:
                     objects.append(content[start : index + 1])
                     start = None
+
+        if start is not None:
+            if in_string:
+                detail = (
+                    "an unterminated escape sequence in a JSON string"
+                    if escaped
+                    else "an unterminated JSON string"
+                )
+            else:
+                detail = "an unclosed JSON object"
+            raise ValueError(f"LLM action choice response contains {detail}.")
 
         return objects
 
