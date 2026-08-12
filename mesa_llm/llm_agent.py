@@ -6,6 +6,7 @@ import json
 import logging
 import warnings
 from collections.abc import Callable
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from mesa.agent import Agent
@@ -41,6 +42,96 @@ from mesa_llm.reasoning.reasoning import (
 from mesa_llm.tools.tool_manager import ToolManager
 
 logger = logging.getLogger(__name__)
+
+
+def _log_step_finalizer_failure(
+    body_error: BaseException,
+    finalizer_error: BaseException,
+    finalizer_name: str,
+) -> None:
+    finalizer_error_is_log_safe = True
+    try:
+        finalizer_error_type = type(finalizer_error).__name__
+    except BaseException:
+        finalizer_error_type = "<unknown type>"
+        finalizer_error_is_log_safe = False
+
+    try:
+        finalizer_error_message = str(finalizer_error)
+    except BaseException:
+        finalizer_error_message = "<message unavailable>"
+        finalizer_error_is_log_safe = False
+
+    try:
+        diagnostic = f"{finalizer_name} finalizer failed: {finalizer_error_type}"
+        if finalizer_error_message:
+            diagnostic = f"{diagnostic}: {finalizer_error_message}"
+    except BaseException:
+        diagnostic = "Step finalizer failed while preserving the original exception."
+
+    # Diagnostics in this secondary-error path must never mask the body error.
+    with suppress(BaseException):
+        body_error.add_note(diagnostic)
+
+    if finalizer_error_is_log_safe:
+        try:
+            logger.error(
+                "%s while preserving the original step exception.",
+                diagnostic,
+                exc_info=(
+                    type(finalizer_error),
+                    finalizer_error,
+                    finalizer_error.__traceback__,
+                ),
+            )
+        except BaseException:
+            with suppress(BaseException):
+                logger.error(
+                    "%s while preserving the original step exception.",
+                    diagnostic,
+                )
+    else:
+        with suppress(BaseException):
+            logger.error(
+                "%s while preserving the original step exception.",
+                diagnostic,
+            )
+
+
+def _run_step_body_with_post(
+    body: Callable[[], Any],
+    post: Callable[[], Any],
+    post_name: str,
+) -> Any:
+    try:
+        result = body()
+    except BaseException as body_error:
+        try:
+            post()
+        except BaseException as finalizer_error:
+            _log_step_finalizer_failure(body_error, finalizer_error, post_name)
+        raise
+
+    post()
+    return result
+
+
+async def _arun_step_body_with_post(
+    body: Callable[[], Any],
+    post: Callable[[], Any],
+    post_name: str,
+) -> Any:
+    try:
+        result = await body()
+    except BaseException as body_error:
+        try:
+            await post()
+        except BaseException as finalizer_error:
+            _log_step_finalizer_failure(body_error, finalizer_error, post_name)
+        raise
+
+    await post()
+    return result
 
 
 class _AmbiguousActionChoiceJSONError(ValueError):
@@ -1051,10 +1142,11 @@ class LLMAgent(Agent):
         Subclasses should override this method for custom async behavior.
         If not overridden, falls back to calling the synchronous step() method.
         """
-        await self.apre_step()
 
-        raw_step = getattr(self.__class__, "_raw_user_step", None)
-        if raw_step is not None:
+        async def run_raw_step():
+            raw_step = getattr(self.__class__, "_raw_user_step", None)
+            if raw_step is None:
+                return None
             if not getattr(self.__class__, "_warned_sync_astep_fallback", False):
                 warnings.warn(
                     (
@@ -1064,12 +1156,17 @@ class LLMAgent(Agent):
                         "threading parallel stepping."
                     ),
                     RuntimeWarning,
-                    stacklevel=2,
+                    stacklevel=4,
                 )
                 self.__class__._warned_sync_astep_fallback = True
-            raw_step(self)
+            return raw_step(self)
 
-        await self.apost_step()
+        await self.apre_step()
+        return await _arun_step_body_with_post(
+            run_raw_step,
+            self.apost_step,
+            "apost_step",
+        )
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -1090,9 +1187,11 @@ class LLMAgent(Agent):
                 This is the wrapper that is used to integrate the pre_step and post_step methods into the step method of the child agent.
                 """
                 LLMAgent.pre_step(self, *args, **kwargs)
-                result = user_step(self, *args, **kwargs)
-                LLMAgent.post_step(self, *args, **kwargs)
-                return result
+                return _run_step_body_with_post(
+                    lambda: user_step(self, *args, **kwargs),
+                    lambda: LLMAgent.post_step(self, *args, **kwargs),
+                    "post_step",
+                )
 
             cls.step = wrapped
 
@@ -1103,9 +1202,11 @@ class LLMAgent(Agent):
                 Async wrapper for astep method.
                 """
                 await self.apre_step()
-                result = await user_astep(self, *args, **kwargs)
-                await self.apost_step()
-                return result
+                return await _arun_step_body_with_post(
+                    lambda: user_astep(self, *args, **kwargs),
+                    self.apost_step,
+                    "apost_step",
+                )
 
             cls.astep = awrapped
 
