@@ -71,7 +71,9 @@ class ShortTermMemory(Memory):
                 content=self.step_content,
                 step=None,
             )
+            self._current_step_entry._event_order = list(self._step_event_order)
             self.step_content = {}
+            self._step_event_order = []
             return
 
         new_entry = None
@@ -84,9 +86,17 @@ class ShortTermMemory(Memory):
                 content=merged_content,
                 step=self.agent.model.steps,
             )
+            staged_event_order = getattr(self._current_step_entry, "_event_order", ())
+            if not isinstance(staged_event_order, list | tuple):
+                staged_event_order = ()
+            new_entry._event_order = [
+                *staged_event_order,
+                *self._step_event_order,
+            ]
             self.short_term_memory.append(new_entry)
             self._current_step_entry = None
             self.step_content = {}
+            self._step_event_order = []
 
         # Display the new entry
         if self.display and new_entry is not None:

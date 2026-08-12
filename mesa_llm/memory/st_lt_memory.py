@@ -138,8 +138,10 @@ class STLTMemory(Memory):
                 content=self.step_content,
                 step=None,
             )
+            new_entry._event_order = list(self._step_event_order)
             self.short_term_memory.append(new_entry)
             self.step_content = {}
+            self._step_event_order = []
             return None, []
 
         if not self.short_term_memory or self.short_term_memory[-1].step is not None:
@@ -154,8 +156,16 @@ class STLTMemory(Memory):
             content=merged_content,
             step=self.agent.model.steps,
         )
+        staged_event_order = getattr(pre_step_entry, "_event_order", ())
+        if not isinstance(staged_event_order, list | tuple):
+            staged_event_order = ()
+        new_entry._event_order = [
+            *staged_event_order,
+            *self._step_event_order,
+        ]
         self.short_term_memory.append(new_entry)
         self.step_content = {}
+        self._step_event_order = []
 
         evicted: list[MemoryEntry] = []
 

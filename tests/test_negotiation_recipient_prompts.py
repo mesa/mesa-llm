@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,7 +16,10 @@ from examples.negotiation.agents import (
 from mesa_llm.actions import ActionChoice
 from mesa_llm.actions import speak_to as builtin_speak_to
 from mesa_llm.memory.episodic_memory import EpisodicMemory
+from mesa_llm.memory.lt_memory import LongTermMemory
+from mesa_llm.memory.memory import MemoryEntry
 from mesa_llm.memory.st_lt_memory import STLTMemory
+from mesa_llm.memory.st_memory import ShortTermMemory
 from mesa_llm.reasoning.react import ReActReasoning
 
 
@@ -42,7 +46,9 @@ def _dialogue_agent(
     agent = _example_agent(agent_type, unique_id)
     agent.model = SimpleNamespace(agents=[], steps=0)
     agent.step_prompt = ""
-    if memory_kind == "stlt":
+    if memory_kind == "short_term":
+        memory = ShortTermMemory(agent=agent, n=20, display=False)
+    elif memory_kind == "stlt":
         memory = STLTMemory(
             agent=agent,
             short_term_capacity=20,
@@ -69,6 +75,12 @@ def _add_message(agent, sender, message: str):
 
 
 def _finalize_stlt_step(agent, step: int):
+    agent.model.steps = step
+    agent.memory.process_step(pre_step=True)
+    agent.memory.process_step(pre_step=False)
+
+
+def _finalize_buffered_step(agent, step: int):
     agent.model.steps = step
     agent.memory.process_step(pre_step=True)
     agent.memory.process_step(pre_step=False)
@@ -333,6 +345,453 @@ def test_dialogue_history_non_positive_limit_returns_empty_result(max_messages):
     assert (
         get_dialogue_history(agent, max_messages=max_messages) == "No recent dialogue."
     )
+
+
+@pytest.mark.parametrize("memory_kind", ("short_term", "stlt"))
+def test_final_a12_staged_incoming_precedes_current_outgoing_after_finalization(
+    memory_kind,
+):
+    agent = _dialogue_agent(
+        memory_kind,
+        agent_type="BuyerAgent",
+        unique_id=4,
+    )
+    seller = _example_agent("SellerAgent", 7)
+    agent.model.agents = [agent, seller]
+
+    _add_message(agent, seller.unique_id, "The opening price is 40.")
+    agent.memory.process_step(pre_step=True)
+    agent.memory.add_to_memory(
+        "action",
+        _successful_speak_action_event(
+            "Can you lower it?",
+            requested=(seller.unique_id,),
+            delivered=(seller.unique_id,),
+        ),
+    )
+    agent.model.steps = 1
+    agent.memory.process_step(pre_step=False)
+
+    assert get_dialogue_history(agent) == "\n".join(
+        (
+            "- SellerAgent 7: The opening price is 40.",
+            "- BuyerAgent 4 to [SellerAgent 7]: Can you lower it?",
+        )
+    )
+
+
+def test_final_a12_short_term_unfinalized_state_includes_staged_then_current():
+    buyer = _dialogue_agent(
+        "short_term",
+        agent_type="BuyerAgent",
+        unique_id=4,
+    )
+    seller = _example_agent("SellerAgent", 7)
+    buyer.model.agents = [buyer, seller]
+
+    _add_message(buyer, seller.unique_id, "The opening price is 40.")
+    buyer.memory.process_step(pre_step=True)
+    buyer.memory.add_to_memory(
+        "action",
+        _successful_speak_action_event(
+            "Can you lower it?",
+            requested=(seller.unique_id,),
+            delivered=(seller.unique_id,),
+        ),
+    )
+
+    assert get_dialogue_history(buyer) == "\n".join(
+        (
+            "- SellerAgent 7: The opening price is 40.",
+            "- BuyerAgent 4 to [SellerAgent 7]: Can you lower it?",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_a12_atomic_long_term_history_is_exact_while_async_commit_waits(
+    llm_response_factory,
+):
+    seller = _dialogue_agent(
+        "short_term",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+    seller.memory = LongTermMemory(
+        agent=seller,
+        llm_model="openai/test",
+        display=False,
+    )
+    incoming_one = {
+        "sender": buyer.unique_id,
+        "message": "Gated incoming one.",
+    }
+    outgoing_two = _successful_speak_action_event(
+        "Gated outgoing two.",
+        requested=(buyer.unique_id,),
+        delivered=(buyer.unique_id,),
+    )
+    incoming_three = {
+        "sender": buyer.unique_id,
+        "message": "Gated incoming three.",
+    }
+    outgoing_four = _successful_speak_action_event(
+        "Gated outgoing four.",
+        requested=(buyer.unique_id,),
+        delivered=(buyer.unique_id,),
+    )
+
+    seller.memory.add_to_memory("message", incoming_one)
+    seller.memory.add_to_memory("action", outgoing_two)
+    await seller.memory.aprocess_step(pre_step=True)
+    seller.memory.add_to_memory("message", incoming_three)
+    seller.memory.add_to_memory("action", outgoing_four)
+    seller.model.steps = 1
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def consolidate(_prompt):
+        entered.set()
+        await release.wait()
+        return llm_response_factory("summary")
+
+    seller.memory.llm.generate = Mock(
+        side_effect=AssertionError("sync provider must not run")
+    )
+    seller.memory.llm.agenerate = AsyncMock(side_effect=consolidate)
+    task = asyncio.create_task(seller.memory.aprocess_step(pre_step=False))
+    await entered.wait()
+
+    expected = "\n".join(
+        (
+            "- BuyerAgent 7: Gated incoming one.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Gated outgoing two.",
+            "- BuyerAgent 7: Gated incoming three.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Gated outgoing four.",
+        )
+    )
+    in_flight_history = get_dialogue_history(seller)
+    assert in_flight_history == expected
+    assert in_flight_history.count("Gated incoming three.") == 1
+    assert in_flight_history.count("Gated outgoing four.") == 1
+    assert seller.memory.buffer.step == 1
+    assert seller.memory.step_content == {}
+    assert seller.memory._step_event_order == []
+
+    release.set()
+    await task
+
+    assert get_dialogue_history(seller) == expected
+    seller.memory.llm.agenerate.assert_awaited_once()
+    seller.memory.llm.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("memory_kind", ("short_term", "stlt"))
+@pytest.mark.parametrize("finalize", (False, True), ids=("current", "finalized"))
+def test_final_a12_same_step_message_action_interleaving_is_exact(
+    memory_kind,
+    finalize,
+):
+    seller = _dialogue_agent(
+        memory_kind,
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+    events = (
+        ("message", {"sender": buyer.unique_id, "message": "Incoming one."}),
+        (
+            "action",
+            _successful_speak_action_event(
+                "Outgoing two.",
+                requested=(buyer.unique_id,),
+                delivered=(buyer.unique_id,),
+            ),
+        ),
+        ("message", {"sender": buyer.unique_id, "message": "Incoming three."}),
+        (
+            "action",
+            _successful_speak_action_event(
+                "Outgoing four.",
+                requested=(buyer.unique_id,),
+                delivered=(buyer.unique_id,),
+            ),
+        ),
+    )
+    for event_type, content in events:
+        seller.memory.add_to_memory(event_type, content)
+    if finalize:
+        _finalize_buffered_step(seller, 1)
+
+    assert get_dialogue_history(seller) == "\n".join(
+        (
+            "- BuyerAgent 7: Incoming one.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Outgoing two.",
+            "- BuyerAgent 7: Incoming three.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Outgoing four.",
+        )
+    )
+
+
+def test_final_a12_dialogue_projection_ignores_valid_third_additive_type_marker():
+    seller = _dialogue_agent(
+        "short_term",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    seller.memory = ShortTermMemory(
+        agent=seller,
+        n=20,
+        display=False,
+        additive_event_types={"action", "message", "audit"},
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+    action_one = _successful_speak_action_event(
+        "Action one.",
+        requested=(buyer.unique_id,),
+        delivered=(buyer.unique_id,),
+    )
+    message_two = {"sender": buyer.unique_id, "message": "Message two."}
+    audit_event = {"event": "delivery audited"}
+    action_three = _successful_speak_action_event(
+        "Action three.",
+        requested=(buyer.unique_id,),
+        delivered=(buyer.unique_id,),
+    )
+
+    seller.memory.add_to_memory("action", action_one)
+    seller.memory.add_to_memory("message", message_two)
+    seller.memory.add_to_memory("audit", audit_event)
+    seller.memory.add_to_memory("action", action_three)
+    _finalize_buffered_step(seller, 1)
+
+    entry = seller.memory.short_term_memory[-1]
+    assert entry.content == {
+        "action": [action_one, action_three],
+        "message": [message_two],
+        "audit": [audit_event],
+    }
+    assert entry._event_order == ["action", "message", "audit", "action"]
+    assert get_dialogue_history(seller) == "\n".join(
+        (
+            "- SellerAgent 5 to [BuyerAgent 7]: Action one.",
+            "- BuyerAgent 7: Message two.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Action three.",
+        )
+    )
+
+
+def test_final_a12_finalized_entries_then_current_buffer_keep_step_order_and_limit():
+    seller = _dialogue_agent(
+        "short_term",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+
+    _add_message(seller, buyer.unique_id, "Step one incoming.")
+    seller.memory.add_to_memory(
+        "action",
+        _successful_speak_action_event(
+            "Step one outgoing.",
+            requested=(buyer.unique_id,),
+            delivered=(buyer.unique_id,),
+        ),
+    )
+    _finalize_buffered_step(seller, 1)
+
+    seller.memory.add_to_memory(
+        "action",
+        _successful_speak_action_event(
+            "Step two outgoing.",
+            requested=(buyer.unique_id,),
+            delivered=(buyer.unique_id,),
+        ),
+    )
+    _add_message(seller, buyer.unique_id, "Step two incoming.")
+
+    assert get_dialogue_history(seller, max_messages=3) == "\n".join(
+        (
+            "- SellerAgent 5 to [BuyerAgent 7]: Step one outgoing.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Step two outgoing.",
+            "- BuyerAgent 7: Step two incoming.",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_order", "expected"),
+    (
+        (
+            None,
+            (
+                "- Agent 7: Legacy incoming.",
+                "- SellerAgent 5 to [Agent 7]: Legacy outgoing.",
+            ),
+        ),
+        (
+            ["message"],
+            (
+                "- Agent 7: Legacy incoming.",
+                "- SellerAgent 5 to [Agent 7]: Legacy outgoing.",
+            ),
+        ),
+        (
+            ["message", "unknown", "action"],
+            (
+                "- Agent 7: Legacy incoming.",
+                "- SellerAgent 5 to [Agent 7]: Legacy outgoing.",
+            ),
+        ),
+        (
+            ["message", "action", "action"],
+            (
+                "- Agent 7: Legacy incoming.",
+                "- SellerAgent 5 to [Agent 7]: Legacy outgoing.",
+            ),
+        ),
+    ),
+    ids=("missing", "short", "unknown", "excess"),
+)
+def test_final_a12_legacy_or_malformed_sidecar_falls_back_for_whole_entry(
+    event_order,
+    expected,
+):
+    seller = _dialogue_agent(agent_type="SellerAgent", unique_id=5)
+    content = {
+        "message": {"sender": 7, "message": "Legacy incoming."},
+        "action": _successful_speak_action_event(
+            "Legacy outgoing.", requested=(7,), delivered=(7,)
+        ),
+    }
+    entry = MemoryEntry(content=content, step=1, agent=seller)
+    if event_order is None:
+        del entry._event_order
+    else:
+        entry._event_order = event_order
+    seller.memory.short_term_memory.append(entry)
+
+    assert get_dialogue_history(seller) == "\n".join(expected)
+
+
+def test_final_a12_short_term_hidden_staged_sender_remains_recent_and_eligible():
+    seller = _dialogue_agent(
+        "short_term",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+    _add_message(seller, buyer.unique_id, "What is your price?")
+    seller.memory.process_step(pre_step=True)
+
+    recipients = get_eligible_recipients(seller, _observation(), "BuyerAgent")
+
+    assert recipients == [
+        {
+            "label": "BuyerAgent 7",
+            "unique_id": 7,
+            "currently_visible": False,
+            "recent_dialogue_partner": True,
+        }
+    ]
+    assert get_dialogue_history(seller) == "- BuyerAgent 7: What is your price?"
+
+
+def test_final_a12_multiple_deliveries_use_actual_partition_and_keep_equal_events():
+    seller = _dialogue_agent(
+        "short_term",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    delivered_buyer = _example_agent("BuyerAgent", 7)
+    unknown_delivered_id = 404
+    seller.model.agents = [seller, delivered_buyer]
+    event = _successful_speak_action_event(
+        "Same delivered offer.",
+        requested=(delivered_buyer.unique_id, 8, 9, unknown_delivered_id),
+        delivered=(delivered_buyer.unique_id, unknown_delivered_id),
+        skipped=(8,),
+        failed=(9,),
+    )
+    seller.memory.add_to_memory("action", event)
+    seller.memory.add_to_memory("action", event.copy())
+
+    line = "- SellerAgent 5 to [BuyerAgent 7, Agent 404]: Same delivered offer."
+    assert get_dialogue_history(seller) == "\n".join((line, line))
+    assert "Agent 8" not in get_dialogue_history(seller)
+    assert "Agent 9" not in get_dialogue_history(seller)
+
+
+def test_final_a12_hidden_staged_and_persisted_alias_is_counted_once_by_identity():
+    seller = _dialogue_agent(
+        "short_term",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    _add_message(seller, 7, "Count this staged message once.")
+    seller.memory.process_step(pre_step=True)
+    seller.memory.short_term_memory.append(seller.memory._current_step_entry)
+
+    assert get_dialogue_history(seller) == (
+        "- Agent 7: Count this staged message once."
+    )
+
+
+def test_final_a12_episodic_events_keep_write_order_without_extra_grading():
+    seller = _dialogue_agent(
+        "episodic",
+        agent_type="SellerAgent",
+        unique_id=5,
+    )
+    buyer = _example_agent("BuyerAgent", 7)
+    seller.model.agents = [seller, buyer]
+    seller.memory.llm.generate = Mock(
+        side_effect=AssertionError("provider grading must remain mocked")
+    )
+    seller.memory.llm.agenerate = AsyncMock(
+        side_effect=AssertionError("async provider grading must not run")
+    )
+    events = (
+        ("message", {"sender": buyer.unique_id, "message": "Incoming one."}),
+        (
+            "action",
+            _successful_speak_action_event(
+                "Outgoing two.",
+                requested=(buyer.unique_id,),
+                delivered=(buyer.unique_id,),
+            ),
+        ),
+        ("message", {"sender": buyer.unique_id, "message": "Incoming three."}),
+        (
+            "action",
+            _successful_speak_action_event(
+                "Outgoing four.",
+                requested=(buyer.unique_id,),
+                delivered=(buyer.unique_id,),
+            ),
+        ),
+    )
+    for event_type, content in events:
+        seller.memory.add_to_memory(event_type, content)
+
+    assert get_dialogue_history(seller) == "\n".join(
+        (
+            "- BuyerAgent 7: Incoming one.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Outgoing two.",
+            "- BuyerAgent 7: Incoming three.",
+            "- SellerAgent 5 to [BuyerAgent 7]: Outgoing four.",
+        )
+    )
+    assert seller.memory.grade_event_importance.call_count == len(events)
+    seller.memory.llm.generate.assert_not_called()
+    seller.memory.llm.agenerate.assert_not_awaited()
 
 
 @pytest.mark.parametrize("memory_kind", ("stlt", "episodic"))
@@ -633,6 +1092,59 @@ def test_final_a6_next_prompt_includes_own_speech_without_sender_message_or_llm_
             "message" not in entry.content for entry in actor.memory.memory_entries
         )
         assert grading.call_count == 1
+    actor.llm.generate.assert_not_called()
+    actor.llm.agenerate.assert_not_awaited()
+    actor.memory.llm.generate.assert_not_called()
+    actor.memory.llm.agenerate.assert_not_awaited()
+
+
+@pytest.mark.parametrize("actor_kind", ("seller", "buyer"))
+def test_final_a12_next_prompt_displays_staged_incoming_before_own_reply_without_llm(
+    monkeypatch,
+    actor_kind,
+):
+    actor = (
+        _seller_agent(monkeypatch)
+        if actor_kind == "seller"
+        else _buyer_agent(monkeypatch)
+    )
+    peer_type = "BuyerAgent" if actor_kind == "seller" else "SellerAgent"
+    peer = _add_peer(actor.model, peer_type)
+    _set_visible_peers(actor, peer)
+    _forbid_action_selection(actor)
+
+    actor.memory.add_to_memory(
+        "message",
+        {"sender": peer.unique_id, "message": "Incoming offer."},
+    )
+    actor.memory.process_step(pre_step=True)
+    result = actor.execute_action(
+        _speak_choice([peer.unique_id], message="Outgoing reply."),
+        actions=["speak_to"],
+    )
+    actor.model.steps = 1
+    actor.memory.process_step(pre_step=False)
+
+    _assert_delivery_partition(
+        result,
+        [peer.unique_id],
+        [peer.unique_id],
+        [],
+    )
+    dialogue = get_dialogue_history(actor)
+    assert dialogue.index("Incoming offer.") < dialogue.index("Outgoing reply.")
+
+    observation = _observation(f"{peer_type} {peer.unique_id}")
+    if actor_kind == "seller":
+        prompt = actor._seller_step_prompt(
+            dialogue,
+            get_eligible_recipients(actor, observation, peer_type),
+        )
+    else:
+        prompt, actions = actor._buyer_step_prompt_and_actions(observation, dialogue)
+        assert actions == ["speak_to", "buy_product"]
+
+    assert prompt.index("Incoming offer.") < prompt.index("Outgoing reply.")
     actor.llm.generate.assert_not_called()
     actor.llm.agenerate.assert_not_awaited()
     actor.memory.llm.generate.assert_not_called()

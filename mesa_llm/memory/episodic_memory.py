@@ -230,6 +230,7 @@ class EpisodicMemory(Memory):
             content={type: graded_content},
             step=self.agent.model.steps,
         )
+        new_entry._event_order = [type]
         self.memory_entries.append(new_entry)
 
     def add_to_memory(self, type: str, content: dict):

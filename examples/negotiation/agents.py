@@ -3,25 +3,53 @@ import json
 from examples.negotiation.actions import speak_to
 from mesa_llm.actions import ActionChoice, teleport_to_location, wait
 from mesa_llm.llm_agent import LLMAgent
+from mesa_llm.memory.memory import _ordered_event_payloads
 from mesa_llm.reasoning.reasoning import Observation
+
+
+def _recent_memory_content_sources(agent):
+    """Return recent content objects and their private order sidecars."""
+    memory = agent.memory
+    sources = []
+    seen_content_ids = set()
+
+    def add_entry(entry):
+        content = getattr(entry, "content", None)
+        if not isinstance(content, dict) or id(content) in seen_content_ids:
+            return
+        seen_content_ids.add(id(content))
+        sources.append((content, getattr(entry, "_event_order", None)))
+
+    for entries_name in ("short_term_memory", "memory_entries"):
+        entries = getattr(memory, entries_name, None)
+        if entries is not None:
+            for entry in entries:
+                add_entry(entry)
+
+    buffer_entry = getattr(memory, "buffer", None)
+    if buffer_entry is not None:
+        add_entry(buffer_entry)
+
+    current_step_entry = getattr(memory, "_current_step_entry", None)
+    if current_step_entry is not None:
+        add_entry(current_step_entry)
+
+    step_content = getattr(memory, "step_content", None)
+    if isinstance(step_content, dict) and id(step_content) not in seen_content_ids:
+        sources.append(
+            (
+                step_content,
+                getattr(memory, "_step_event_order", None),
+            )
+        )
+
+    return sources
 
 
 def _memory_event_payloads(agent, event_type: str):
     """Yield structured recent-memory payloads for one event type."""
-    memory = agent.memory
-    entries = getattr(memory, "short_term_memory", None)
-    if entries is None:
-        entries = getattr(memory, "memory_entries", ())
-
-    contents = [entry.content for entry in entries]
-    step_content = getattr(memory, "step_content", None)
-    if isinstance(step_content, dict) and not any(
-        step_content is content for content in contents
-    ):
-        contents.append(step_content)
-
-    for content in contents:
-        if not isinstance(content, dict) or event_type not in content:
+    for content, _event_order in _recent_memory_content_sources(agent):
+        if event_type not in content:
             continue
         payloads = content[event_type]
         if not isinstance(payloads, list):
@@ -31,28 +59,14 @@ def _memory_event_payloads(agent, event_type: str):
 
 def _dialogue_event_payloads(agent):
     """Yield stored message and action payloads in insertion order."""
-    memory = agent.memory
-    entries = getattr(memory, "short_term_memory", None)
-    if entries is None:
-        entries = getattr(memory, "memory_entries", ())
-
-    contents = [entry.content for entry in entries]
-    step_content = getattr(memory, "step_content", None)
-    if isinstance(step_content, dict) and not any(
-        step_content is content for content in contents
-    ):
-        contents.append(step_content)
-
-    for content in contents:
-        if not isinstance(content, dict):
-            continue
-        for event_type, payloads in content.items():
-            if event_type not in ("message", "action"):
-                continue
-            event_payloads = payloads if isinstance(payloads, list) else [payloads]
-            for payload in event_payloads:
-                if isinstance(payload, dict):
-                    yield event_type, payload
+    for content, event_order in _recent_memory_content_sources(agent):
+        for event_type, payload in _ordered_event_payloads(
+            content,
+            event_order,
+            ("message", "action"),
+        ):
+            if isinstance(payload, dict):
+                yield event_type, payload
 
 
 def _recent_dialogue_partner_ids(agent) -> set:
