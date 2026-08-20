@@ -107,12 +107,17 @@ class LongTermMemory(Memory):
             content=merged_content,
             step=self.agent.model.steps,
         )
-        staged_event_order = getattr(staged_entry, "_event_order", ())
-        if not isinstance(staged_event_order, list | tuple):
-            staged_event_order = ()
+        staged_event_order = self._normalized_step_event_order(
+            staged_entry.content,
+            getattr(staged_entry, "_event_order", ()),
+        )
+        normalized_current_event_order = self._normalized_step_event_order(
+            current_content,
+            current_event_order,
+        )
         candidate._event_order = [
             *staged_event_order,
-            *current_event_order,
+            *normalized_current_event_order,
         ]
 
         self.buffer, self.step_content, self._step_event_order = candidate, {}, []

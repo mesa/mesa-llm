@@ -40,10 +40,15 @@ def _ordered_event_payloads(
     sidecar can never drop or duplicate part of a content object.
     """
     selected_types = set(event_types)
+    ordered_types = (
+        {marker for marker in event_order if isinstance(marker, str)}
+        if isinstance(event_order, list | tuple)
+        else set()
+    )
     grouped_values = {
         event_type: value if isinstance(value, list) else [value]
         for event_type, value in content.items()
-        if event_type in selected_types or isinstance(value, list)
+        if event_type in selected_types or event_type in ordered_types
     }
     fallback = [
         (event_type, payload)
@@ -285,6 +290,42 @@ class Memory(ABC):
         if isinstance(value, list):
             return list(value)
         return [value]
+
+    def _normalized_step_event_order(
+        self,
+        content: dict,
+        event_order,
+    ) -> list[str]:
+        """Return a complete order for one staged or current step segment.
+
+        A valid sidecar is preserved exactly. Legacy, missing, or malformed
+        metadata falls back to the segment's deterministic grouped-content
+        order, without using unrelated list-valued fields as event markers.
+        """
+        grouped_counts = {
+            event_type: len(self._coerce_additive_values(value))
+            for event_type, value in content.items()
+            if event_type in self.additive_event_types
+        }
+        fallback = [
+            event_type
+            for event_type, value in content.items()
+            if event_type in self.additive_event_types
+            for _ in self._coerce_additive_values(value)
+        ]
+
+        if not isinstance(event_order, list | tuple):
+            return fallback
+
+        normalized = list(event_order)
+        if any(
+            not isinstance(marker, str) or marker not in grouped_counts
+            for marker in normalized
+        ):
+            return fallback
+        if Counter(normalized) != Counter(grouped_counts):
+            return fallback
+        return normalized
 
     def _merge_step_contents(self, current_content: dict, staged_content: dict) -> dict:
         """

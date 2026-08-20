@@ -86,12 +86,17 @@ class ShortTermMemory(Memory):
                 content=merged_content,
                 step=self.agent.model.steps,
             )
-            staged_event_order = getattr(self._current_step_entry, "_event_order", ())
-            if not isinstance(staged_event_order, list | tuple):
-                staged_event_order = ()
+            staged_event_order = self._normalized_step_event_order(
+                self._current_step_entry.content,
+                getattr(self._current_step_entry, "_event_order", ()),
+            )
+            current_event_order = self._normalized_step_event_order(
+                self.step_content,
+                self._step_event_order,
+            )
             new_entry._event_order = [
                 *staged_event_order,
-                *self._step_event_order,
+                *current_event_order,
             ]
             self.short_term_memory.append(new_entry)
             self._current_step_entry = None
