@@ -140,6 +140,14 @@ class LongTermMemory(Memory):
         ) = transaction
         fresh_content = self.step_content
         fresh_event_order = self._step_event_order
+        normalized_current_order = self._normalized_step_event_order(
+            current_content,
+            current_event_order,
+        )
+        normalized_fresh_order = self._normalized_step_event_order(
+            fresh_content,
+            fresh_event_order,
+        )
 
         try:
             for event_type, value in fresh_content.items():
@@ -161,7 +169,10 @@ class LongTermMemory(Memory):
                     current_content[event_type] = [existing, *value]
                 else:
                     current_content[event_type] = [existing, value]
-            current_event_order.extend(fresh_event_order)
+            current_event_order[:] = [
+                *normalized_current_order,
+                *normalized_fresh_order,
+            ]
         finally:
             staged_entry.step = None
             self.long_term_memory = old_long_term_memory

@@ -363,6 +363,12 @@ class Memory(ABC):
             )
 
         if type in self.additive_event_types:
+            event_order = self._step_event_order
+            event_order[:] = self._normalized_step_event_order(
+                self.step_content,
+                event_order,
+            )
+
             # Accumulate discrete events so concurrent entries are preserved
             existing = self.step_content.get(type)
             if existing is None:
@@ -372,7 +378,7 @@ class Memory(ABC):
             else:
                 # Migrate a legacy single-dict entry into a list
                 self.step_content[type] = [existing, content]
-            self._step_event_order.append(type)
+            event_order.append(type)
         else:
             self.step_content[type] = content
 
