@@ -31,6 +31,8 @@ async def test_completed_future_cleans_pending_task_result():
 
     @action(action_manager=manager)
     async def completed_wrapper_task(agent) -> object:
+        """Return a completed Future containing a pending child Task."""
+
         async def mutate_after_release():
             started.set()
             await release.wait()
@@ -73,6 +75,8 @@ async def test_completed_future_chain_cleans_pending_task_result():
 
     @action(action_manager=manager)
     def completed_wrapper_chain(agent) -> object:
+        """Return completed Future wrappers around a pending child Task."""
+
         async def mutate_after_release():
             await release.wait()
             agent.mutations += 1
@@ -115,6 +119,8 @@ async def test_completed_future_closes_native_coroutine_result(recwarn):
 
     @action(action_manager=manager)
     async def completed_wrapper_coroutine(agent) -> object:
+        """Return a completed Future containing a native coroutine."""
+
         async def mutate_later():
             agent.mutations += 1
 
@@ -147,6 +153,8 @@ async def test_completed_future_identity_cycle_does_not_recurse_forever():
 
     @action(action_manager=manager)
     async def completed_wrapper_cycle(agent) -> object:
+        """Return a completed Future whose result is itself."""
+
         del agent
         wrapper = asyncio.get_running_loop().create_future()
         wrapper.set_result(wrapper)
@@ -173,6 +181,8 @@ async def test_completed_future_current_task_is_not_self_cancelled():
 
     @action(action_manager=manager)
     async def completed_wrapper_current_task(agent) -> object:
+        """Return a completed Future containing the current Task."""
+
         del agent
         wrapper = asyncio.get_running_loop().create_future()
         wrapper.set_result(asyncio.current_task())
@@ -206,6 +216,8 @@ async def test_llm_agent_does_not_record_completed_wrapper_child():
 
     @action(action_manager=manager)
     async def completed_wrapper_agent(agent) -> object:
+        """Return a completed Future containing a pending child Task."""
+
         async def mutate_after_release():
             started.set()
             await release.wait()
