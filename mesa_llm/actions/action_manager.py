@@ -479,7 +479,7 @@ class ActionManager:
             f"{type(cleanup_error).__name__}: {cleanup_text}"
         )
 
-    def _cleanup_nested_awaitable_action_result(
+    async def _cleanup_nested_awaitable_action_result(
         self,
         primary_error: TypeError,
         result: Any,
@@ -539,11 +539,37 @@ class ActionManager:
                 )
                 return
 
-            if inspect.isawaitable(nested_result):
-                self._cleanup_nested_awaitable_action_result(
+            if (
+                inspect.isawaitable(nested_result)
+                or inspect.isgenerator(nested_result)
+                or inspect.isasyncgen(nested_result)
+            ):
+                await self._cleanup_nested_awaitable_action_result(
                     primary_error,
                     nested_result,
                     seen,
+                )
+            return
+
+        if inspect.isgenerator(result):
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "generator",
+                    cleanup_error,
+                )
+            return
+
+        if inspect.isasyncgen(result):
+            try:
+                await result.aclose()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "async-generator",
+                    cleanup_error,
                 )
             return
 
@@ -565,7 +591,7 @@ class ActionManager:
             "opaque custom awaitables during cleanup."
         )
 
-    def _reject_nested_awaitable_action_result(
+    async def _reject_nested_awaitable_action_result(
         self,
         action_name: str,
         result: Any,
@@ -574,7 +600,7 @@ class ActionManager:
             return
 
         primary_error = self._nested_awaitable_action_result_error(action_name)
-        self._cleanup_nested_awaitable_action_result(
+        await self._cleanup_nested_awaitable_action_result(
             primary_error,
             result,
             set(),
@@ -597,7 +623,7 @@ class ActionManager:
         if inspect.isawaitable(result):
             result = await result
             await self._areject_generator_action_result(choice.name, result)
-            self._reject_nested_awaitable_action_result(choice.name, result)
+            await self._reject_nested_awaitable_action_result(choice.name, result)
         return result
 
     def _coerce_action_choice(

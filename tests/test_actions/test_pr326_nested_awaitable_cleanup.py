@@ -249,3 +249,73 @@ async def test_llm_agent_does_not_record_completed_wrapper_child():
         if agent.child is not None and not agent.child.done():
             agent.child.cancel()
             await _await_cancelled(agent.child)
+
+
+@pytest.mark.asyncio
+async def test_completed_future_closes_started_generator_result():
+    state = SimpleNamespace(closed=False, child=None)
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    async def completed_wrapper_generator(agent) -> object:
+        """Return a completed Future containing a started generator."""
+
+        def deferred_cleanup():
+            try:
+                yield "started"
+            finally:
+                agent.closed = True
+
+        agent.child = deferred_cleanup()
+        assert next(agent.child) == "started"
+        wrapper = asyncio.get_running_loop().create_future()
+        wrapper.set_result(agent.child)
+        return wrapper
+
+    with pytest.raises(TypeError) as exc_info:
+        await manager.aexecute(
+            state,
+            ActionChoice(name="completed_wrapper_generator", arguments={}),
+        )
+
+    _assert_nested_awaitable_error(
+        exc_info.value,
+        "completed_wrapper_generator",
+    )
+    assert state.closed
+    assert state.child.gi_frame is None
+
+
+@pytest.mark.asyncio
+async def test_completed_future_closes_started_async_generator_result():
+    state = SimpleNamespace(closed=False, child=None)
+    manager = ActionManager()
+
+    @action(action_manager=manager)
+    async def completed_wrapper_async_generator(agent) -> object:
+        """Return a completed Future containing a started async generator."""
+
+        async def deferred_cleanup():
+            try:
+                yield "started"
+            finally:
+                agent.closed = True
+
+        agent.child = deferred_cleanup()
+        assert await anext(agent.child) == "started"
+        wrapper = asyncio.get_running_loop().create_future()
+        wrapper.set_result(agent.child)
+        return wrapper
+
+    with pytest.raises(TypeError) as exc_info:
+        await manager.aexecute(
+            state,
+            ActionChoice(name="completed_wrapper_async_generator", arguments={}),
+        )
+
+    _assert_nested_awaitable_error(
+        exc_info.value,
+        "completed_wrapper_async_generator",
+    )
+    assert state.closed
+    assert state.child.ag_frame is None
