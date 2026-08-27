@@ -690,7 +690,7 @@ class TestFinalA12EventOrdering:
             side_effect=AssertionError("sync grading must not run")
         )
         memory.llm.generate = Mock(
-            side_effect=AssertionError("sync provider grading must not run")
+            side_effect=AssertionError("sync provider must not run")
         )
         memory.llm.agenerate = AsyncMock(
             side_effect=AssertionError("provider grading must remain mocked")
@@ -741,7 +741,7 @@ class TestFinalInt01PartialMemoryCompatibility:
         assert legacy_entry.content == legacy_content
         assert legacy_entry.content["message"] == [legacy_message]
         assert legacy_entry.content["action"] == [legacy_action]
-        assert legacy_entry._event_order == []
+        assert legacy_entry._event_order == ["message", "action"]
 
         fresh_events = _final_a12_ordered_events()
         for event in fresh_events:
