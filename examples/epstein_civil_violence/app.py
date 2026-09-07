@@ -7,6 +7,7 @@ from mesa.visualization import (
     SolaraViz,
     make_plot_component,
     make_space_component,
+    SpaceRenderer,
 )
 
 from examples.epstein_civil_violence.agents import Citizen, CitizenState, Cop
@@ -48,8 +49,8 @@ model_params = {
     "width": 10,
     "height": 10,
     "reasoning": ReActReasoning,
-    "llm_model": "openai/gpt-4o-mini",
-    "api_base": None,
+    "llm_model": "ollama/llama3.1:latest", # openai/gpt-4o-mini
+    "api_base": None,                  #
     "vision": 5,
     "parallel_stepping": True,
 }
@@ -85,12 +86,17 @@ def citizen_cop_portrayal(agent):
 
     return portrayal
 
-
 def post_process(ax):
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
     ax.get_figure().set_size_inches(10, 10)
+
+renderer = SpaceRenderer(model, backend="altair").setup_agents(
+    citizen_cop_portrayal
+)
+renderer.render()
+renderer.post_process = post_process
 
 
 space_component = make_space_component(

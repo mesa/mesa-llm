@@ -7,6 +7,8 @@ from mesa.visualization import (
     SolaraViz,
     make_plot_component,
     make_space_component,
+    Slider,
+    SpaceRenderer,
 )
 
 from examples.sugarscrap_g1mt.agents import Resource, Trader
@@ -35,12 +37,12 @@ model_params = {
         "value": 42,
         "label": "Random Seed",
     },
-    "initial_traders": 2,
+    "initial_traders":10,
     "initial_resources": 10,
-    "width": 10,
+    "width":10,
     "height": 10,
     "reasoning": ReActReasoning,
-    "llm_model": "gemini/gemini-2.5-flash",
+    "llm_model": "ollama/llama3:latest",  # gemini/gemini-2.5-flash
     "api_base": None,
     "vision": 5,
     "parallel_stepping": False,
@@ -113,9 +115,17 @@ space_component = make_space_component(
 
 chart_component = make_plot_component({"Total_Sugar": "blue", "Total_Spice": "red"})
 
+# renderer  = (
+#     SpaceRenderer(model, backend="altair")
+#     .setup_agents(agent_potrayal)
+#            # May be remove
+# )
+# renderer.render()
+
+
 if __name__ == "__main__":
     page = SolaraViz(
-        model,
+        model,                      
         components=[
             space_component,
             chart_component,
