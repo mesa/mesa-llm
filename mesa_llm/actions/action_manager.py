@@ -33,6 +33,7 @@ from mesa_llm.actions.action_decorator import (
 )
 
 _UNSET = object()
+_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS = 0.5
 ActionRef = Callable | str
 ActionSelection = ActionRef | list[ActionRef] | tuple[ActionRef, ...] | None
 
@@ -479,6 +480,80 @@ class ActionManager:
             f"{type(cleanup_error).__name__}: {cleanup_text}"
         )
 
+    async def _drain_rejected_task(
+        self,
+        primary_error: TypeError,
+        task: asyncio.Task,
+        seen: set[int],
+    ) -> None:
+        """Request cancellation once and wait briefly for terminal cleanup."""
+        if task is asyncio.current_task():
+            primary_error.add_note(
+                "The rejected nested asyncio Task was not cancelled because "
+                "it is the current task running ActionManager.aexecute(...); "
+                "self-cancellation is unsafe."
+            )
+            return
+
+        if not task.done():
+            try:
+                if task.cancelling() == 0:
+                    task.cancel()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "asyncio Task",
+                    cleanup_error,
+                )
+                return
+
+            try:
+                done, _ = await asyncio.wait(
+                    {task},
+                    timeout=_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "asyncio Task cancellation drain",
+                    cleanup_error,
+                )
+                return
+
+            if task not in done:
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected nested asyncio Task "
+                    "remained live after cancellation was requested and the "
+                    "bounded cancellation-drain timeout elapsed."
+                )
+                return
+
+        if task.cancelled():
+            return
+
+        try:
+            nested_result = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as cleanup_error:
+            self._note_nested_awaitable_cleanup_failure(
+                primary_error,
+                "completed asyncio Task",
+                cleanup_error,
+            )
+            return
+
+        if (
+            inspect.isawaitable(nested_result)
+            or inspect.isgenerator(nested_result)
+            or inspect.isasyncgen(nested_result)
+        ):
+            await self._cleanup_nested_awaitable_action_result(
+                primary_error,
+                nested_result,
+                seen,
+            )
+
     async def _cleanup_nested_awaitable_action_result(
         self,
         primary_error: TypeError,
@@ -494,15 +569,11 @@ class ActionManager:
             return
         seen.add(result_identity)
 
-        if isinstance(result, asyncio.Future):
-            if result is asyncio.current_task():
-                primary_error.add_note(
-                    "The rejected nested asyncio Task was not cancelled because "
-                    "it is the current task running ActionManager.aexecute(...); "
-                    "self-cancellation is unsafe."
-                )
-                return
+        if isinstance(result, asyncio.Task):
+            await self._drain_rejected_task(primary_error, result, seen)
+            return
 
+        if isinstance(result, asyncio.Future):
             if result.cancelled():
                 return
 
@@ -512,7 +583,7 @@ class ActionManager:
                 except Exception as cleanup_error:
                     self._note_nested_awaitable_cleanup_failure(
                         primary_error,
-                        "asyncio Future or Task",
+                        "asyncio Future",
                         cleanup_error,
                     )
                     return
@@ -521,8 +592,8 @@ class ActionManager:
                     return
                 if not result.done():
                     primary_error.add_note(
-                        "The rejected nested asyncio Future or Task remained "
-                        "pending after cancellation was requested."
+                        "Cleanup unresolved: the rejected nested asyncio Future "
+                        "remained pending after cancellation was requested."
                     )
                     return
 
@@ -531,10 +602,12 @@ class ActionManager:
 
             try:
                 nested_result = result.result()
+            except asyncio.CancelledError:
+                return
             except Exception as cleanup_error:
                 self._note_nested_awaitable_cleanup_failure(
                     primary_error,
-                    "completed asyncio Future or Task",
+                    "completed asyncio Future",
                     cleanup_error,
                 )
                 return
