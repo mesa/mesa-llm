@@ -6,8 +6,6 @@ from dotenv import load_dotenv
 from mesa.visualization import (
     SolaraViz,
     make_plot_component,
-    make_space_component,
-    Slider,
     SpaceRenderer,
 )
 
@@ -25,9 +23,6 @@ warnings.filterwarnings(
 
 # Also suppress through logging
 logging.getLogger("pydantic").setLevel(logging.ERROR)
-
-# enable_automatic_parallel_stepping(mode="threading")
-
 load_dotenv()
 
 
@@ -42,7 +37,7 @@ model_params = {
     "width":10,
     "height": 10,
     "reasoning": ReActReasoning,
-    "llm_model": "ollama/llama3:latest",  # gemini/gemini-2.5-flash
+    "llm_model": "ollama/llama3-groq-tool-use:8b",  # gemini/gemini-2.5-flash
     "api_base": None,
     "vision": 5,
     "parallel_stepping": False,
@@ -109,25 +104,25 @@ def post_process(ax):
     ax.text(8, 10.5, "● Spice (Red)", color="red", fontsize=10, fontweight="bold")
 
 
-space_component = make_space_component(
-    agent_potrayal, post_process=post_process, draw_grid=False
-)
+# space_component = make_space_component(
+#     agent_potrayal, post_process=post_process, draw_grid=False
+# )
 
 chart_component = make_plot_component({"Total_Sugar": "blue", "Total_Spice": "red"})
 
-# renderer  = (
-#     SpaceRenderer(model, backend="altair")
-#     .setup_agents(agent_potrayal)
-#            # May be remove
-# )
-# renderer.render()
+renderer  = (
+    SpaceRenderer(model, backend="altair")
+    .setup_agents(agent_potrayal)
+           # May be remove
+)
+renderer.postprocess = post_process
 
 
 if __name__ == "__main__":
     page = SolaraViz(
-        model,                      
+        model,
+        renderer,                      
         components=[
-            space_component,
             chart_component,
         ],
         model_params=model_params,

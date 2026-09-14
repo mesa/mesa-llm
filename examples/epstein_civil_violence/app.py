@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from mesa.visualization import (
     SolaraViz,
     make_plot_component,
-    make_space_component,
     SpaceRenderer,
 )
 
@@ -44,15 +43,15 @@ model_params = {
         "value": 42,
         "label": "Random Seed",
     },
-    "initial_citizens": 20,
+    "initial_citizens": 5,
     "initial_cops": 5,
     "width": 10,
     "height": 10,
     "reasoning": ReActReasoning,
-    "llm_model": "ollama/llama3.1:latest", # openai/gpt-4o-mini
+    "llm_model": "ollama/llama3-groq-tool-use:8b", # openai/gpt-4o-mini
     "api_base": None,                  #
     "vision": 5,
-    "parallel_stepping": True,
+    "parallel_stepping": False,
 }
 
 
@@ -86,37 +85,35 @@ def citizen_cop_portrayal(agent):
 
     return portrayal
 
-def post_process(ax):
-    ax.set_aspect("equal")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.get_figure().set_size_inches(10, 10)
-
 renderer = SpaceRenderer(model, backend="altair").setup_agents(
-    citizen_cop_portrayal
-)
-renderer.render()
-renderer.post_process = post_process
-
-
-space_component = make_space_component(
-    citizen_cop_portrayal, post_process=post_process, draw_grid=False
+    citizen_cop_portrayal,
 )
 
 chart_component = make_plot_component(
     {state.name.lower(): agent_colors[state] for state in CitizenState}
 )
 
-if __name__ == "__main__":
-    page = SolaraViz(
+def post_process(chart):
+    return (
+        chart.properties(width=700, height=700)
+        .configure_view(strokeWidth=0)
+        .configure_axis(grid=False)
+    )
+renderer.post_process = post_process
+
+
+page = SolaraViz(
         model,
+        renderer,
         components=[
-            space_component,
             chart_component,
         ],  # Add ShowSalesButton here
         model_params=model_params,
         name="Espstein Civil Violence Model",
     )
+
+if __name__ == "__main__":
+    pass
 
 
 """run with:
