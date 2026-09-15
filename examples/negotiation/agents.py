@@ -11,12 +11,16 @@ def _recent_memory_content_sources(agent):
     """Return recent content objects and their private order sidecars."""
     memory = agent.memory
     sources = []
+    seen_entry_ids = set()
     seen_content_ids = set()
 
     def add_entry(entry):
         content = getattr(entry, "content", None)
-        if not isinstance(content, dict) or id(content) in seen_content_ids:
+        if not isinstance(content, dict) or id(entry) in seen_entry_ids:
             return
+        # Distinct records can share a payload, including across model steps.
+        # Only collapse the same record exposed through multiple containers.
+        seen_entry_ids.add(id(entry))
         seen_content_ids.add(id(content))
         sources.append((content, getattr(entry, "_event_order", None)))
 
