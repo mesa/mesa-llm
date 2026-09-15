@@ -21,6 +21,7 @@ from typing import (
 from pydantic import BaseModel, Field
 from terminal_style import style
 
+from mesa_llm.actions._asyncgen_cleanup import close_asyncgen_best_effort
 from mesa_llm.actions.action_decorator import (
     _GLOBAL_ACTION_REGISTRY,
     ActionAnnotationContractError,
@@ -434,7 +435,13 @@ class ActionManager:
             asyncio.get_running_loop()
         except RuntimeError:
             try:
-                asyncio.run(result.aclose())
+                asyncio.run(
+                    close_asyncgen_best_effort(
+                        result,
+                        primary_error,
+                        _TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                    )
+                )
             except Exception as cleanup_error:
                 self._note_generator_cleanup_failure(
                     primary_error,
@@ -465,7 +472,11 @@ class ActionManager:
             if result_kind == "generator":
                 result.close()
             else:
-                await result.aclose()
+                await close_asyncgen_best_effort(
+                    result,
+                    primary_error,
+                    _TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
         except Exception as cleanup_error:
             self._note_generator_cleanup_failure(
                 primary_error,
@@ -656,7 +667,13 @@ class ActionManager:
                 asyncio.get_running_loop()
             except RuntimeError:
                 try:
-                    asyncio.run(result.aclose())
+                    asyncio.run(
+                        close_asyncgen_best_effort(
+                            result,
+                            primary_error,
+                            _TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                        )
+                    )
                 except Exception as cleanup_error:
                     self._note_nested_awaitable_cleanup_failure(
                         primary_error,
@@ -955,7 +972,11 @@ class ActionManager:
 
         if inspect.isasyncgen(result):
             try:
-                await result.aclose()
+                await close_asyncgen_best_effort(
+                    result,
+                    primary_error,
+                    _TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
             except Exception as cleanup_error:
                 self._note_nested_awaitable_cleanup_failure(
                     primary_error,
