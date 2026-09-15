@@ -123,9 +123,7 @@ def _executor_wrapper(payload):
 def _assert_untouched(state, error):
     assert type(error) is TypeError
     notes = getattr(error, "__notes__", ())
-    assert any(
-        "Cleanup unresolved" in note and "event loop" in note for note in notes
-    )
+    assert any("Cleanup unresolved" in note and "event loop" in note for note in notes)
     assert state.snapshot() == (False, 0, False, False)
 
 
