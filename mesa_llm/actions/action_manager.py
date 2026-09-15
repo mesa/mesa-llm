@@ -315,8 +315,10 @@ class ActionManager:
         if isinstance(result, concurrent.futures.Future):
             self._reject_concurrent_future_action_result(choice.name, result)
         if inspect.isawaitable(result):
-            self._close_awaitable_if_safe(result)
-            raise self._synchronous_awaitable_error(choice.name)
+            primary_error = self._synchronous_awaitable_error(choice.name)
+            if not self._skip_foreign_loop_cleanup(primary_error, result):
+                self._close_awaitable_if_safe(result)
+            raise primary_error
         return result
 
     def _call_validated_action(
@@ -344,6 +346,27 @@ class ActionManager:
             result.cancel()
         elif inspect.iscoroutine(result):
             result.close()
+
+    def _skip_foreign_loop_cleanup(
+        self,
+        primary_error: TypeError,
+        result: Any,
+    ) -> bool:
+        """Leave pending asyncio objects untouched outside their owning loop."""
+        if not isinstance(result, asyncio.Future) or result.done():
+            return False
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if result.get_loop() is running_loop:
+            return False
+        primary_error.add_note(
+            "Cleanup unresolved: the rejected asyncio Future or Task belongs "
+            "to another event loop, or no event loop is running in this thread; "
+            "it was left untouched rather than cancelled or drained here."
+        )
+        return True
 
     def _synchronous_awaitable_error(self, action_name: str) -> TypeError:
         return TypeError(
@@ -537,6 +560,8 @@ class ActionManager:
             return
 
         if isinstance(result, asyncio.Future):
+            if self._skip_foreign_loop_cleanup(primary_error, result):
+                return
             try:
                 current_task = asyncio.current_task()
             except RuntimeError:
@@ -736,6 +761,9 @@ class ActionManager:
             )
             return
 
+        if self._skip_foreign_loop_cleanup(primary_error, task):
+            return
+
         if not task.done():
             try:
                 if task.cancelling() == 0:
@@ -844,12 +872,7 @@ class ActionManager:
                 return
 
             if not result.done():
-                if result.get_loop() is not asyncio.get_running_loop():
-                    primary_error.add_note(
-                        "Cleanup unresolved: the rejected nested asyncio Future "
-                        "belongs to another event loop; it was not cancelled "
-                        "or drained from this loop."
-                    )
+                if self._skip_foreign_loop_cleanup(primary_error, result):
                     return
 
                 try:
