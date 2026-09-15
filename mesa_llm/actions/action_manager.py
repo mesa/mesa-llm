@@ -586,6 +586,15 @@ class ActionManager:
             if result.cancelled():
                 return
 
+            if type(result) is not asyncio.Future and not isinstance(
+                result, asyncio.Task
+            ):
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected asyncio Future subclass is "
+                    "terminal, but completion of any underlying child work cannot "
+                    "be established from its public Future interface."
+                )
+
             try:
                 nested_result = result.result()
             except asyncio.CancelledError:
@@ -835,8 +844,16 @@ class ActionManager:
                 return
 
             if not result.done():
+                if result.get_loop() is not asyncio.get_running_loop():
+                    primary_error.add_note(
+                        "Cleanup unresolved: the rejected nested asyncio Future "
+                        "belongs to another event loop; it was not cancelled "
+                        "or drained from this loop."
+                    )
+                    return
+
                 try:
-                    cancelled = result.cancel()
+                    result.cancel()
                 except Exception as cleanup_error:
                     self._note_nested_awaitable_cleanup_failure(
                         primary_error,
@@ -845,17 +862,42 @@ class ActionManager:
                     )
                     return
 
-                if cancelled or result.cancelled():
-                    return
+                # Composite Futures can accept cancellation without finishing.
+                # Wait only for this Future, without scheduling or driving children.
                 if not result.done():
-                    primary_error.add_note(
-                        "Cleanup unresolved: the rejected nested asyncio Future "
-                        "remained pending after cancellation was requested."
-                    )
-                    return
+                    try:
+                        done, _ = await asyncio.wait(
+                            {result},
+                            timeout=_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                        )
+                    except Exception as cleanup_error:
+                        self._note_nested_awaitable_cleanup_failure(
+                            primary_error,
+                            "asyncio Future cancellation drain",
+                            cleanup_error,
+                        )
+                        return
+
+                    if result not in done:
+                        primary_error.add_note(
+                            "Cleanup unresolved: the rejected nested asyncio Future "
+                            "remained pending after the bounded cancellation-drain "
+                            "timeout elapsed."
+                        )
+                        return
 
             if result.cancelled():
                 return
+
+            # A Future subclass can finish before its underlying work does (for
+            # example, gather can finish on the first child's cancellation).
+            # Do not infer child completion or depend on private child attributes.
+            if type(result) is not asyncio.Future:
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected asyncio Future subclass is "
+                    "terminal, but completion of any underlying child work cannot "
+                    "be established from its public Future interface."
+                )
 
             try:
                 nested_result = result.result()
