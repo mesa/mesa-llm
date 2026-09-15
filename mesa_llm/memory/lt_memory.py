@@ -120,7 +120,8 @@ class LongTermMemory(Memory):
             *normalized_current_event_order,
         ]
 
-        self.buffer, self.step_content, self._step_event_order = candidate, {}, []
+        self.buffer, self.step_content = candidate, {}
+        self._reset_step_event_order()
         return (
             staged_entry,
             current_content,
@@ -197,7 +198,7 @@ class LongTermMemory(Memory):
             new_entry._event_order = list(self._step_event_order)
             self.buffer = new_entry
             self.step_content = {}
-            self._step_event_order = []
+            self._reset_step_event_order()
             return
 
         elif self.buffer and self.buffer.step is None:
@@ -227,7 +228,7 @@ class LongTermMemory(Memory):
             new_entry._event_order = list(self._step_event_order)
             self.buffer = new_entry
             self.step_content = {}
-            self._step_event_order = []
+            self._reset_step_event_order()
             return
 
         elif self.buffer and self.buffer.step is None:

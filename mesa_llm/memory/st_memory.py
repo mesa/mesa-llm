@@ -73,7 +73,7 @@ class ShortTermMemory(Memory):
             )
             self._current_step_entry._event_order = list(self._step_event_order)
             self.step_content = {}
-            self._step_event_order = []
+            self._reset_step_event_order()
             return
 
         new_entry = None
@@ -101,7 +101,7 @@ class ShortTermMemory(Memory):
             self.short_term_memory.append(new_entry)
             self._current_step_entry = None
             self.step_content = {}
-            self._step_event_order = []
+            self._reset_step_event_order()
 
         # Display the new entry
         if self.display and new_entry is not None:

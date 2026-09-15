@@ -166,6 +166,69 @@ class MemoryEntry:
             console.print(panel)
 
 
+class _EventOrder(list):
+    """A private list whose mutation version makes append validation cheap.
+
+    Plain lists supplied by legacy callers retain their identity and use the
+    conservative validation path instead. Increment before mutation because
+    operations such as extend or sort can change a list before raising.
+    """
+
+    _version = 0
+
+    def __init__(self, values=()):
+        self._version += 1
+        super().__init__(values)
+
+    def __setitem__(self, key, value):
+        self._version += 1
+        return super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._version += 1
+        return super().__delitem__(key)
+
+    def append(self, value):
+        self._version += 1
+        return super().append(value)
+
+    def extend(self, values):
+        self._version += 1
+        return super().extend(values)
+
+    def insert(self, index, value):
+        self._version += 1
+        return super().insert(index, value)
+
+    def pop(self, index=-1):
+        self._version += 1
+        return super().pop(index)
+
+    def remove(self, value):
+        self._version += 1
+        return super().remove(value)
+
+    def clear(self):
+        self._version += 1
+        return super().clear()
+
+    def reverse(self):
+        self._version += 1
+        return super().reverse()
+
+    def sort(self, *, key=None, reverse=False):
+        self._version += 1
+        return super().sort(key=key, reverse=reverse)
+
+    def __iadd__(self, values):
+        self._version += 1
+        return super().__iadd__(values)
+
+    def __imul__(self, count):
+        self._version += 1
+        return super().__imul__(count)
+
+
 class Memory(ABC):
     """
     Generic parent class for memory backends.
@@ -212,8 +275,9 @@ class Memory(ABC):
         if storage_key not in instance_state and isinstance(legacy_event_order, list):
             event_order = legacy_event_order
         else:
-            event_order = []
+            event_order = _EventOrder()
 
+        self.__dict__.pop("_step_event_order_cache", None)
         instance_state[storage_key] = event_order
         instance_state.pop("_step_event_order", None)
         return event_order
@@ -222,9 +286,14 @@ class Memory(ABC):
     def _step_event_order(self, event_order: list[str]) -> None:
         """Store an event-order buffer while preserving valid list identity."""
         if not isinstance(event_order, list):
-            event_order = []
+            event_order = _EventOrder()
+        self.__dict__.pop("_step_event_order_cache", None)
         self.__dict__[Memory._STEP_EVENT_ORDER_STORAGE_KEY] = event_order
         self.__dict__.pop("_step_event_order", None)
+
+    def _reset_step_event_order(self) -> None:
+        """Start a managed order buffer without retaining the previous step."""
+        self._step_event_order = _EventOrder()
 
     def __init__(
         self,
@@ -255,7 +324,7 @@ class Memory(ABC):
         self.display = display
 
         self.step_content: dict = {}
-        self._step_event_order: list[str] = []
+        self._reset_step_event_order()
         if additive_event_types is None:
             additive_event_types = {"message", "action"}
         self.additive_event_types = set(additive_event_types)
@@ -364,10 +433,27 @@ class Memory(ABC):
 
         if type in self.additive_event_types:
             event_order = self._step_event_order
-            event_order[:] = self._normalized_step_event_order(
-                self.step_content,
-                event_order,
-            )
+            # Count groups, not payloads: ordinary appends must not scan all
+            # prior events. The version also detects same-length sidecar edits.
+            counts = {
+                event_type: len(value) if isinstance(value, list) else 1
+                for event_type, value in self.step_content.items()
+                if event_type in self.additive_event_types
+            }
+            cached = self.__dict__.get("_step_event_order_cache")
+            if not (
+                isinstance(event_order, _EventOrder)
+                and cached is not None
+                and cached[0] is self.step_content
+                and cached[1] is event_order
+                and cached[2] == event_order._version
+                and cached[3] == self.additive_event_types
+                and cached[4] == counts
+            ):
+                event_order[:] = self._normalized_step_event_order(
+                    self.step_content,
+                    event_order,
+                )
 
             # Accumulate discrete events so concurrent entries are preserved
             existing = self.step_content.get(type)
@@ -379,6 +465,23 @@ class Memory(ABC):
                 # Migrate a legacy single-dict entry into a list
                 self.step_content[type] = [existing, content]
             event_order.append(type)
+            previous_count = counts.get(type, 0)
+            counts[type] = len(self.step_content[type])
+            if (
+                isinstance(event_order, _EventOrder)
+                and counts[type] == previous_count + 1
+                and all(isinstance(marker, str) for marker in counts)
+            ):
+                self._step_event_order_cache = (
+                    self.step_content,
+                    event_order,
+                    event_order._version,
+                    frozenset(self.additive_event_types),
+                    counts,
+                )
+            else:
+                # Keep plain legacy lists observable by their original aliases.
+                self.__dict__.pop("_step_event_order_cache", None)
         else:
             self.step_content[type] = content
 

@@ -141,7 +141,7 @@ class STLTMemory(Memory):
             new_entry._event_order = list(self._step_event_order)
             self.short_term_memory.append(new_entry)
             self.step_content = {}
-            self._step_event_order = []
+            self._reset_step_event_order()
             return None, []
 
         if not self.short_term_memory or self.short_term_memory[-1].step is not None:
@@ -170,7 +170,7 @@ class STLTMemory(Memory):
         ]
         self.short_term_memory.append(new_entry)
         self.step_content = {}
-        self._step_event_order = []
+        self._reset_step_event_order()
 
         evicted: list[MemoryEntry] = []
 
