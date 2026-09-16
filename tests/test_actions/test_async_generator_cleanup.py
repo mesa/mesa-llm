@@ -388,9 +388,7 @@ async def test_synchronous_rejection_on_active_loop_does_not_start_close(monkeyp
 
     generator = stream()
     await anext(generator)
-    manager, choice = _manager(
-        await _wrap(generator, "concurrent"), asynchronous=False
-    )
+    manager, choice = _manager(await _wrap(generator, "concurrent"), asynchronous=False)
     run = Mock(side_effect=AssertionError("must not nest the active loop"))
     monkeypatch.setattr(manager_module.asyncio, "run", run)
     try:
