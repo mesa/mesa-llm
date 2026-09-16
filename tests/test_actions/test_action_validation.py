@@ -1152,6 +1152,23 @@ def test_final_a10_execute_started_deferred_cleanup_failure_contract(
     )
 
     try:
+        if kind == "async-generator":
+            # Synchronous rejection leaves started async finalizers to their
+            # owning context; it does not execute them to discover a failure.
+            with pytest.raises(TypeError) as exc_info:
+                manager.execute(SimpleNamespace(), choice)
+            _assert_final_a10_deferred_result_error(
+                exc_info.value, "final_a10_sync_started_deferred"
+            )
+            notes = getattr(exc_info.value, "__notes__", ())
+            assert len(notes) == 1
+            assert "Cleanup unresolved" in notes[0]
+            assert "left untouched" in notes[0]
+            assert state.producer_calls == 1
+            assert state.body_calls == 1
+            assert state.cleanup_calls == 0
+            assert state.result.ag_frame is not None
+            return
         with pytest.raises(expected_error) as exc_info:
             manager.execute(SimpleNamespace(), choice)
 

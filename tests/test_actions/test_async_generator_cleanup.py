@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import mesa_llm.actions.action_manager as manager_module
+import mesa_llm.llm_agent as agent_module
 from mesa_llm.actions import ActionChoice, ActionManager, action
 from mesa_llm.llm_agent import LLMAgent
 
@@ -264,8 +265,6 @@ async def test_external_cancellation_is_not_converted_to_rejection():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entrypoint", ["aexecute_action", "aact"])
 async def test_timed_out_close_precedes_agent_observers(monkeypatch, entrypoint):
-    import mesa_llm.llm_agent as agent_module
-
     release = asyncio.Event()
 
     async def stream():
@@ -312,7 +311,7 @@ async def test_timed_out_close_precedes_agent_observers(monkeypatch, entrypoint)
 
 @pytest.mark.parametrize("wrapper_kind", ["direct", "concurrent", "asyncio", "task"])
 @pytest.mark.parametrize("suppress_cancellation", [False, True])
-def test_synchronous_close_returns_before_release_and_loop_shutdown(
+def test_synchronous_rejection_leaves_started_finalizer_untouched(
     wrapper_kind, suppress_cancellation
 ):
     entered = threading.Event()
@@ -362,17 +361,23 @@ def test_synchronous_close_returns_before_release_and_loop_shutdown(
     thread = threading.Thread(target=execute, daemon=True)
     thread.start()
     try:
-        assert entered.wait(1), "finalizer did not start"
         assert finished.wait(1), "synchronous rejection or loop shutdown blocked"
-        _assert_rejection(state.error, unresolved=True)
-        assert not state.release.is_set()
-        assert state.generator.ag_frame is None
-        assert state.loop.is_closed()
+        notes = _assert_rejection(state.error)
+        assert "cleanup unresolved" in notes
+        assert "left untouched" in notes
+        assert not entered.is_set()
+        assert state.release is None
+        assert state.generator.ag_frame is not None
+        assert state.loop is None
     finally:
         if not finished.is_set() and state.loop is not None:
             state.loop.call_soon_threadsafe(state.release.set)
         thread.join(timeout=2)
         assert not thread.is_alive()
+        # Owner teardown follows rejection assertions. Without a running
+        # loop, the finalizer fails at its first loop lookup before waiting.
+        with suppress(RuntimeError, StopIteration):
+            state.generator.aclose().send(None)
 
 
 @pytest.mark.asyncio
