@@ -309,9 +309,10 @@ async def test_manager_rejects_before_child_release(wrapper, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_async_close_does_not_create_a_helper_task():
+async def test_async_close_joins_its_driver_before_return():
     loop = asyncio.get_running_loop()
-    previous_factory = loop.get_task_factory()
+    before = asyncio.all_tasks()
+    drivers = []
     primary = TypeError("invalid action result")
     closed = []
 
@@ -319,6 +320,7 @@ async def test_async_close_does_not_create_a_helper_task():
         try:
             yield 1
         finally:
+            drivers.append(asyncio.current_task())
             waiter = loop.create_future()
             loop.call_soon(waiter.set_result, None)
             await waiter
@@ -328,16 +330,13 @@ async def test_async_close_does_not_create_a_helper_task():
     generator = stream()
     await anext(generator)
 
-    def forbidden_factory(*args, **kwargs):
-        raise AssertionError("cleanup scheduled a helper Task")
-
-    loop.set_task_factory(forbidden_factory)
     try:
         await close_asyncgen_best_effort(generator, primary, WATCHDOG)
         assert closed == [True]
         assert _notes(primary) == ""
+        assert drivers and all(task.done() for task in drivers)
+        assert asyncio.all_tasks() == before
     finally:
-        loop.set_task_factory(previous_factory)
         await generator.aclose()
 
 

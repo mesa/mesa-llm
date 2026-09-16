@@ -17,10 +17,34 @@ from mesa_llm.llm_agent import LLMAgent
 
 
 @pytest.fixture(autouse=True)
-def short_cleanup_budget(monkeypatch):
+def cleanup_budget(monkeypatch):
+    """Do not make scheduling speed part of successful-cleanup assertions."""
+    monkeypatch.setattr(
+        manager_module, "_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 10.0
+    )
+
+
+@pytest.fixture
+def short_cleanup_budget(monkeypatch, cleanup_budget):
+    """Use a short deadline only in tests that deliberately exhaust it."""
     monkeypatch.setattr(
         manager_module, "_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.03
     )
+
+
+async def _with_watchdog(awaitable):
+    execution = asyncio.create_task(awaitable)
+    try:
+        done, _ = await asyncio.wait({execution}, timeout=15)
+        assert execution in done, "cleanup did not finish before the test watchdog"
+        return execution.result()
+    finally:
+        if not execution.done():
+            execution.cancel()
+            await asyncio.wait({execution}, timeout=1)
+        if execution.done():
+            with suppress(BaseException):
+                execution.result()
 
 
 def _manager(payload, asynchronous=True):
@@ -85,6 +109,7 @@ def _assert_rejection(error, unresolved=False):
     "wrapper_kind", ["asyncio", "concurrent", "task", "mixed", "direct"]
 )
 @pytest.mark.parametrize("finalizer", ["waiting", "suppress-cancellation", "yielding"])
+@pytest.mark.usefixtures("short_cleanup_budget")
 async def test_waiting_finalizer_is_rejected_before_release(wrapper_kind, finalizer):
     release = asyncio.Event()
     entered = asyncio.Event()
@@ -173,7 +198,7 @@ async def test_prompt_finalizers_still_finish_before_rejection(wrapper_kind, fin
     manager, choice = _manager(payload)
     tasks_before = asyncio.all_tasks()
     with pytest.raises(TypeError) as exc_info:
-        await manager.aexecute(SimpleNamespace(), choice)
+        await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
     assert _assert_rejection(exc_info.value) == ""
     assert generator.ag_frame is None
     assert events == ["closed"]
@@ -198,7 +223,7 @@ async def test_finalizer_errors_remain_cleanup_notes(wrapper_kind, failure_type)
     assert await anext(generator) == 1
     manager, choice = _manager(await _wrap(generator, wrapper_kind))
     with pytest.raises(TypeError) as exc_info:
-        await manager.aexecute(SimpleNamespace(), choice)
+        await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
     notes = _assert_rejection(exc_info.value)
     assert "finalizer failure" in notes
     assert "cleanup unresolved" not in notes
@@ -224,7 +249,7 @@ async def test_finalizer_base_exception_retains_identity():
     await anext(generator)
     manager, choice = _manager(await _wrap(generator, "concurrent"))
     with pytest.raises(CleanupAbort) as exc_info:
-        await manager.aexecute(SimpleNamespace(), choice)
+        await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
     assert exc_info.value is failure
     assert generator.ag_frame is None
 
@@ -264,6 +289,7 @@ async def test_external_cancellation_is_not_converted_to_rejection():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entrypoint", ["aexecute_action", "aact"])
+@pytest.mark.usefixtures("short_cleanup_budget")
 async def test_timed_out_close_precedes_agent_observers(monkeypatch, entrypoint):
     release = asyncio.Event()
 
@@ -418,7 +444,7 @@ async def test_unstarted_and_closed_generators_do_not_run_the_body():
     for _ in range(2):
         manager, choice = _manager(await _wrap(generator, "concurrent"))
         with pytest.raises(TypeError) as exc_info:
-            await manager.aexecute(SimpleNamespace(), choice)
+            await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
         assert _assert_rejection(exc_info.value) == ""
         assert generator.ag_frame is None
     assert events == []
@@ -426,37 +452,35 @@ async def test_unstarted_and_closed_generators_do_not_run_the_body():
 
 
 @pytest.mark.asyncio
-async def test_close_does_not_schedule_helper_tasks():
+async def test_cleanup_driver_is_finished_before_rejection():
     events = []
+    drivers = []
 
     async def stream():
         try:
             yield 1
         finally:
+            drivers.append(asyncio.current_task())
             await asyncio.sleep(0)
             events.append("closed")
 
     generator = stream()
     await anext(generator)
     manager, choice = _manager(await _wrap(generator, "concurrent"))
-    loop = asyncio.get_running_loop()
-    original_factory = loop.get_task_factory()
-
-    def forbidden_factory(*args, **kwargs):
-        raise AssertionError("async-generator cleanup scheduled a new Task")
-
-    loop.set_task_factory(forbidden_factory)
+    tasks_before = asyncio.all_tasks()
     try:
         with pytest.raises(TypeError) as exc_info:
-            await manager.aexecute(SimpleNamespace(), choice)
+            await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
         assert _assert_rejection(exc_info.value) == ""
         assert events == ["closed"]
+        assert drivers and all(task.done() for task in drivers)
+        assert asyncio.all_tasks() == tasks_before
     finally:
-        loop.set_task_factory(original_factory)
         await generator.aclose()
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("short_cleanup_budget")
 async def test_cleanup_failure_during_timeout_keeps_primary_rejection():
     async def stream():
         try:
@@ -471,13 +495,14 @@ async def test_cleanup_failure_during_timeout_keeps_primary_rejection():
     await anext(generator)
     manager, choice = _manager(await _wrap(generator, "concurrent"))
     with pytest.raises(TypeError) as exc_info:
-        await manager.aexecute(SimpleNamespace(), choice)
+        await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
     notes = _assert_rejection(exc_info.value, unresolved=True)
     assert "failure during close interruption" in notes
     assert generator.ag_frame is None
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("short_cleanup_budget")
 async def test_finalizer_that_refuses_interruption_is_diagnosed(recwarn):
     events = []
     release = asyncio.Event()
@@ -498,7 +523,7 @@ async def test_finalizer_that_refuses_interruption_is_diagnosed(recwarn):
     manager, choice = _manager(await _wrap(generator, "concurrent"))
     before = asyncio.all_tasks()
     with pytest.raises(TypeError) as exc_info:
-        await manager.aexecute(SimpleNamespace(), choice)
+        await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
     notes = _assert_rejection(exc_info.value, unresolved=True)
     assert "ignored generatorexit" in notes
     assert asyncio.all_tasks() == before
@@ -537,7 +562,7 @@ async def test_finalizer_can_handle_its_awaited_future_being_cancelled(wrapper_k
     await anext(generator)
     manager, choice = _manager(await _wrap(generator, wrapper_kind))
     with pytest.raises(TypeError) as exc_info:
-        await manager.aexecute(SimpleNamespace(), choice)
+        await _with_watchdog(manager.aexecute(SimpleNamespace(), choice))
     assert _assert_rejection(exc_info.value) == ""
     assert events == ["handled"]
     assert generator.ag_frame is None

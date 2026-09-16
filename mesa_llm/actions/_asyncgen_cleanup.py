@@ -1,4 +1,4 @@
-"""Best-effort async-generator closure without dependent cancellation waits."""
+"""Best-effort closure with separate finalizer and caller cancellation scopes."""
 
 import asyncio
 import contextlib
@@ -44,20 +44,31 @@ def _interrupt_close(close, primary_error, cancellation):
     else:
         note = (
             "Cleanup unresolved: the rejected async-generator ignored GeneratorExit "
-            "while its close was interrupted; no helper Task was scheduled."
+            "while its close was interrupted; its driver will not resume it."
         )
-    # The timeout's caller receives primary_error; an external canceller receives
-    # cancellation. Neither outcome may be replaced by an ordinary close failure.
     primary_error.add_note(note)
-    cancellation.add_note(note)
+    if cancellation is not None:
+        cancellation.add_note(note)
 
 
-async def _drive_close(generator, primary_error):
-    """Resume close steps without making cancellation depend on awaited work."""
-    close = generator.aclose()
+async def _drive_close(generator, primary_error, stop):
+    """Deliver local cancellation normally; an independent signal stops closure.
+
+    The driver never directly awaits user work. Its local timeout scopes may
+    cancel this Task without affecting the action-execution Task. The caller's
+    stop signal is not cancellation and cannot be swallowed by those scopes.
+    Return failures as values so BaseExceptions remain under caller control,
+    rather than escaping from a separate Task into the event loop.
+    """
     try:
+        if stop.done():
+            return None
+        close = generator.aclose()
         pending = close.send(None)
         while True:
+            if stop.done():
+                _interrupt_close(close, primary_error, stop.result())
+                return None
             try:
                 if pending is None:
                     await asyncio.sleep(0)
@@ -70,21 +81,36 @@ async def _drive_close(generator, primary_error):
                         raise RuntimeError(
                             "Async-generator cleanup awaited a foreign loop."
                         )
-                    # Consuming the native await's yield replaces Task.__step at
-                    # this boundary. Reset its protocol flag as Task would do.
+                    # Replace Task.__step's consumption of the native await yield.
                     pending._asyncio_future_blocking = False
-                    # wait() uses a separate waiter and removes its callback on
-                    # cancellation. Never await or cancel the child directly:
-                    # its cancellation/finally may itself wait indefinitely.
-                    await asyncio.wait({pending})
-            except asyncio.CancelledError as cancellation:
-                _interrupt_close(close, primary_error, cancellation)
-                raise
+                    while True:
+                        try:
+                            await asyncio.wait(
+                                {pending, stop}, return_when=asyncio.FIRST_COMPLETED
+                            )
+                        except asyncio.CancelledError as error:
+                            if stop.done() or pending.done():
+                                raise
+                            # Cancellation originating in the finalizer keeps
+                            # native child-cancellation semantics. Waiting for
+                            # that child is still interruptible by the caller's
+                            # independent stop signal.
+                            message = error.args[0] if error.args else None
+                            if not pending.cancel(msg=message):
+                                raise
+                        else:
+                            break
             except BaseException as error:
+                if stop.done():
+                    _interrupt_close(close, primary_error, stop.result())
+                    return None
+                # In particular, a finalizer-local timeout must receive its own
+                # CancelledError so __aexit__ can convert it to TimeoutError.
                 pending = close.throw(error)
             else:
-                # A cancelled awaited object is a normal await outcome, not
-                # cancellation of the execution Task. Deliver it to the finalizer.
+                if stop.done():
+                    _interrupt_close(close, primary_error, stop.result())
+                    return None
                 try:
                     value = None if pending is None else pending.result()
                 except BaseException as error:
@@ -92,29 +118,68 @@ async def _drive_close(generator, primary_error):
                 else:
                     pending = close.send(value)
     except StopIteration:
-        return
+        return None
+    except BaseException as error:
+        return error
 
 
 async def close_asyncgen_best_effort(generator, primary_error, timeout):
-    """Close within a cooperative budget or report unresolved cleanup.
+    """Supervise closure within budget and finish its driver before returning.
 
-    No helper Task is created. Timeout and external cancellation stop this
-    driver without cancelling or draining awaited work; that work remains its
-    owner's responsibility. Synchronous user code that never yields cannot be
-    preempted. Ordinary finalizer failures retain the caller's exception policy.
+    Finalizer timeouts use a separate Task, while the caller's deadline waits
+    independently of user work. On caller timeout or cancellation, signal the
+    driver to interrupt once without cancelling or draining user-owned children. The
+    driver is joined before rejection/cancellation returns, not left running.
+    The two Tasks share the caller's context so context-variable tokens remain
+    valid. Synchronous user code that never yields cannot be preempted.
     """
-    budget = asyncio.timeout(timeout)
+    loop = asyncio.get_running_loop()
+    caller = asyncio.current_task()
+    stop = loop.create_future()
+    coroutine = _drive_close(generator, primary_error, stop)
     try:
-        async with budget:
-            await _drive_close(generator, primary_error)
-    except TimeoutError:
-        if not budget.expired():
-            raise
+        # Explicit non-eager start avoids re-entering the shared Context while
+        # the caller is still running, including with an eager loop factory.
+        driver = asyncio.Task(
+            coroutine, loop=loop, context=caller.get_context(), eager_start=False
+        )
+    except BaseException:
+        coroutine.close()
+        raise
+    cancellation = None
+    note_start = len(getattr(primary_error, "__notes__", ()))
+    try:
+        done, _ = await asyncio.wait({driver}, timeout=timeout)
+        if driver in done:
+            failure = driver.result()
+            if failure is not None:
+                raise failure
+            return
+        primary_error.add_note(
+            "Cleanup unresolved: the rejected async-generator did not finish "
+            "closing within the bounded cleanup timeout; its finalizer was "
+            "interrupted and may be incomplete. The framework did not cancel "
+            "or drain awaited work."
+        )
+    except asyncio.CancelledError as error:
+        cancellation = error
     finally:
-        if budget.expired():
-            primary_error.add_note(
-                "Cleanup unresolved: the rejected async-generator did not finish "
-                "closing within the bounded cleanup timeout; its finalizer was "
-                "interrupted and may be incomplete. Awaited work was not cancelled "
-                "or drained; no helper Task was scheduled."
-            )
+        # The caller does not cancel the driver or its awaited child. The stop
+        # signal wakes the driver's independent waiter even if the child has an
+        # indefinitely waiting cancellation finalizer.
+        if not stop.done():
+            stop.set_result(cancellation)
+        while not driver.done():
+            try:
+                await asyncio.shield(driver)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        if cancellation is not None:
+            for note in getattr(primary_error, "__notes__", ())[note_start:]:
+                if note not in getattr(cancellation, "__notes__", ()):
+                    cancellation.add_note(note)
+            raise cancellation
+    failure = driver.result()
+    if failure is not None:
+        raise failure
