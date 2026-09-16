@@ -9,7 +9,6 @@ from unittest.mock import Mock
 
 import pytest
 
-import mesa_llm.actions._asyncgen_cleanup as cleanup_module
 import mesa_llm.actions.action_manager as manager_module
 from mesa_llm.actions import ActionChoice, ActionManager, action
 from mesa_llm.actions._asyncgen_cleanup import (
@@ -133,7 +132,7 @@ async def test_external_cancellation_survives_interruption_failure(
                     await release.wait()
                 else:
                     await child
-            except GeneratorExit:
+            except (asyncio.CancelledError, GeneratorExit):
                 raise failure_type("secondary interruption failure") from None
 
     generator = stream()
@@ -363,18 +362,10 @@ async def test_abandoned_waiter_is_not_cancelled_after_timeout():
 
 
 @pytest.mark.asyncio
-async def test_external_cancellation_object_is_preserved(monkeypatch):
-
+async def test_external_cancellation_object_is_preserved():
     caught_inside = []
-    interrupt = cleanup_module._interrupt_close
     entered = asyncio.Event()
     primary = TypeError("invalid action result")
-
-    def observe(close, error, cancellation):
-        caught_inside.append(cancellation)
-        interrupt(close, error, cancellation)
-
-    monkeypatch.setattr(cleanup_module, "_interrupt_close", observe)
 
     async def stream():
         try:
@@ -383,7 +374,8 @@ async def test_external_cancellation_object_is_preserved(monkeypatch):
             try:
                 entered.set()
                 await asyncio.Event().wait()
-            except GeneratorExit:
+            except asyncio.CancelledError as cancellation:
+                caught_inside.append(cancellation)
                 raise ValueError("interrupted") from None
 
     generator = stream()
