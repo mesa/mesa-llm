@@ -55,55 +55,56 @@ model = NegotiationModel(
     seed=model_params["seed"]["value"],
 )
 
-if __name__ == "__main__":
 
-    def model_portrayal(agent):
-        if agent is None:
-            return
+def model_portrayal(agent):
+    if agent is None:
+        return
 
-        portrayal = {
-            "size": 25,
-        }
+    portrayal = {
+        "size": 25,
+    }
 
-        if isinstance(agent, SellerAgent):
-            portrayal["color"] = "tab:red"
-            portrayal["marker"] = "o"
-            portrayal["zorder"] = 2
-        elif isinstance(agent, BuyerAgent):
-            portrayal["color"] = "tab:blue"
-            portrayal["marker"] = "o"
-            portrayal["zorder"] = 1
+    if isinstance(agent, SellerAgent):
+        portrayal["color"] = "tab:red"
+        portrayal["marker"] = "o"
+        portrayal["zorder"] = 2
+    elif isinstance(agent, BuyerAgent):
+        portrayal["color"] = "tab:blue"
+        portrayal["marker"] = "o"
+        portrayal["zorder"] = 1
 
-        return portrayal
+    return portrayal
 
-    @solara.component
-    def ShowSalesButton(*args, **kwargs):
-        show = solara.use_reactive(False)
-        df = solara.use_memo(
-            lambda: (
-                model.datacollector.get_model_vars_dataframe()
-                if show.value
-                else pd.DataFrame()
-            ),
-            [show.value],
-        )
 
-        def on_click():
-            show.set(True)
-
-        solara.Button(label="Show Sales Data", on_click=on_click)
-        if show.value and not df.empty:
-            solara.DataFrame(df)
-
-    page = SolaraViz(
-        model,
-        components=[
-            make_space_component(model_portrayal),
-            ShowSalesButton,
-        ],  # Add ShowSalesButton here
-        model_params=model_params,
-        name="Negotiation",
+@solara.component
+def ShowSalesButton(*args, **kwargs):
+    show = solara.use_reactive(False)
+    df = solara.use_memo(
+        lambda: (
+            model.datacollector.get_model_vars_dataframe()
+            if show.value
+            else pd.DataFrame()
+        ),
+        [show.value],
     )
+
+    def on_click():
+        show.set(True)
+
+    solara.Button(label="Show Sales Data", on_click=on_click)
+    if show.value and not df.empty:
+        solara.DataFrame(df)
+
+
+page = SolaraViz(
+    model,
+    components=[
+        make_space_component(model_portrayal),
+        ShowSalesButton,
+    ],
+    model_params=model_params,
+    name="Negotiation",
+)
 
 
 """run with:

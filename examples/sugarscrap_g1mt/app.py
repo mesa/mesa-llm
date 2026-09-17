@@ -109,19 +109,17 @@ space_component = make_space_component(
 
 chart_component = make_plot_component({"Total_Sugar": "blue", "Total_Spice": "red"})
 
-if __name__ == "__main__":
-    page = SolaraViz(
-        model,
-        components=[
-            space_component,
-            chart_component,
-        ],
-        model_params=model_params,
-        name="SugarScape G1MT Example",
-    )
+page = SolaraViz(
+    model,
+    components=[
+        space_component,
+        chart_component,
+    ],
+    model_params=model_params,
+    name="SugarScape G1MT Example",
+)
 
-    """
-    run with
-    cd examples/sugarscrap_g1mt
-    conda activate mesa-llm && solara run app.py
-    """
+"""run with
+cd examples/sugarscrap_g1mt
+conda activate mesa-llm && solara run app.py
+"""
