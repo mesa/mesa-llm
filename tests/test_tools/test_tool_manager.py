@@ -1,3 +1,5 @@
+import gc
+import weakref
 from unittest.mock import Mock
 
 import pytest
@@ -25,7 +27,7 @@ class TestToolManager:
         # Clear global registry to start fresh
         _GLOBAL_TOOL_REGISTRY.clear()
         _TOOL_CALLBACKS.clear()
-        # Clear instances list
+        # Clear instances registry
         ToolManager.instances.clear()
 
     def teardown_method(self):
@@ -262,6 +264,70 @@ class TestToolManager:
 
         assert "shared_tool" in manager1.tools
         assert "shared_tool" in manager2.tools
+
+    def test_unreferenced_manager_is_garbage_collected(self):
+        """The instance registry must not keep managers alive (#336)."""
+        manager = ToolManager()
+        manager_ref = weakref.ref(manager)
+
+        del manager
+        gc.collect()
+
+        assert manager_ref() is None
+        assert len(ToolManager.instances) == 0
+
+    def test_add_tool_to_all_skips_collected_managers(self):
+        """Broadcasting reaches live managers only, not discarded ones."""
+        live_manager = ToolManager()
+        for _ in range(100):
+            ToolManager()
+        gc.collect()
+
+        def shared_tool(agent, value: str) -> str:
+            """Shared tool.
+            Args:
+                agent: The agent making the request (provided automatically)
+                value: Input value.
+            Returns:
+                The input value.
+            """
+            return value
+
+        ToolManager.add_tool_to_all(shared_tool)
+
+        assert list(ToolManager.instances) == [live_manager]
+        assert "shared_tool" in live_manager.tools
+
+    def test_add_tool_to_all_tolerates_manager_created_mid_broadcast(self):
+        """A manager created while broadcasting must not abort the broadcast.
+
+        Simulates another thread (e.g. an agent spawned during a threaded
+        step) constructing a ToolManager while ``add_tool_to_all`` iterates.
+        """
+        managers = [ToolManager(), ToolManager()]
+        spawned = []
+
+        def spawning_register(fn):
+            if not spawned:
+                spawned.append(ToolManager())
+            ToolManager.register(managers[0], fn)
+
+        managers[0].register = spawning_register
+
+        def shared_tool(agent, value: str) -> str:
+            """Shared tool.
+            Args:
+                agent: The agent making the request (provided automatically)
+                value: Input value.
+            Returns:
+                The input value.
+            """
+            return value
+
+        ToolManager.add_tool_to_all(shared_tool)
+
+        assert all("shared_tool" in m.tools for m in managers)
+        assert spawned[0] in ToolManager.instances
 
     def test_get_tool_schema_deprecated_alias(self):
         """Deprecated single-tool schema alias still works."""

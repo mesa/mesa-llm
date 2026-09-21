@@ -5,7 +5,9 @@ import copy
 import inspect
 import json
 import logging
+import threading
 import warnings
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, get_type_hints
 
@@ -31,11 +33,12 @@ class ToolManager:
 
     Attributes:
         - tools: A dictionary of tools of the form {tool_name: tool_function}. E.g. {"get_current_weather": get_current_weather}.
-        - **instances** (class-level list) - ToolManager instances.
+        - **instances** (class-level ``weakref.WeakSet``) - Live ToolManager instances.
+          Weakly referenced, so registering a manager never keeps it alive.
 
     Methods:
         - **register(fn)** - Register tool function to this manager
-        - **add_tool_to_all(fn)** - Add tool to all ToolManager instances
+        - **add_tool_to_all(fn)** - Add tool to all live ToolManager instances
         - **get_tools_schema(tools=<inherit>)** → *list[dict]* - Get OpenAI-compatible schemas
         - **call_tools(agent, llm_response)** → *list[dict]* - Execute LLM-recommended tools
         - **has_tool(name)** → *bool* - Check if tool is registered
@@ -49,14 +52,16 @@ class ToolManager:
         6. **Result Handling**: Tool outputs are captured and added to agent memory for future reasoning
     """
 
-    instances: ClassVar[list["ToolManager"]] = []
+    instances: ClassVar["weakref.WeakSet[ToolManager]"] = weakref.WeakSet()
+    _instances_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
         tools: list[ToolRef] | tuple[ToolRef, ...] | None = None,
         extra_tools: dict[str, Callable] | None = None,
     ):
-        ToolManager.instances.append(self)
+        with ToolManager._instances_lock:
+            ToolManager.instances.add(self)
         self.tools: dict[str, Callable] = {}
 
         if tools is not None:
@@ -82,8 +87,12 @@ class ToolManager:
 
     @classmethod
     def add_tool_to_all(cls, fn: Callable):
-        """Add a tool to all instances"""
-        for instance in cls.instances:
+        """Add a tool to all live instances"""
+        # Snapshot under the lock: a WeakSet raises if another thread adds a
+        # manager while it is being iterated.
+        with cls._instances_lock:
+            live_instances = list(cls.instances)
+        for instance in live_instances:
             instance.register(fn)
 
     def _get_tool_schema(self, tool: ToolRef, schema_name: str | None = None) -> dict:
