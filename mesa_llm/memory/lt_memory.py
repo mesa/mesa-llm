@@ -1,9 +1,12 @@
-from typing import TYPE_CHECKING
+from collections import deque
+from typing import TYPE_CHECKING, Any
 
-from mesa_llm.memory.memory import Memory, MemoryEntry
+from mesa_llm.memory.memory import Memory, MemoryEntry, _format_message_entry
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
+
+_DEFAULT_COMMUNICATION_HISTORY_CAPACITY = 50
 
 
 class LongTermMemory(Memory):
@@ -16,6 +19,8 @@ class LongTermMemory(Memory):
         llm_model : the model to use for the summarization
         additive_event_types : event types accumulated as lists within a step.
             Defaults to ``{"message", "action"}``.
+        communication_history_capacity : number of most recent messages kept
+            verbatim for ``get_communication_history()``. Defaults to 50.
 
     """
 
@@ -26,6 +31,7 @@ class LongTermMemory(Memory):
         llm_model: str = "openai/gpt-4o-mini",
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
+        communication_history_capacity: int = _DEFAULT_COMMUNICATION_HISTORY_CAPACITY,
     ):
         """
         Initialize long-term memory.
@@ -38,10 +44,21 @@ class LongTermMemory(Memory):
             additive_event_types : event types that accumulate multiple values
                 within a step instead of overwriting. Defaults to
                 ``{"message", "action"}``.
+            communication_history_capacity : number of most recent messages
+                kept verbatim for ``get_communication_history()``
         """
         if not llm_model:
             raise ValueError(
                 "llm_model must be provided for the usage of long term memory"
+            )
+        if (
+            not isinstance(communication_history_capacity, int)
+            or isinstance(communication_history_capacity, bool)
+            or communication_history_capacity < 1
+        ):
+            raise ValueError(
+                "communication_history_capacity must be a positive integer, "
+                f"got {communication_history_capacity!r}"
             )
 
         super().__init__(
@@ -53,6 +70,11 @@ class LongTermMemory(Memory):
         )
 
         self.long_term_memory = ""
+        # Consolidation folds messages into a prose summary, so keep the most
+        # recent ones verbatim as (step, message) pairs.
+        self._messages: deque[tuple[int, Any]] = deque(
+            maxlen=communication_history_capacity
+        )
         self.system_prompt = """
             You are a helpful assistant that summarizes all memory entries and stores it into long-term.
             The long term memory should be a summary of the individual memory entries such that it is concise and informative.
@@ -62,6 +84,19 @@ class LongTermMemory(Memory):
             self.system_prompt += f" This is the prompt of the problem you will be tackling:{self.agent.step_prompt}, ensure you summarize the memory entries into long-term a way that is relevant to the problem at hand."
 
         self.llm.system_prompt = self.system_prompt
+
+    @property
+    def _message_log(self) -> deque[tuple[int, Any]]:
+        # Instances unpickled from older versions predate the message log.
+        log = self.__dict__.get("_messages")
+        if log is None:
+            log = self._messages = deque(maxlen=_DEFAULT_COMMUNICATION_HISTORY_CAPACITY)
+        return log
+
+    def add_to_memory(self, type: str, content: dict):
+        super().add_to_memory(type, content)
+        if type == "message":
+            self._message_log.append((self.agent.model.steps, content))
 
     def _build_consolidation_prompt(self) -> str:
         """
@@ -256,4 +291,7 @@ class LongTermMemory(Memory):
         """
         Get the communication history
         """
-        return "communication history is in memory of the agent"
+        return "\n".join(
+            f"Step {step}: {_format_message_entry(msg)}\n\n"
+            for step, msg in self._message_log
+        )
