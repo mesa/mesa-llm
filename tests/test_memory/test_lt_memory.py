@@ -4,6 +4,7 @@ import pytest
 
 from mesa_llm.memory.lt_memory import LongTermMemory
 from mesa_llm.memory.memory import MemoryEntry
+from mesa_llm.reasoning.react import ReActReasoning
 
 
 class TestLTMemory:
@@ -151,3 +152,113 @@ class TestLTMemory:
             assert memory.long_term_memory == "mocked async summary"
             assert memory.step_content == {}
             assert memory.buffer.step is not None
+
+
+class TestLTMemoryCommunicationHistory:
+    """``get_communication_history`` must return real messages (#327)."""
+
+    @staticmethod
+    def _memory(mock_agent, **kwargs):
+        return LongTermMemory(
+            agent=mock_agent, llm_model="provider/test_model", display=False, **kwargs
+        )
+
+    def test_empty_history_is_empty_string(self, mock_agent):
+        """Falsy when there are no messages, so ReAct adds no section."""
+        memory = self._memory(mock_agent)
+        memory.add_to_memory("observation", {"content": "obs"})
+
+        assert memory.get_communication_history() == ""
+
+    def test_renders_messages_like_other_backends(self, mock_agent):
+        memory = self._memory(mock_agent)
+        mock_agent.model.steps = 4
+        memory.add_to_memory("message", {"message": "offer 20", "sender": 7})
+        memory.add_to_memory("plan", {"content": "secret plan"})
+        memory.add_to_memory(
+            "message", {"message": "counter 25", "sender": 123, "recipients": [7]}
+        )
+
+        history = memory.get_communication_history()
+
+        assert history.index("Step 4: Agent 7 says: offer 20") < history.index(
+            "Step 4: Agent 123 says: counter 25"
+        )
+        assert "secret plan" not in history
+
+    def test_message_visible_before_consolidation(self, mock_agent):
+        """A message received between steps is visible while planning."""
+        memory = self._memory(mock_agent)
+        memory.add_to_memory("message", {"message": "offer 20", "sender": 7})
+
+        memory.process_step(pre_step=True)
+
+        assert "Agent 7 says: offer 20" in memory.get_communication_history()
+
+    def test_history_survives_consolidation_exactly_once(
+        self, mock_agent, llm_response_factory
+    ):
+        """Summarization neither drops nor duplicates messages, even on retry."""
+        memory = self._memory(mock_agent)
+        memory.add_to_memory("message", {"message": "offer 20", "sender": 7})
+        memory.process_step(pre_step=True)
+
+        with (
+            patch.object(memory.llm, "generate", side_effect=RuntimeError("down")),
+            pytest.raises(RuntimeError),
+        ):
+            memory.process_step()
+        with patch.object(
+            memory.llm, "generate", return_value=llm_response_factory("summary")
+        ):
+            memory.process_step()
+
+        assert memory.long_term_memory == "summary"
+        assert memory.get_communication_history().count("offer 20") == 1
+
+    @pytest.mark.asyncio
+    async def test_async_messages_are_recorded(self, mock_agent):
+        memory = self._memory(mock_agent)
+
+        await memory.aadd_to_memory("message", {"message": "hi", "sender": 9})
+
+        assert "Agent 9 says: hi" in memory.get_communication_history()
+
+    def test_history_is_bounded(self, mock_agent):
+        memory = self._memory(mock_agent, communication_history_capacity=2)
+        for i in range(3):
+            memory.add_to_memory("message", {"message": f"m{i}", "sender": i})
+
+        history = memory.get_communication_history()
+
+        assert "m0" not in history
+        assert "m1" in history
+        assert "m2" in history
+
+    def test_instance_from_older_version_records_messages(self, mock_agent):
+        """Memories unpickled from before the message log still work."""
+        memory = self._memory(mock_agent)
+        del memory.__dict__["_messages"]
+
+        assert memory.get_communication_history() == ""
+        memory.add_to_memory("message", {"message": "hi", "sender": 9})
+        assert "Agent 9 says: hi" in memory.get_communication_history()
+
+    @pytest.mark.parametrize("capacity", [0, -1, 1.5, True])
+    def test_invalid_capacity_rejected(self, mock_agent, capacity):
+        with pytest.raises(ValueError, match="communication_history_capacity"):
+            self._memory(mock_agent, communication_history_capacity=capacity)
+
+    def test_react_prompt_uses_real_history(self, mock_agent):
+        """The placeholder no longer leaks into ReAct prompts."""
+        memory = self._memory(mock_agent)
+        mock_agent.memory = memory
+        reasoning = ReActReasoning(agent=mock_agent)
+
+        assert reasoning.get_react_prompt(obs=None) == [memory.get_prompt_ready()]
+
+        memory.add_to_memory("message", {"message": "offer 20", "sender": 7})
+        prompt = "\n".join(reasoning.get_react_prompt(obs=None))
+
+        assert "Agent 7 says: offer 20" in prompt
+        assert "communication history is in memory of the agent" not in prompt
