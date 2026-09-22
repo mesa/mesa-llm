@@ -1,3 +1,7 @@
+import gc
+import sys
+import threading
+import weakref
 from unittest.mock import Mock
 
 import pytest
@@ -25,7 +29,7 @@ class TestToolManager:
         # Clear global registry to start fresh
         _GLOBAL_TOOL_REGISTRY.clear()
         _TOOL_CALLBACKS.clear()
-        # Clear instances list
+        # Clear instances registry
         ToolManager.instances.clear()
 
     def teardown_method(self):
@@ -1256,3 +1260,94 @@ class TestToolManager:
         assert len(result) == 1
         assert result[0]["tool_call_id"] == "call_async"
         assert "Async: hello" in result[0]["response"]
+
+
+def test_tool_manager_can_be_garbage_collected():
+    """Regression test for #336.
+
+    A ToolManager with no other referents must be collectible once it is
+    only weakly reachable through ``ToolManager.instances``; a strong
+    reference there would keep it alive indefinitely.
+    """
+    manager = ToolManager()
+    manager_ref = weakref.ref(manager)
+
+    del manager
+    gc.collect()
+
+    assert manager_ref() is None
+
+
+def test_add_tool_to_all_skips_collected_managers():
+    """A manager that has already been garbage-collected must not receive
+    tools broadcast via ``add_tool_to_all`` after the fact, and must not
+    prevent the broadcast from reaching managers that are still alive."""
+    ToolManager.instances.clear()
+    kept = ToolManager()
+    discarded = ToolManager()
+    discarded_ref = weakref.ref(discarded)
+
+    del discarded
+    gc.collect()
+    assert discarded_ref() is None  # sanity check on the test setup itself
+
+    def dummy_tool():
+        return "ok"
+
+    dummy_tool.__name__ = "dummy_tool"
+    ToolManager.add_tool_to_all(dummy_tool)
+
+    assert "dummy_tool" in kept.tools
+
+
+def test_add_tool_to_all_tolerates_manager_created_mid_broadcast():
+    """Regression test for the concurrency issue found while fixing #336.
+
+    ``add_tool_to_all`` must not raise when a new ``ToolManager`` is
+    constructed on another thread while a broadcast is in progress. This
+    reproduces most reliably with a tight thread-switch interval, since the
+    race window is narrow under normal scheduling.
+    """
+    ToolManager.instances.clear()
+    errors = []
+    stop = threading.Event()
+    made = 0
+    max_managers = 20000  # bound the constructor loop so it can't run away
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.00001)
+    try:
+
+        def dummy_tool():
+            return "ok"
+
+        dummy_tool.__name__ = "dummy_tool"
+
+        def constructor_loop():
+            nonlocal made
+            while not stop.is_set() and made < max_managers:
+                try:
+                    ToolManager()
+                    made += 1
+                except Exception as e:
+                    errors.append(e)
+                    return
+
+        def broadcaster_loop():
+            for _ in range(500):
+                try:
+                    ToolManager.add_tool_to_all(dummy_tool)
+                except Exception as e:
+                    errors.append(e)
+
+        constructor_thread = threading.Thread(target=constructor_loop, daemon=True)
+        broadcaster_thread = threading.Thread(target=broadcaster_loop, daemon=True)
+        constructor_thread.start()
+        broadcaster_thread.start()
+        broadcaster_thread.join(timeout=15)
+        stop.set()
+        constructor_thread.join(timeout=5)
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert not errors, f"raised under concurrent construction: {errors[0]!r}"
