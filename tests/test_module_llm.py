@@ -12,7 +12,7 @@ from litellm.exceptions import (
 )
 from tenacity import wait_none
 
-from mesa_llm.module_llm import ModuleLLM
+from mesa_llm.module_llm import DEFAULT_MAX_RETRIES, ModuleLLM
 
 _RETRYABLE_TRANSPORT_ERRORS = (
     APIConnectionError,
@@ -585,3 +585,97 @@ class TestModuleLLM:
 
         with pytest.raises(ValueError, match="Invalid or unsupported model"):
             await llm.agenerate(prompt="Hello, how are you?")
+
+
+class TestBoundedRetries:
+    """Transient failures must eventually surface instead of retrying forever (#266)."""
+
+    @staticmethod
+    def _always_failing(calls, error_type=Timeout):
+        def _complete(**kwargs):
+            calls.append(kwargs)
+            raise _make_retryable_transport_error(error_type)
+
+        return _complete
+
+    def test_generate_gives_up_after_max_retries(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.completion", self._always_failing(calls)
+        )
+        llm = ModuleLLM(llm_model="openai/gpt-4o", max_retries=2)
+        generate_without_wait = ModuleLLM.generate.retry_with(wait=wait_none())
+
+        with pytest.raises(Timeout):
+            generate_without_wait(llm, prompt="Never succeeds.")
+
+        assert len(calls) == 3  # initial attempt + 2 retries
+
+    def test_generate_uses_default_retry_budget(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.completion", self._always_failing(calls)
+        )
+        llm = ModuleLLM(llm_model="openai/gpt-4o")
+        generate_without_wait = ModuleLLM.generate.retry_with(wait=wait_none())
+
+        with pytest.raises(Timeout):
+            generate_without_wait(llm, prompt="Never succeeds.")
+
+        assert len(calls) == DEFAULT_MAX_RETRIES + 1
+
+    def test_generate_without_retries_calls_provider_once(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.completion", self._always_failing(calls)
+        )
+        llm = ModuleLLM(llm_model="openai/gpt-4o", max_retries=0)
+        generate_without_wait = ModuleLLM.generate.retry_with(wait=wait_none())
+
+        with pytest.raises(Timeout):
+            generate_without_wait(llm, prompt="Never succeeds.")
+
+        assert len(calls) == 1
+
+    def test_rate_limit_error_surfaces_after_retry_budget(self, monkeypatch):
+        """The rewritten rate-limit message is reachable, not retried forever (#257)."""
+        calls = []
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.completion",
+            self._always_failing(calls, RateLimitError),
+        )
+        llm = ModuleLLM(llm_model="gemini/gemini-2.0-flash", max_retries=1)
+        generate_without_wait = ModuleLLM.generate.retry_with(wait=wait_none())
+
+        with pytest.raises(RateLimitError) as exc_info:
+            generate_without_wait(llm, prompt="Out of quota.")
+
+        assert len(calls) == 2
+        assert "Rate limit exceeded for model 'gemini/gemini-2.0-flash'" in str(
+            exc_info.value
+        )
+
+    @pytest.mark.asyncio
+    async def test_agenerate_gives_up_after_max_retries(self, monkeypatch):
+        calls = []
+
+        async def _complete(**kwargs):
+            await asyncio.sleep(0)
+            calls.append(kwargs)
+            raise _make_retryable_transport_error(Timeout)
+
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.wait_exponential", lambda **kwargs: wait_none()
+        )
+        monkeypatch.setattr("mesa_llm.module_llm.acompletion", _complete)
+        llm = ModuleLLM(llm_model="openai/gpt-4o", max_retries=2)
+
+        with pytest.raises(Timeout):
+            await llm.agenerate(prompt="Never succeeds.")
+
+        assert len(calls) == 3
+
+    @pytest.mark.parametrize("max_retries", [-1, 1.5, True, "3"])
+    def test_invalid_max_retries_rejected(self, max_retries):
+        with pytest.raises(ValueError, match="max_retries"):
+            ModuleLLM(llm_model="openai/gpt-4o", max_retries=max_retries)

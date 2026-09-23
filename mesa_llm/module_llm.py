@@ -12,7 +12,13 @@ from litellm.exceptions import (
     RateLimitError,
     Timeout,
 )
-from tenacity import AsyncRetrying, retry, retry_if_exception, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 RETRYABLE_EXCEPTIONS = (
     APIConnectionError,
@@ -21,9 +27,29 @@ RETRYABLE_EXCEPTIONS = (
 )
 _ONE_SHOT_COMPLETION = ContextVar("mesa_llm_one_shot_completion", default=False)
 
+#: Retries attempted after the initial request before the error is raised.
+DEFAULT_MAX_RETRIES = 5
+
 
 def _should_retry_completion(error: BaseException) -> bool:
     return not _ONE_SHOT_COMPLETION.get() and isinstance(error, RETRYABLE_EXCEPTIONS)
+
+
+def _max_attempts(max_retries: int) -> int:
+    return max_retries + 1
+
+
+def _stop_after_configured_retries(retry_state) -> bool:
+    """Bound retries by the calling instance's ``max_retries``.
+
+    ``generate`` is decorated once at class creation, so the limit cannot be
+    read from ``self`` there. Resolving it per call from the bound instance
+    keeps the limit configurable while leaving the decorator (and the
+    ``__wrapped__`` / ``retry_with`` helpers tests rely on) intact.
+    """
+    instance = retry_state.args[0] if retry_state.args else None
+    max_retries = getattr(instance, "max_retries", DEFAULT_MAX_RETRIES)
+    return retry_state.attempt_number >= _max_attempts(max_retries)
 
 
 load_dotenv()
@@ -42,6 +68,7 @@ class ModuleLLM:
         llm_model: str,
         api_base: str | None = None,
         system_prompt: str | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ):
         """
         Initialize the LLM module
@@ -51,11 +78,25 @@ class ModuleLLM:
                 "{provider}/{model}" (for example, "openai/gpt-4o").
             api_base: The API base to use if the LLM provider is Ollama
             system_prompt: The system prompt to use for the LLM
+            max_retries: How many times a transient failure (timeout,
+                connection error, rate limit) is retried before the error is
+                raised. ``0`` disables retrying.
 
         Raises:
             ValueError: If llm_model is not in the expected "{provider}/{model}"
-                format, or if the provider API key is missing.
+                format, if the provider API key is missing, or if max_retries is
+                not a non-negative integer.
         """
+        if (
+            not isinstance(max_retries, int)
+            or isinstance(max_retries, bool)
+            or max_retries < 0
+        ):
+            raise ValueError(
+                f"max_retries must be a non-negative integer, got {max_retries!r}"
+            )
+
+        self.max_retries = max_retries
         self.api_base = api_base
         self.llm_model = llm_model
         self.system_prompt = system_prompt
@@ -225,6 +266,7 @@ class ModuleLLM:
 
     @retry(
         wait=wait_exponential(multiplier=1, min=1, max=60),
+        stop=_stop_after_configured_retries,
         retry=retry_if_exception(_should_retry_completion),
         reraise=True,
     )
@@ -290,6 +332,7 @@ class ModuleLLM:
         messages = self._build_messages(prompt, system_prompt=system_prompt)
         async for attempt in AsyncRetrying(
             wait=wait_exponential(multiplier=1, min=1, max=60),
+            stop=stop_after_attempt(_max_attempts(self.max_retries)),
             retry=retry_if_exception(_should_retry_completion),
             reraise=True,
         ):
