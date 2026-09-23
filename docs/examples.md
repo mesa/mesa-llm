@@ -37,3 +37,15 @@ Implementation of Epstein & Axtell’s classic Sugarscape (G1MT) model, where Tr
 - Resource regeneration and environmental dynamics
 - Marginal Rate of Substitution (MRS)-driven economic behavior
 - Emergent price equilibrium and wealth distribution
+
+## Information Cascade Model
+
+Implementation of a financial market simulation where LLM-powered quantitative traders make buy/sell/hold decisions based on market rumors and memory consolidation.
+
+**Location:** [examples/information_cascade](https://github.com/projectmesa/mesa-llm/tree/main/examples/information_cascade)
+
+This example demonstrates:
+- Emergent herd behavior and "Information Cascades" in financial markets
+- High-frequency `STLTMemory` consolidation stress testing
+- Latency benchmarking for LLM-powered memory modules
+- Custom robust Solara-based UI for asynchronous agent interactions
