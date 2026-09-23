@@ -34,7 +34,7 @@ async def step_agents_parallel(agents: list[Agent | LLMAgent]) -> None:
 
 async def _sync_step(agent: Agent) -> None:
     """Run synchronous step in async context."""
-    agent.step()
+    await asyncio.to_thread(agent.step)
 
 
 def step_agents_multithreaded(agents: list[Agent | LLMAgent]) -> None:
