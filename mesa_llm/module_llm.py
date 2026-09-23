@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from collections.abc import Iterator
@@ -24,6 +25,62 @@ _ONE_SHOT_COMPLETION = ContextVar("mesa_llm_one_shot_completion", default=False)
 
 def _should_retry_completion(error: BaseException) -> bool:
     return not _ONE_SHOT_COMPLETION.get() and isinstance(error, RETRYABLE_EXCEPTIONS)
+
+
+#: Longest provider detail kept when no readable message can be extracted.
+_MAX_PROVIDER_DETAIL_CHARS = 200
+_LITELLM_ERROR_PREFIX = "litellm.RateLimitError: "
+
+
+def _find_nested_value(payload: object, keys: tuple[str, ...]) -> str | None:
+    """Return the first value stored under any of ``keys``, at any depth."""
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in keys and isinstance(value, str | int | float):
+                return str(value)
+            found = _find_nested_value(value, keys)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_nested_value(item, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _condense_provider_detail(detail: str) -> tuple[str, str | None]:
+    """Summarize a provider error payload into one readable line.
+
+    Providers answer HTTP 429 with a JSON quota report that is tens of lines
+    long. Only the human-readable message and the retry delay are useful to a
+    modeller, so the rest is dropped. Payloads that are already short, or that
+    cannot be parsed, are collapsed to a single truncated line instead.
+
+    Returns:
+        The condensed detail and the retry delay, if the provider reported one.
+    """
+    start = detail.find("{")
+    end = detail.rfind("}")
+    if start != -1 and end > start:
+        try:
+            payload = json.loads(detail[start : end + 1])
+        except ValueError:
+            payload = None
+        if payload is not None:
+            message = _find_nested_value(payload, ("message",))
+            if message:
+                retry_after = _find_nested_value(
+                    payload, ("retryDelay", "retry_delay", "retry-after")
+                )
+                prefix = detail[:start].strip()
+                condensed = f"{prefix} {message}".strip() if prefix else message
+                return " ".join(condensed.split()), retry_after
+
+    collapsed = " ".join(detail.split())
+    if len(collapsed) > _MAX_PROVIDER_DETAIL_CHARS:
+        collapsed = f"{collapsed[: _MAX_PROVIDER_DETAIL_CHARS - 1]}\u2026"
+    return collapsed, None
 
 
 load_dotenv()
@@ -168,12 +225,17 @@ class ModuleLLM:
             "xai": "https://docs.x.ai/developers/rate-limits",
         }.get(provider)
 
-        detail = error.message.removeprefix("litellm.RateLimitError: ").strip()
+        detail = error.message.strip()
+        while detail.startswith(_LITELLM_ERROR_PREFIX):
+            detail = detail.removeprefix(_LITELLM_ERROR_PREFIX).strip()
+        detail, retry_after = _condense_provider_detail(detail)
+
         message_parts = [f"Rate limit exceeded for model '{self.llm_model}'."]
         if detail:
             message_parts.append(detail)
+        wait_advice = retry_after or "a few minutes"
         message_parts.append(
-            "Please wait a few minutes and try again, or switch to a different model."
+            f"Please wait {wait_advice} and try again, or switch to a different model."
         )
         if docs_url:
             message_parts.append(f"To check your quota visit: {docs_url}")
