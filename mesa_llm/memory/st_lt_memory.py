@@ -35,6 +35,7 @@ class STLTMemory(Memory):
         consolidation_capacity: int = 2,
         display: bool = True,
         llm_model: str | None = None,
+        fallback_model: str | None = None,
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
     ):

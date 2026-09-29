@@ -3,6 +3,7 @@ import os
 
 from dotenv import load_dotenv
 from litellm import acompletion, completion, litellm
+from litellm import Router
 from litellm.exceptions import (
     APIConnectionError,
     NotFoundError,
@@ -19,6 +20,7 @@ RETRYABLE_EXCEPTIONS = (
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 class ModuleLLM:
@@ -31,6 +33,7 @@ class ModuleLLM:
     def __init__(
         self,
         llm_model: str,
+        fallback_model: str | None = None,
         api_base: str | None = None,
         system_prompt: str | None = None,
     ):
@@ -49,7 +52,31 @@ class ModuleLLM:
         """
         self.api_base = api_base
         self.llm_model = llm_model
+        self.fallback_model = fallback_model
         self.system_prompt = system_prompt
+
+        if self.fallback_model:
+                self.router = Router(
+                    model_list=[
+                        {
+                            "model_name": "primary",
+                            "litellm_params": {
+                                "model": self.llm_model,
+                            },
+                        },
+                        {
+                            "model_name": "fallback",
+                            "litellm_params": {
+                                "model": self.fallback_model,
+                            },
+                        },
+                    ],
+                    fallbacks=[
+                        {"primary": ["fallback"]}
+                    ],
+                )
+        else:
+            self.router = None
 
         if "/" not in llm_model:
             raise ValueError(
@@ -210,7 +237,6 @@ class ModuleLLM:
         messages = self._build_messages(prompt, system_prompt=system_prompt)
 
         completion_kwargs = {
-            "model": self.llm_model,
             "messages": messages,
             "tools": tool_schema,
             "tool_choice": tool_choice if tool_schema else None,
@@ -220,7 +246,29 @@ class ModuleLLM:
             completion_kwargs["api_base"] = self.api_base
 
         try:
-            response = completion(**completion_kwargs)
+            if self.router:
+                logger.warning(
+                    "Primary model '%s' failed; trying fallback route via LiteLLM router.",
+                    self.llm_model,
+                )
+                response = self.router.completion(
+                    model="primary",
+                    **completion_kwargs,
+                )
+            else:
+                response = completion(
+                    model=self.llm_model,
+                    api_base=self.api_base,
+                    **completion_kwargs,
+                )
+                actual_model = response.get("model", "unknown")
+
+                logger.info(
+                    "LLM request handled by model: %s",
+                    actual_model,
+                )
+
+                return response
         except RateLimitError as error:
             raise self._build_rate_limit_error(error) from error
         except NotFoundError as error:
@@ -251,17 +299,43 @@ class ModuleLLM:
         ):
             with attempt:
                 completion_kwargs = {
-                    "model": self.llm_model,
                     "messages": messages,
                     "tools": tool_schema,
                     "tool_choice": tool_choice if tool_schema else None,
                     "response_format": response_format,
                 }
+                if tool_schema:
+                    completion_kwargs["tools"] = tool_schema
+                    completion_kwargs["tool_choice"] = tool_choice
+
+                if response_format:
+                    completion_kwargs["response_format"] = response_format
                 if self.api_base:
                     completion_kwargs["api_base"] = self.api_base
 
                 try:
-                    response = await acompletion(**completion_kwargs)
+                    if self.router:
+                        logger.warning(
+                            "Primary model '%s' failed; trying fallback route via LiteLLM router.",
+                            self.llm_model,
+                        )
+                        response = await self.router.acompletion(
+                            model="primary",
+                            **completion_kwargs,
+                        )
+                    else:
+                        response = await acompletion(
+                            model=self.llm_model,
+                            api_base=self.api_base,
+                            **completion_kwargs,
+                        )
+                        actual_model = response.get("model", "unknown")
+
+                        logger.info(
+                            "LLM request handled by model: %s", actual_model
+                        )
+
+                        return response
                 except RateLimitError as error:
                     raise self._build_rate_limit_error(error) from error
                 except NotFoundError as error:
