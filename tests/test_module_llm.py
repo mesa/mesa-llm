@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from unittest.mock import patch
@@ -12,7 +13,7 @@ from litellm.exceptions import (
 )
 from tenacity import wait_none
 
-from mesa_llm.module_llm import ModuleLLM
+from mesa_llm.module_llm import _MAX_PROVIDER_DETAIL_CHARS, ModuleLLM
 
 _RETRYABLE_TRANSPORT_ERRORS = (
     APIConnectionError,
@@ -585,3 +586,146 @@ class TestModuleLLM:
 
         with pytest.raises(ValueError, match="Invalid or unsupported model"):
             await llm.agenerate(prompt="Hello, how are you?")
+
+
+_GEMINI_QUOTA_PAYLOAD = {
+    "error": {
+        "code": 429,
+        "message": (
+            "You exceeded your current quota, please check your plan and "
+            "billing details."
+        ),
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [
+                    {
+                        "quotaMetric": (
+                            "generativelanguage.googleapis.com/"
+                            "generate_content_free_tier_requests"
+                        ),
+                        "quotaId": (
+                            "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+                        ),
+                        "quotaValue": "15",
+                    }
+                ],
+            },
+            {
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": "27s",
+            },
+        ],
+    }
+}
+
+
+def _gemini_quota_error():
+    return RateLimitError(
+        "litellm.RateLimitError: VertexAIException - "
+        + json.dumps(_GEMINI_QUOTA_PAYLOAD, indent=2),
+        "gemini",
+        "gemini/gemini-2.0-flash",
+    )
+
+
+class TestRateLimitErrorReadability:
+    """A quota error must read as one sentence, not a JSON dump (#257)."""
+
+    def _raise_on_generate(self, monkeypatch, error):
+        def _raise(**kwargs):
+            raise error
+
+        monkeypatch.setattr("mesa_llm.module_llm.completion", _raise)
+        llm = ModuleLLM(llm_model="gemini/gemini-2.0-flash")
+        with pytest.raises(RateLimitError) as exc_info:
+            ModuleLLM.generate.__wrapped__(llm, prompt="Out of quota.")
+        return str(exc_info.value)
+
+    def test_quota_payload_is_condensed(self, monkeypatch):
+        message = self._raise_on_generate(monkeypatch, _gemini_quota_error())
+
+        assert "\n" not in message
+        assert len(message) < 400
+        assert "You exceeded your current quota" in message
+        assert "quotaMetric" not in message
+        assert "@type" not in message
+
+    def test_provider_retry_delay_is_surfaced(self, monkeypatch):
+        message = self._raise_on_generate(monkeypatch, _gemini_quota_error())
+
+        assert "Please wait 27s and try again" in message
+        assert "https://ai.google.dev/gemini-api/docs/rate-limits" in message
+
+    def test_duplicated_litellm_prefix_is_stripped(self, monkeypatch):
+        error = RateLimitError(
+            "litellm.RateLimitError: litellm.RateLimitError: quota exhausted",
+            "gemini",
+            "gemini/gemini-2.0-flash",
+        )
+
+        message = self._raise_on_generate(monkeypatch, error)
+
+        assert message.count("litellm.RateLimitError:") == 1
+        assert "quota exhausted" in message
+
+    def test_short_plain_detail_is_preserved(self, monkeypatch):
+        error = RateLimitError(
+            "per-minute limit hit", "gemini", "gemini/gemini-2.0-flash"
+        )
+
+        message = self._raise_on_generate(monkeypatch, error)
+
+        assert "per-minute limit hit" in message
+        assert "Please wait a few minutes and try again" in message
+
+    def test_unparsable_payload_is_truncated_to_one_line(self, monkeypatch):
+        error = RateLimitError(
+            "ProviderException - {broken json\n" + "x" * 500,
+            "gemini",
+            "gemini/gemini-2.0-flash",
+        )
+
+        message = self._raise_on_generate(monkeypatch, error)
+
+        assert "\n" not in message
+        assert "…" in message
+        assert message.count("x") <= _MAX_PROVIDER_DETAIL_CHARS
+
+    @pytest.mark.asyncio
+    async def test_agenerate_condenses_quota_payload(self, monkeypatch):
+        class _SingleAttempt:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _SingleAsyncRetrying:
+            def __init__(self, **kwargs):
+                self._yielded = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._yielded:
+                    raise StopAsyncIteration
+                self._yielded = True
+                return _SingleAttempt()
+
+        async def _raise(**kwargs):
+            raise _gemini_quota_error()
+
+        monkeypatch.setattr("mesa_llm.module_llm.AsyncRetrying", _SingleAsyncRetrying)
+        monkeypatch.setattr("mesa_llm.module_llm.acompletion", _raise)
+
+        llm = ModuleLLM(llm_model="gemini/gemini-2.0-flash")
+        with pytest.raises(RateLimitError) as exc_info:
+            await llm.agenerate(prompt="Out of quota.")
+
+        message = str(exc_info.value)
+        assert "\n" not in message
+        assert "You exceeded your current quota" in message
+        assert "Please wait 27s and try again" in message
