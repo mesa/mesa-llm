@@ -3,7 +3,6 @@ import os
 
 from dotenv import load_dotenv
 from litellm import acompletion, completion, litellm
-from litellm import Router
 from litellm.exceptions import (
     APIConnectionError,
     NotFoundError,
@@ -20,7 +19,6 @@ RETRYABLE_EXCEPTIONS = (
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 
 class ModuleLLM:
@@ -54,29 +52,7 @@ class ModuleLLM:
         self.llm_model = llm_model
         self.fallback_model = fallback_model
         self.system_prompt = system_prompt
-
-        if self.fallback_model:
-                self.router = Router(
-                    model_list=[
-                        {
-                            "model_name": "primary",
-                            "litellm_params": {
-                                "model": self.llm_model,
-                            },
-                        },
-                        {
-                            "model_name": "fallback",
-                            "litellm_params": {
-                                "model": self.fallback_model,
-                            },
-                        },
-                    ],
-                    fallbacks=[
-                        {"primary": ["fallback"]}
-                    ],
-                )
-        else:
-            self.router = None
+        self._fallback_active = False
 
         if "/" not in llm_model:
             raise ValueError(
@@ -97,9 +73,17 @@ class ModuleLLM:
             try:
                 self.api_key = os.environ[f"{provider}_API_KEY"]
             except KeyError as err:
-                raise ValueError(
-                    f"No API key found for {provider}. Please set the {provider}_API_KEY environment variable (e.g., in your .env file)."
-                ) from err
+                if self.fallback_model is not None:
+                    logger.warning(
+                        "Primary provider '%s' API key is missing; fallback model '%s' will be used when the primary call is attempted.",
+                        provider,
+                        self.fallback_model,
+                    )
+                    self.api_key = None
+                else:
+                    raise ValueError(
+                        f"No API key found for {provider}. Please set the {provider}_API_KEY environment variable (e.g., in your .env file)."
+                    ) from err
 
         try:
             litellm.get_model_info(model=self.llm_model)
@@ -115,6 +99,21 @@ class ModuleLLM:
                     "%s does not support function calling. This model may not be able to use tools. Please check the model documentation at https://docs.litellm.ai/docs/providers for more information.",
                     self.llm_model,
                 )
+
+    @property
+    def active_model(self) -> str:
+        if self._fallback_active and self.fallback_model:
+            return self.fallback_model
+        return self.llm_model
+
+    def _switch_to_fallback(self):
+        if self.fallback_model and not self._fallback_active:
+            self._fallback_active = True
+            logger.warning(
+                "Primary model '%s' failed; switching permanently to fallback model '%s'.",
+                self.llm_model,
+                self.fallback_model,
+            )
 
     def _build_invalid_model_error(self, error: Exception) -> ValueError:
         provider = self.llm_model.split("/", 1)[0].lower()
@@ -245,40 +244,42 @@ class ModuleLLM:
         if self.api_base:
             completion_kwargs["api_base"] = self.api_base
 
+        model_to_use = self.active_model
+
         try:
-            if self.router:
-                logger.warning(
-                    "Primary model '%s' failed; trying fallback route via LiteLLM router.",
-                    self.llm_model,
-                )
-                response = self.router.completion(
-                    model="primary",
-                    **completion_kwargs,
-                )
-            else:
-                response = completion(
-                    model=self.llm_model,
-                    api_base=self.api_base,
-                    **completion_kwargs,
-                )
-                actual_model = response.get("model", "unknown")
-
-                logger.info(
-                    "LLM request handled by model: %s",
-                    actual_model,
-                )
-
-                return response
-        except RateLimitError as error:
-            raise self._build_rate_limit_error(error) from error
-        except NotFoundError as error:
-            raise self._build_invalid_model_error(error) from error
+            response = completion(
+                model=model_to_use,
+                **completion_kwargs,
+            )
+            actual_model = response.get("model", "unknown")
+            logger.info("LLM request handled by model: %s", actual_model)
+            return response
         except Exception as error:
-            if str(error).startswith("This model isn't mapped yet."):
+            if (
+                self.fallback_model
+                and not self._fallback_active
+                and model_to_use == self.llm_model
+            ):
+                self._switch_to_fallback()
+                try:
+                    response = completion(
+                        model=self.fallback_model,
+                        **completion_kwargs,
+                    )
+                    actual_model = response.get("model", "unknown")
+                    logger.info(
+                        "LLM request handled by fallback model: %s",
+                        actual_model,
+                    )
+                    return response
+                except Exception:
+                    raise
+
+            if isinstance(error, RateLimitError):
+                raise self._build_rate_limit_error(error) from error
+            if isinstance(error, NotFoundError):
                 raise self._build_invalid_model_error(error) from error
             raise
-
-        return response
 
     async def agenerate(
         self,
@@ -304,44 +305,47 @@ class ModuleLLM:
                     "tool_choice": tool_choice if tool_schema else None,
                     "response_format": response_format,
                 }
-                if tool_schema:
-                    completion_kwargs["tools"] = tool_schema
-                    completion_kwargs["tool_choice"] = tool_choice
-
-                if response_format:
-                    completion_kwargs["response_format"] = response_format
                 if self.api_base:
                     completion_kwargs["api_base"] = self.api_base
 
+                model_to_use = self.active_model
+
                 try:
-                    if self.router:
-                        logger.warning(
-                            "Primary model '%s' failed; trying fallback route via LiteLLM router.",
-                            self.llm_model,
-                        )
-                        response = await self.router.acompletion(
-                            model="primary",
-                            **completion_kwargs,
-                        )
-                    else:
-                        response = await acompletion(
-                            model=self.llm_model,
-                            api_base=self.api_base,
-                            **completion_kwargs,
-                        )
-                        actual_model = response.get("model", "unknown")
-
-                        logger.info(
-                            "LLM request handled by model: %s", actual_model
-                        )
-
-                        return response
-                except RateLimitError as error:
-                    raise self._build_rate_limit_error(error) from error
-                except NotFoundError as error:
-                    raise self._build_invalid_model_error(error) from error
+                    response = await acompletion(
+                        model=model_to_use,
+                        **completion_kwargs,
+                    )
+                    actual_model = response.get("model", "unknown")
+                    logger.info("LLM request handled by model: %s", actual_model)
+                    return response
                 except Exception as error:
+                    if (
+                        self.fallback_model
+                        and not self._fallback_active
+                        and model_to_use == self.llm_model
+                    ):
+                        self._switch_to_fallback()
+                        try:
+                            response = await acompletion(
+                                model=self.fallback_model,
+                                **completion_kwargs,
+                            )
+                            actual_model = response.get("model", "unknown")
+                            logger.info(
+                                "LLM request handled by fallback model: %s",
+                                actual_model,
+                            )
+                            return response
+                        except Exception:
+                            raise
+
+                    # Treat unmapped-model message from litellm as an invalid model
                     if str(error).startswith("This model isn't mapped yet."):
+                        raise self._build_invalid_model_error(error) from error
+
+                    if isinstance(error, RateLimitError):
+                        raise self._build_rate_limit_error(error) from error
+                    if isinstance(error, NotFoundError):
                         raise self._build_invalid_model_error(error) from error
                     raise
         return response

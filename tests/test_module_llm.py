@@ -48,6 +48,50 @@ class TestModuleLLM:
         with patch.dict(os.environ, {}, clear=True), pytest.raises(ValueError):
             ModuleLLM(llm_model="openai/gpt-4o")
 
+    def test_fallback_model_allows_missing_primary_key(self, monkeypatch):
+        # Missing primary API key with fallback configured
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        llm = ModuleLLM(
+            llm_model="openai/gpt-4o",
+            fallback_model="ollama/llama3",
+        )
+
+        assert llm.api_key is None
+        assert llm.active_model == "openai/gpt-4o"
+
+    
+    def test_generate_switches_to_fallback_when_primary_fails(self, monkeypatch):
+        calls = []
+
+        def fake_completion(**kwargs):
+            calls.append(kwargs["model"])
+
+            if kwargs["model"] == "openai/gpt-4o":
+                raise ValueError("primary failed")
+
+            return {
+                "model": "ollama/llama3",
+                "choices": [
+                    {"message": {"content": "ok"}}
+                ],
+            }
+
+        monkeypatch.setattr(
+            "mesa_llm.module_llm.completion",
+            fake_completion,
+        )
+
+        llm = ModuleLLM(
+            llm_model="openai/gpt-4o",
+            fallback_model="ollama/llama3",
+        )
+
+        response = llm.generate(prompt="hello")
+
+        assert response is not None
+        assert calls == ["openai/gpt-4o", "ollama/llama3"]
+
     def test_build_messages(self):
         # Test _build_messages with string prompt
         llm = ModuleLLM(llm_model="openai/gpt-4o")

@@ -133,6 +133,7 @@ class Memory(ABC):
         self,
         agent: "LLMAgent",
         llm_model: str | None = None,
+        fallback_model: str | None = None,
         display: bool = True,
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
@@ -153,7 +154,7 @@ class Memory(ABC):
         """
         self.agent = agent
         if llm_model:
-            self.llm = ModuleLLM(llm_model=llm_model, api_base=api_base)
+            self.llm = ModuleLLM(llm_model=llm_model, fallback_model=fallback_model, api_base=api_base)
 
         self.display = display
 

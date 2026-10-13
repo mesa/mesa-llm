@@ -59,6 +59,7 @@ class STLTMemory(Memory):
         super().__init__(
             agent=agent,
             llm_model=llm_model,
+            fallback_model=fallback_model,
             api_base=api_base,
             display=display,
             additive_event_types=additive_event_types,
