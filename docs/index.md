@@ -77,6 +77,7 @@ maxdepth: 2
 hidden: true
 ---
 Getting Started <getting_started>
+Migration Guide <migration_guide>
 Overview <overview>
 Tutorials <tutorials/index>
 Examples <examples>
