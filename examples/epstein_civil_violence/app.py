@@ -96,16 +96,15 @@ chart_component = make_plot_component(
     {state.name.lower(): agent_colors[state] for state in CitizenState}
 )
 
-if __name__ == "__main__":
-    page = SolaraViz(
-        model,
-        components=[
-            space_component,
-            chart_component,
-        ],  # Add ShowSalesButton here
-        model_params=model_params,
-        name="Espstein Civil Violence Model",
-    )
+page = SolaraViz(
+    model,
+    components=[
+        space_component,
+        chart_component,
+    ],
+    model_params=model_params,
+    name="Epstein Civil Violence Model",
+)
 
 
 """run with:
