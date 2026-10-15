@@ -337,7 +337,9 @@ class ToolManager:
             if inspect.iscoroutinefunction(function_to_call):
                 function_response = await function_to_call(**filtered_args)
             else:
-                function_response = function_to_call(**filtered_args)
+                function_response = await asyncio.to_thread(
+                    function_to_call, **filtered_args
+                )
 
             # Only treat None as empty
             if function_response is None:
