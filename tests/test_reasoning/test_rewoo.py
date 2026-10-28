@@ -134,7 +134,8 @@ class TestReWOOReasoning:
 
         assert isinstance(result, Plan)
         assert result.ttl == 4
-        assert reasoning.remaining_tool_calls == 2
+        assert reasoning.remaining_tool_calls == 1
+        assert len(result.llm_plan.tool_calls) == 1
         assert reasoning.current_plan == mock_exec_response.choices[0].message
         assert reasoning.current_obs is not None
         reasoning.execute_tool_call.assert_called_once_with(
@@ -173,7 +174,7 @@ class TestReWOOReasoning:
         result = reasoning.plan(prompt="Custom prompt")
 
         assert isinstance(result, Plan)
-        assert reasoning.remaining_tool_calls == 1
+        assert reasoning.remaining_tool_calls == 0
 
     def test_plan_with_custom_tool_calls(self, llm_response_factory, mock_agent):
         """Test plan method forwards a custom execution tool choice."""
@@ -276,7 +277,7 @@ class TestReWOOReasoning:
 
         assert continuation.tools == tools
         assert continuation.llm_plan.tool_calls == [
-            mock_exec_response.choices[0].message.tool_calls[0]
+            mock_exec_response.choices[0].message.tool_calls[1]
         ]
 
     def test_plan_uses_scoped_system_prompt(self, llm_response_factory, mock_agent):
@@ -453,7 +454,8 @@ class TestReWOOReasoning:
 
         assert isinstance(result, Plan)
         assert result.ttl == 7
-        assert reasoning.remaining_tool_calls == 3
+        assert reasoning.remaining_tool_calls == 2
+        assert len(result.llm_plan.tool_calls) == 1
         assert reasoning.current_plan == mock_exec_response.choices[0].message
         assert reasoning.current_obs is not None
         reasoning.aexecute_tool_call.assert_called_once_with(
@@ -618,7 +620,7 @@ class TestReWOOReasoning:
 
         assert continuation.tools == tools
         assert continuation.llm_plan.tool_calls == [
-            mock_exec_response.choices[0].message.tool_calls[0]
+            mock_exec_response.choices[0].message.tool_calls[1]
         ]
 
     def test_aplan_uses_scoped_system_prompt(self, llm_response_factory, mock_agent):
@@ -959,3 +961,37 @@ class TestReWOOSignatureConsistency:
         result = asyncio.run(reasoning.aplan(ttl=5))
         assert isinstance(result, Plan)
         assert result.ttl == 5
+
+    def test_each_planned_tool_call_is_returned_once(
+        self, llm_response_factory, mock_agent
+    ):
+        """A fresh plan and its replays return every tool call exactly once."""
+        mock_agent.step_prompt = "Default step prompt"
+        mock_agent.memory = Mock()
+        mock_agent.memory.add_to_memory = Mock()
+        mock_agent.tool_manager = Mock()
+        mock_agent.tool_manager.get_tools_schema.return_value = {}
+        exec_message = (
+            llm_response_factory(
+                content="Execution plan",
+                tool_calls=[_tool_call("a"), _tool_call("b"), _tool_call("c")],
+            )
+            .choices[0]
+            .message
+        )
+
+        reasoning = ReWOOReasoning(mock_agent)
+        reasoning.execute_tool_call = Mock(
+            return_value=Plan(step=1, llm_plan=exec_message)
+        )
+        mock_agent.llm.generate.return_value = llm_response_factory(content="plan")
+
+        returned = []
+        for _ in range(3):
+            plan = reasoning.plan(
+                obs=Observation(step=1, self_state={}, local_state={})
+            )
+            returned.extend(call.id for call in plan.llm_plan.tool_calls)
+
+        assert returned == ["a", "b", "c"]
+        assert reasoning.execute_tool_call.call_count == 1
