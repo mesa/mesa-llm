@@ -104,7 +104,7 @@ if __name__ == "__main__":
             chart_component,
         ],  # Add ShowSalesButton here
         model_params=model_params,
-        name="Espstein Civil Violence Model",
+        name="Esptein Civil Violence Model",
     )
 
 
