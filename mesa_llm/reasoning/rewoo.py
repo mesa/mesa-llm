@@ -111,6 +111,18 @@ class ReWOOReasoning(Reasoning):
         """
         return system_prompt
 
+    def _start_plan(self, rewoo_plan: Plan, tools: ToolSelection | object) -> Plan:
+        """Return the first planned tool call and queue the rest for later steps."""
+        tool_calls = getattr(rewoo_plan.llm_plan, "tool_calls", None) or []
+        self.current_plan = rewoo_plan.llm_plan
+        self.current_tools = tools
+        self.remaining_tool_calls = max(len(tool_calls) - 1, 0)
+        if self.remaining_tool_calls:
+            first_call = copy.copy(rewoo_plan.llm_plan)
+            first_call.tool_calls = tool_calls[:1]
+            rewoo_plan.llm_plan = first_call
+        return rewoo_plan
+
     def plan(
         self,
         prompt: str | None = None,
@@ -190,14 +202,7 @@ class ReWOOReasoning(Reasoning):
         rewoo_plan = self.execute_tool_call(
             rsp.choices[0].message.content, **execute_kwargs
         )
-        # Count the number of tool calls in the response and set remaining_tool_calls
-        self.remaining_tool_calls = len(
-            getattr(rewoo_plan.llm_plan, "tool_calls", None) or []
-        )
-        self.current_plan = rewoo_plan.llm_plan
-        self.current_tools = tools
-
-        return rewoo_plan
+        return self._start_plan(rewoo_plan, tools)
 
     async def aplan(
         self,
@@ -274,11 +279,4 @@ class ReWOOReasoning(Reasoning):
         rewoo_plan = await self.aexecute_tool_call(
             rsp.choices[0].message.content, **execute_kwargs
         )
-        # Count the number of tool calls in the response and set remaining_tool_calls
-        self.remaining_tool_calls = len(
-            getattr(rewoo_plan.llm_plan, "tool_calls", None) or []
-        )
-        self.current_plan = rewoo_plan.llm_plan
-        self.current_tools = tools
-
-        return rewoo_plan
+        return self._start_plan(rewoo_plan, tools)
