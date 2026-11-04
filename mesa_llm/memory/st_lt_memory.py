@@ -35,6 +35,7 @@ class STLTMemory(Memory):
         consolidation_capacity: int = 2,
         display: bool = True,
         llm_model: str | None = None,
+        fallback_model: str | None = None,
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
     ):
@@ -58,6 +59,7 @@ class STLTMemory(Memory):
         super().__init__(
             agent=agent,
             llm_model=llm_model,
+            fallback_model=fallback_model,
             api_base=api_base,
             display=display,
             additive_event_types=additive_event_types,
