@@ -24,6 +24,8 @@ def geometric_mean(list_of_prices):
     """
     find the geometric mean of a list of prices
     """
+    if not list_of_prices or any(p <= 0 for p in list_of_prices):
+        return 0.0
     return np.exp(np.log(list_of_prices).mean())
 
 
@@ -155,14 +157,14 @@ if __name__ == "__main__":
     """
     Run the model without the solara integration
     """
-    from mesa_llm.reasoning.reasoning import Reasoning
+    from mesa_llm.reasoning.react import ReActReasoning
 
     model = SugarScapeModel(
         initial_traders=5,
         initial_resources=20,
         width=10,
         height=10,
-        reasoning=Reasoning(),
+        reasoning=ReActReasoning,
         llm_model="openai/gpt-4o-mini",
         vision=2,
     )
