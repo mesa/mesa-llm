@@ -10,6 +10,7 @@ import pytest
 from mesa.agent import Agent, AgentSet
 from mesa.model import Model
 
+from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.parallel_stepping import (
     disable_automatic_parallel_stepping,
     enable_automatic_parallel_stepping,
@@ -17,6 +18,7 @@ from mesa_llm.parallel_stepping import (
     step_agents_parallel,
     step_agents_parallel_sync,
 )
+from mesa_llm.reasoning.react import ReActReasoning
 
 _CHILD_PROCESS_BASE_ENV = os.environ.copy()
 
@@ -98,6 +100,32 @@ class AsyncAgent(Agent):
 
     async def astep(self):
         self.counter += 1
+
+
+class ComponentAgent(Agent):
+    """Constituent agent that is stepped by its parent, not the scheduler."""
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.counter = 0
+        self.is_component = True
+
+    def step(self):
+        self.counter += 1
+
+
+class CompositeAgent(Agent):
+    """Minimal meta-agent stand-in that steps its constituents itself."""
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.counter = 0
+        self.components = [ComponentAgent(model), ComponentAgent(model)]
+
+    def step(self):
+        self.counter += 1
+        for component in self.components:
+            component.step()
 
 
 def test_import_mesa_llm_does_not_patch_shuffle_do():
@@ -201,3 +229,58 @@ def test_step_agents_parallel_sync_in_running_loop():
     asyncio.run(wrapper())
     assert a1.counter == 1
     assert a2.counter == 1
+
+
+def test_automatic_parallel_skips_component_agents():
+    """Component agents must only be stepped by their parent."""
+    m = DummyModel()
+    m.parallel_stepping = True
+    parent = CompositeAgent(m)
+    agents = AgentSet([parent, *parent.components], random=m.random)
+
+    enable_automatic_parallel_stepping("asyncio")
+    agents.shuffle_do("step")
+
+    assert parent.counter == 1
+    assert [component.counter for component in parent.components] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_step_agents_parallel_skips_component_agents():
+    m = DummyModel()
+    parent = CompositeAgent(m)
+
+    await step_agents_parallel([parent, *parent.components])
+
+    assert parent.counter == 1
+    assert [component.counter for component in parent.components] == [1, 1]
+
+
+def test_step_agents_multithreaded_skips_component_agents():
+    m = DummyModel()
+    parent = CompositeAgent(m)
+
+    step_agents_multithreaded([parent, *parent.components])
+
+    assert parent.counter == 1
+    assert [component.counter for component in parent.components] == [1, 1]
+
+
+def test_component_only_agent_set_is_not_stepped():
+    m = DummyModel()
+    m.parallel_stepping = True
+    components = [ComponentAgent(m), ComponentAgent(m)]
+    agents = AgentSet(components, random=m.random)
+
+    enable_automatic_parallel_stepping("asyncio")
+    agents.shuffle_do("step")
+
+    assert [component.counter for component in components] == [0, 0]
+
+
+def test_llm_agent_defaults_to_non_component():
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning)
+
+    assert agent.is_component is False
+    agent.is_component = True
+    assert agent.is_component is True

@@ -186,6 +186,10 @@ class LLMAgent(Agent):
     Attributes:
         llm (ModuleLLM): The internal LLM interface used by the agent.
         memory (Memory | None): The memory module attached to this agent, if any.
+        is_component (bool): Whether this agent is a constituent of a parent
+            agent, such as a ``MetaAgent``. Component agents are stepped by
+            their parent and are skipped by the automatic parallel scheduler
+            to avoid being stepped twice in the same model tick.
     """
 
     def __init__(
@@ -206,6 +210,7 @@ class LLMAgent(Agent):
             super().__init__(model=model)
 
             self.model = model
+            self.is_component = False
             self.step_prompt = step_prompt
             self.llm = ModuleLLM(
                 llm_model=llm_model,

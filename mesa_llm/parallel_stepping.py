@@ -21,10 +21,22 @@ logger = logging.getLogger(__name__)
 _PARALLEL_STEPPING_MODE = "asyncio"  # or "threading"
 
 
+def _is_component(agent: Agent | LLMAgent) -> bool:
+    """Return whether ``agent`` is a constituent of another agent.
+
+    Agents that are part of a parent agent, such as the constituting agents of
+    a ``MetaAgent``, are stepped by that parent. The parallel scheduler must
+    skip them to avoid stepping them twice in the same model tick.
+    """
+    return bool(getattr(agent, "is_component", False))
+
+
 async def step_agents_parallel(agents: list[Agent | LLMAgent]) -> None:
-    """Step all agents in parallel using async/await."""
+    """Step all independent agents in parallel using async/await."""
     tasks = []
     for agent in agents:
+        if _is_component(agent):
+            continue
         if hasattr(agent, "astep"):
             tasks.append(agent.astep())
         elif hasattr(agent, "step"):
@@ -38,10 +50,12 @@ async def _sync_step(agent: Agent) -> None:
 
 
 def step_agents_multithreaded(agents: list[Agent | LLMAgent]) -> None:
-    """Step all agents in parallel using threads."""
+    """Step all independent agents in parallel using threads."""
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for agent in agents:
+            if _is_component(agent):
+                continue
             if hasattr(agent, "astep"):
                 # run async steps in the event loop in a thread
                 futures.append(
