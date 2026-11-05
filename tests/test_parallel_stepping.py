@@ -187,6 +187,57 @@ def test_automatic_parallel_shuffle_do():
     assert a1.counter == 2
 
 
+def test_automatic_parallel_shuffle_do_on_model_agents():
+    """Automatic mode also steps model.agents and model.agents_by_type.
+
+    Since Mesa 3.5 these are _HardKeyAgentSet, which does not subclass AgentSet.
+    Regression test for GitHub issue #349.
+    """
+    m = DummyModel()
+    m.parallel_stepping = True
+    a1 = AsyncAgent(m)
+    a2 = AsyncAgent(m)
+    model_agentset_cls = type(m.agents)
+    original_shuffle_do = model_agentset_cls.shuffle_do
+
+    enable_automatic_parallel_stepping("asyncio")
+    assert m.agents.shuffle_do("step") is m.agents
+    assert (a1.counter, a2.counter) == (1, 1)
+
+    m.agents_by_type[AsyncAgent].shuffle_do("step")
+    assert (a1.counter, a2.counter) == (2, 2)
+
+    # astep-only agents fall back to Mesa's no-op step once the patch is removed
+    disable_automatic_parallel_stepping()
+    assert model_agentset_cls.shuffle_do is original_shuffle_do
+    m.agents.shuffle_do("step")
+    assert (a1.counter, a2.counter) == (2, 2)
+
+
+def test_automatic_shuffle_do_without_parallel_flag_returns_agentset():
+    """Without parallel_stepping the patched shuffle_do behaves like Mesa's."""
+    m = DummyModel()
+    a1 = SyncAgent(m)
+
+    enable_automatic_parallel_stepping("asyncio")
+    assert m.agents.shuffle_do("step") is m.agents
+    assert a1.counter == 1
+
+
+@pytest.mark.asyncio
+async def test_do_async_on_model_agents():
+    """do_async is also available on model.agents."""
+    m = DummyModel()
+    a1 = AsyncAgent(m)
+
+    enable_automatic_parallel_stepping("asyncio")
+    await m.agents.do_async("astep")
+    assert a1.counter == 1
+
+    disable_automatic_parallel_stepping()
+    assert not hasattr(m.agents, "do_async")
+
+
 def test_step_agents_parallel_sync_in_running_loop():
     # ensure no exception is raised if we call the sync wrapper
     # while an event loop is already running

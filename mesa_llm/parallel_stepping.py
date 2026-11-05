@@ -7,10 +7,16 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import inspect
 import logging
 from typing import TYPE_CHECKING
 
 from mesa.agent import Agent, AgentSet
+
+try:
+    from mesa.agentset import _HardKeyAgentSet
+except ImportError:  # Mesa < 3.5 has no _HardKeyAgentSet
+    _HardKeyAgentSet = None
 
 if TYPE_CHECKING:
     from .llm_agent import LLMAgent
@@ -74,20 +80,35 @@ def step_agents_parallel_sync(agents: list[Agent | LLMAgent]) -> None:
         raise ValueError(f"Unknown parallel stepping mode: {_PARALLEL_STEPPING_MODE}")
 
 
-# Patch Mesa's shuffle_do for automatic parallel detection
-_original_shuffle_do = AgentSet.shuffle_do
-_original_do_async = getattr(AgentSet, "do_async", None)
-_original_do_async_exists = hasattr(AgentSet, "do_async")
+# Patch Mesa's shuffle_do for automatic parallel detection. Since Mesa 3.5,
+# model.agents and model.agents_by_type are _HardKeyAgentSet, which does not
+# subclass AgentSet, so both classes are patched.
+_PATCHED_AGENTSET_CLASSES = tuple(
+    cls for cls in (AgentSet, _HardKeyAgentSet) if cls is not None
+)
+_original_shuffle_do = {cls: cls.shuffle_do for cls in _PATCHED_AGENTSET_CLASSES}
+_original_do_async = {
+    cls: cls.__dict__["do_async"]
+    for cls in _PATCHED_AGENTSET_CLASSES
+    if "do_async" in cls.__dict__
+}
 
 
-def _enhanced_shuffle_do(self, method: str, *args, **kwargs):
-    """Enhanced shuffle_do with automatic parallel stepping."""
-    if method == "step" and self:
-        agent = next(iter(self))
-        if hasattr(agent, "model") and getattr(agent.model, "parallel_stepping", False):
-            step_agents_parallel_sync(list(self))
-            return
-    _original_shuffle_do(self, method, *args, **kwargs)
+def _make_enhanced_shuffle_do(original_shuffle_do):
+    """Wrap a shuffle_do implementation with automatic parallel stepping."""
+
+    def _enhanced_shuffle_do(self, method: str, *args, **kwargs):
+        """Enhanced shuffle_do with automatic parallel stepping."""
+        if method == "step" and self:
+            agent = next(iter(self))
+            if hasattr(agent, "model") and getattr(
+                agent.model, "parallel_stepping", False
+            ):
+                step_agents_parallel_sync(list(self))
+                return self
+        return original_shuffle_do(self, method, *args, **kwargs)
+
+    return _enhanced_shuffle_do
 
 
 def enable_automatic_parallel_stepping(mode: str = "asyncio"):
@@ -96,18 +117,20 @@ def enable_automatic_parallel_stepping(mode: str = "asyncio"):
     if mode not in ("asyncio", "threading"):
         raise ValueError("mode must be either 'asyncio' or 'threading'")
     _PARALLEL_STEPPING_MODE = mode
-    AgentSet.shuffle_do = _enhanced_shuffle_do
-    AgentSet.do_async = _agentset_do_async
+    for cls in _PATCHED_AGENTSET_CLASSES:
+        cls.shuffle_do = _make_enhanced_shuffle_do(_original_shuffle_do[cls])
+        cls.do_async = _agentset_do_async
 
 
 def disable_automatic_parallel_stepping():
     """Restore original shuffle_do behavior."""
-    AgentSet.shuffle_do = _original_shuffle_do
-    if _original_do_async_exists:
-        AgentSet.do_async = _original_do_async
-    else:
-        with contextlib.suppress(AttributeError):
-            delattr(AgentSet, "do_async")
+    for cls in _PATCHED_AGENTSET_CLASSES:
+        cls.shuffle_do = _original_shuffle_do[cls]
+        if cls in _original_do_async:
+            cls.do_async = _original_do_async[cls]
+        else:
+            with contextlib.suppress(AttributeError):
+                delattr(cls, "do_async")
 
 
 # --- Monkey-patch AgentSet with do_async for async parallel method calls ---
@@ -124,7 +147,7 @@ def _agentset_do_async(self, method: str, *args, **kwargs):
         tasks = []
         for agent in self:
             fn = getattr(agent, method, None)
-            if fn is not None and asyncio.iscoroutinefunction(fn):
+            if fn is not None and inspect.iscoroutinefunction(fn):
                 tasks.append(fn(*args, **kwargs))
             else:
                 raise AttributeError(
