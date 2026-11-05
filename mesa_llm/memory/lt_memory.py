@@ -1,6 +1,7 @@
+from collections import deque
 from typing import TYPE_CHECKING
 
-from mesa_llm.memory.memory import Memory, MemoryEntry
+from mesa_llm.memory.memory import Memory, MemoryEntry, _format_message_entry
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
@@ -16,7 +17,15 @@ class LongTermMemory(Memory):
         llm_model : the model to use for the summarization
         additive_event_types : event types accumulated as lists within a step.
             Defaults to ``{"message", "action"}``.
+        communication_history_capacity : maximum number of message events
+            retained for ``get_communication_history()``. Defaults to 50.
 
+    Note
+        Consolidation summarizes each step into a single long-term string,
+        which discards the structure of individual messages. Message events are
+        therefore additionally retained in a bounded log so that the
+        communication history stays readable, mirroring the behaviour of the
+        other memory backends.
     """
 
     def __init__(
@@ -26,6 +35,7 @@ class LongTermMemory(Memory):
         llm_model: str = "openai/gpt-4o-mini",
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
+        communication_history_capacity: int = 50,
     ):
         """
         Initialize long-term memory.
@@ -38,11 +48,21 @@ class LongTermMemory(Memory):
             additive_event_types : event types that accumulate multiple values
                 within a step instead of overwriting. Defaults to
                 ``{"message", "action"}``.
+            communication_history_capacity : maximum number of message events
+                retained for ``get_communication_history()``. Older messages are
+                discarded once the limit is reached.
+
+        Raises:
+            ValueError: If llm_model is falsy, or if
+                communication_history_capacity is less than 1.
         """
         if not llm_model:
             raise ValueError(
                 "llm_model must be provided for the usage of long term memory"
             )
+
+        if communication_history_capacity < 1:
+            raise ValueError("communication_history_capacity must be >= 1")
 
         super().__init__(
             agent=agent,
@@ -53,6 +73,9 @@ class LongTermMemory(Memory):
         )
 
         self.long_term_memory = ""
+        self.communication_history: deque[MemoryEntry] = deque(
+            maxlen=communication_history_capacity
+        )
         self.system_prompt = """
             You are a helpful assistant that summarizes all memory entries and stores it into long-term.
             The long term memory should be a summary of the individual memory entries such that it is concise and informative.
@@ -62,6 +85,33 @@ class LongTermMemory(Memory):
             self.system_prompt += f" This is the prompt of the problem you will be tackling:{self.agent.step_prompt}, ensure you summarize the memory entries into long-term a way that is relevant to the problem at hand."
 
         self.llm.system_prompt = self.system_prompt
+
+    def add_to_memory(self, type: str, content: dict):
+        """
+        Record an event and retain message events for the communication history.
+
+        Consolidation folds each step into a single long-term summary string,
+        so the structure of individual messages does not survive. Message
+        events are therefore also appended to a bounded log, stamped with the
+        step in which they were recorded.
+
+        Args:
+            type : the event type, for example "message" or "plan"
+            content : the event payload
+
+        Raises:
+            TypeError: If content is not a dict.
+        """
+        super().add_to_memory(type, content)
+
+        if type == "message":
+            self.communication_history.append(
+                MemoryEntry(
+                    agent=self.agent,
+                    content={"message": content},
+                    step=self.agent.model.steps,
+                )
+            )
 
     def _build_consolidation_prompt(self) -> str:
         """
@@ -255,5 +305,20 @@ class LongTermMemory(Memory):
     def get_communication_history(self) -> str:
         """
         Get the communication history
+
+        Returns:
+            One entry per message, formatted as
+            "Step {step}: Agent {sender} says: {text}", or an empty string when
+            no messages have been exchanged.
         """
-        return "communication history is in memory of the agent"
+        lines = []
+        for entry in self.communication_history:
+            if "message" not in entry.content:
+                continue
+            msgs = entry.content["message"]
+            if isinstance(msgs, list):
+                for msg in msgs:
+                    lines.append(f"Step {entry.step}: {_format_message_entry(msg)}\n\n")
+            else:
+                lines.append(f"Step {entry.step}: {_format_message_entry(msgs)}\n\n")
+        return "\n".join(lines)
