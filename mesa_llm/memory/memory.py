@@ -1,3 +1,5 @@
+import copy
+import logging
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass
@@ -10,6 +12,12 @@ from mesa_llm.module_llm import ModuleLLM
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
+
+logger = logging.getLogger(__name__)
+
+# Memory entries that are mirrored to the agent's SimulationRecorder. Actions
+# are left out on purpose: LLMAgent.execute_action records them itself.
+_RECORDED_EVENT_TYPES = frozenset({"observation", "plan", "message"})
 
 
 def _format_message_entry(msg_value) -> str:
@@ -487,6 +495,42 @@ class Memory(ABC):
                 self.__dict__.pop("_step_event_order_cache", None)
         else:
             self.step_content[type] = content
+        self._record_event(type, content)
+
+    def _record_event(self, type: str, content: dict) -> None:
+        """
+        Mirror a memory entry to the agent's ``SimulationRecorder``, if it has one.
+
+        Only observations, plans and messages are mirrored. A message is
+        recorded once, from the sender's entry (the one that lists its
+        ``recipients``), and not again for each recipient's copy. A recorder
+        failure is logged and never reaches the agent.
+        """
+        agent = getattr(self, "agent", None)
+        recorder = getattr(agent, "recorder", None)
+        if recorder is None or type not in _RECORDED_EVENT_TYPES:
+            return
+        try:
+            content = copy.deepcopy(content)
+            if type == "message":
+                recipients = content.get("recipients")
+                if recipients is None:
+                    return
+                recorder.record_event(
+                    "message",
+                    content=content.get("message"),
+                    agent_id=agent.unique_id,
+                    recipient_ids=list(recipients),
+                )
+            else:
+                recorder.record_event(type, content=content, agent_id=agent.unique_id)
+        except Exception:
+            logger.warning(
+                "Could not record a %s event for agent %s.",
+                type,
+                getattr(agent, "unique_id", None),
+                exc_info=True,
+            )
 
     # Async Function wrapper for add_to_memory()
     async def aadd_to_memory(self, type: str, content: dict):
