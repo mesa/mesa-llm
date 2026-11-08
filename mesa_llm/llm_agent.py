@@ -504,3 +504,63 @@ class LLMAgent(Agent):
                 return result
 
             cls.astep = awrapped
+
+    def _record_llm_generation(
+        self,
+        response: object,
+        *,
+        prompt: str | list[str] | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Record a generated LLM response if llm tracing is enabled."""
+        if not self.record_llm_calls:
+            return
+
+        recorder = getattr(self, "recorder", None)
+        if recorder is None:
+            return
+
+        reasoning = None
+        if isinstance(response, dict):
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
+                if isinstance(message, dict):
+                    reasoning = message.get("content")
+                elif message is not None:
+                    reasoning = getattr(message, "content", None)
+            if reasoning is None:
+                reasoning = response.get("content")
+        else:
+            choices = getattr(response, "choices", None)
+            if choices:
+                message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
+                if isinstance(message, dict):
+                    reasoning = message.get("content")
+                elif message is not None:
+                    reasoning = getattr(message, "content", None)
+            if reasoning is None:
+                reasoning = getattr(response, "content", None)
+
+        event_content = {
+            "model": model or self.llm_model,
+            "reasoning": reasoning,
+        }
+        if prompt is not None:
+            event_content["prompt"] = (
+                prompt if isinstance(prompt, str) else " | ".join(prompt)
+            )
+        if system_prompt:
+            event_content["system_prompt"] = system_prompt
+
+        recorder.record_event(
+            event_type="llm_generation",
+            content=event_content,
+            agent_id=self.unique_id,
+            metadata={
+                "source": "llm_agent",
+                "model": event_content["model"],
+                "record_llm_calls": True,
+            },
+        )
