@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import copy
+import inspect
+import json
 import logging
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any
 
 from mesa.agent import Agent
 from mesa.discrete_space import (
@@ -17,17 +21,136 @@ from mesa.space import (
     SingleGrid,
 )
 
-from mesa_llm import Plan
+from mesa_llm.actions.action_manager import (
+    _UNSET as _ACTIONS_UNSET,
+)
+from mesa_llm.actions.action_manager import (
+    ActionChoice,
+    ActionManager,
+    ActionSelection,
+)
+from mesa_llm.actions.action_result import ActionPostCommitError, ActResult
 from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.module_llm import ModuleLLM
 from mesa_llm.reasoning.reasoning import (
     _UNSET,
     Observation,
+    Plan,
     Reasoning,
+    ToolSelection,
 )
 from mesa_llm.tools.tool_manager import ToolManager
 
 logger = logging.getLogger(__name__)
+
+
+def _log_step_finalizer_failure(
+    body_error: BaseException,
+    finalizer_error: BaseException,
+    finalizer_name: str,
+) -> None:
+    finalizer_error_is_log_safe = True
+    try:
+        finalizer_error_type = type(finalizer_error).__name__
+    except BaseException:
+        finalizer_error_type = "<unknown type>"
+        finalizer_error_is_log_safe = False
+
+    try:
+        finalizer_error_message = str(finalizer_error)
+    except BaseException:
+        finalizer_error_message = "<message unavailable>"
+        finalizer_error_is_log_safe = False
+
+    try:
+        diagnostic = f"{finalizer_name} finalizer failed: {finalizer_error_type}"
+        if finalizer_error_message:
+            diagnostic = f"{diagnostic}: {finalizer_error_message}"
+    except BaseException:
+        diagnostic = "Step finalizer failed while preserving the original exception."
+
+    # Diagnostics in this secondary-error path must never mask the body error.
+    with suppress(BaseException):
+        body_error.add_note(diagnostic)
+
+    if finalizer_error_is_log_safe:
+        try:
+            logger.error(
+                "%s while preserving the original step exception.",
+                diagnostic,
+                exc_info=(
+                    type(finalizer_error),
+                    finalizer_error,
+                    finalizer_error.__traceback__,
+                ),
+            )
+        except BaseException:
+            with suppress(BaseException):
+                logger.error(
+                    "%s while preserving the original step exception.",
+                    diagnostic,
+                )
+    else:
+        with suppress(BaseException):
+            logger.error(
+                "%s while preserving the original step exception.",
+                diagnostic,
+            )
+
+
+def _run_step_body_with_post(
+    body: Callable[[], Any],
+    post: Callable[[], Any],
+    post_name: str,
+) -> Any:
+    try:
+        result = body()
+    except BaseException as body_error:
+        try:
+            post()
+        except BaseException as finalizer_error:
+            _log_step_finalizer_failure(body_error, finalizer_error, post_name)
+        raise
+
+    post()
+    return result
+
+
+async def _arun_step_body_with_post(
+    body: Callable[[], Any],
+    post: Callable[[], Any],
+    post_name: str,
+) -> Any:
+    try:
+        result = await body()
+    except BaseException as body_error:
+        try:
+            await post()
+        except BaseException as finalizer_error:
+            _log_step_finalizer_failure(body_error, finalizer_error, post_name)
+        raise
+
+    await post()
+    return result
+
+
+class _AmbiguousActionChoiceJSONError(ValueError):
+    """Raised when an LLM response contains more than one action JSON object."""
+
+
+def _load_action_choice_json(content: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in data:
+                raise ValueError(
+                    f"LLM action choice response contains duplicate JSON key {key!r}."
+                )
+            data[key] = value
+        return data
+
+    return json.loads(content, object_pairs_hook=reject_duplicate_keys)
+
 
 if TYPE_CHECKING:  # pragma: no cover
     from mesa_llm.recording.simulation_recorder import SimulationRecorder
@@ -53,8 +176,12 @@ class LLMAgent(Agent):
             self-hosted or remote inference endpoints.
         tools (list[Callable | str] | tuple[Callable | str, ...] | None):
             Explicit tools exposed to this agent. ``None`` and ``[]`` expose
-            no tools; pass a tool-set factory such as ``legacy_tools()`` to
-            opt in to compatibility built-ins.
+            no tools; pass explicit read-only tool callables or tool-set
+            factories to opt in to tool capabilities.
+        actions (list[Callable | str] | tuple[Callable | str, ...] | None):
+            Explicit actions exposed to this agent. ``None`` and ``[]`` expose
+            no actions; pass an explicit action list or action-set factory to
+            opt in to action capabilities.
 
     Attributes:
         llm (ModuleLLM): The internal LLM interface used by the agent.
@@ -66,47 +193,68 @@ class LLMAgent(Agent):
         model: Model,
         reasoning: type[Reasoning],
         llm_model: str = "gemini/gemini-2.0-flash",
+        fallback_model: str | None = None,
         system_prompt: str | None = None,
         vision: float | None = None,
         internal_state: list[str] | str | None = None,
         step_prompt: str | None = None,
         api_base: str | None = None,
         tools: list[Callable | str] | tuple[Callable | str, ...] | None = None,
+        actions: list[Callable | str] | tuple[Callable | str, ...] | None = None,
     ):
-        super().__init__(model=model)
+        try:
+            super().__init__(model=model)
 
-        self.model = model
-        self.step_prompt = step_prompt
-        self.llm = ModuleLLM(
-            llm_model=llm_model, system_prompt=system_prompt, api_base=api_base
-        )
+            self.model = model
+            self.step_prompt = step_prompt
+            self.llm = ModuleLLM(
+                llm_model=llm_model,
+                fallback_model=fallback_model,
+                system_prompt=system_prompt,
+                api_base=api_base,
+            )
 
-        self.memory = STLTMemory(
-            agent=self,
-            short_term_capacity=5,
-            consolidation_capacity=2,
-            llm_model=llm_model,
-            api_base=api_base,
-        )
+            self.memory = STLTMemory(
+                agent=self,
+                short_term_capacity=5,
+                consolidation_capacity=2,
+                llm_model=llm_model,
+                fallback_model=fallback_model,
+                api_base=api_base,
+            )
 
-        self._tool_manager = ToolManager(tools=tools)
-        self.vision = vision
-        self.reasoning = reasoning(agent=self)
-        self.system_prompt = system_prompt
-        self._current_plan = None  # Store current plan for formatting
+            self._tool_manager = ToolManager(tools=tools)
+            self._action_manager = ActionManager(actions=actions)
+            self.vision = vision
+            self.reasoning = reasoning(agent=self)
+            self.system_prompt = system_prompt
+            self._current_plan = None  # Store current plan for formatting
 
-        # display coordination
-        self._step_display_data = {}
+            # display coordination
+            self._step_display_data = {}
 
-        # Placeholder so @record_model can attach the SimulationRecorder
-        self.recorder: SimulationRecorder | None = None
+            # Placeholder so @record_model can attach the SimulationRecorder
+            self.recorder: SimulationRecorder | None = None
 
-        if isinstance(internal_state, str):
-            internal_state = [internal_state]
-        elif internal_state is None:
-            internal_state = []
+            if isinstance(internal_state, str):
+                internal_state = [internal_state]
+            elif internal_state is None:
+                internal_state = []
 
-        self.internal_state = internal_state
+            self.internal_state = internal_state
+        except Exception as initialization_error:
+            try:
+                LLMAgent._remove_after_failed_initialization(self, model)
+            except Exception as cleanup_error:
+                initialization_error.add_note(
+                    "Failed to remove the partially initialized LLMAgent: "
+                    f"{cleanup_error!r}"
+                )
+            raise
+
+    def _remove_after_failed_initialization(self, model: Model) -> None:
+        if any(agent is self for agent in model.agents):
+            super().remove()
 
     def __str__(self):
         return f"LLMAgent {self.unique_id}"
@@ -139,19 +287,447 @@ class LLMAgent(Agent):
         )
         self._tool_manager = value
 
+    def plan(
+        self,
+        prompt: str | None = None,
+        obs: Observation | None = None,
+        ttl: int = 1,
+        tools: ToolSelection | object = _UNSET,
+        tool_calls: str | None = "auto",
+        selected_tools: ToolSelection | object = _UNSET,
+    ) -> Plan:
+        """Run the configured reasoning module without exposing actions."""
+        plan_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "obs": obs,
+            "ttl": ttl,
+            "tools": tools,
+            "tool_calls": tool_calls,
+        }
+        if selected_tools is not _UNSET:
+            plan_kwargs["selected_tools"] = selected_tools
+        return self.reasoning.plan(**plan_kwargs)
+
+    def act(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActResult:
+        """Choose one action, execute it, and return the successful result."""
+        action_choice = self.choose_action(
+            prompt,
+            actions=actions,
+            system_prompt=system_prompt,
+        )
+        result = self.execute_action(action_choice, actions=actions)
+        return ActResult(action=action_choice, result=result)
+
+    async def aact(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActResult:
+        """Asynchronously choose one action, execute it, and return the result."""
+        action_choice = await self.achoose_action(
+            prompt,
+            actions=actions,
+            system_prompt=system_prompt,
+        )
+        result = await self.aexecute_action(action_choice, actions=actions)
+        return ActResult(action=action_choice, result=result)
+
+    def execute_action(
+        self,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+    ) -> Any:
+        """Validate and execute one configured action locally."""
+        validated_choice = self._action_manager.validate(
+            self,
+            action_choice,
+            actions=actions,
+        )
+        result = self._action_manager.execute(self, validated_choice, actions=actions)
+        self._record_successful_action_event(validated_choice, result)
+        return result
+
+    async def aexecute_action(
+        self,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+    ) -> Any:
+        """Validate and asynchronously execute one configured action locally."""
+        validated_choice = self._action_manager.validate(
+            self,
+            action_choice,
+            actions=actions,
+        )
+        result = await self._action_manager.aexecute(
+            self,
+            validated_choice,
+            actions=actions,
+        )
+        await self._arecord_successful_action_event(validated_choice, result)
+        return result
+
+    def choose_action(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActionChoice:
+        """Choose one structured action without executing or mutating state."""
+        action_schemas = self._action_manager.get_actions_schema(
+            agent=self,
+            actions=actions,
+        )
+        if not action_schemas:
+            raise ValueError(
+                "No actions are available for this call. Configure actions on "
+                "the agent or pass a non-empty configured action selector."
+            )
+
+        action_prompt = self._build_action_choice_prompt(prompt, action_schemas)
+        with self.llm._one_shot_completion():
+            response = self.llm.generate(
+                prompt=action_prompt,
+                tool_schema=None,
+                tool_choice="none",
+                response_format=self._action_choice_response_format(),
+                system_prompt=system_prompt,
+                suppress_thinking=True,
+            )
+        action_choice = self._parse_action_choice_response(response)
+        return self._action_manager.validate(self, action_choice, actions=actions)
+
+    async def achoose_action(
+        self,
+        prompt: str | list[str],
+        actions: ActionSelection | object = _ACTIONS_UNSET,
+        system_prompt: str | None = None,
+    ) -> ActionChoice:
+        """Asynchronously choose one structured action without mutating state."""
+        action_schemas = self._action_manager.get_actions_schema(
+            agent=self,
+            actions=actions,
+        )
+        if not action_schemas:
+            raise ValueError(
+                "No actions are available for this call. Configure actions on "
+                "the agent or pass a non-empty configured action selector."
+            )
+
+        action_prompt = self._build_action_choice_prompt(prompt, action_schemas)
+        with self.llm._one_shot_completion():
+            response = await self.llm.agenerate(
+                prompt=action_prompt,
+                tool_schema=None,
+                tool_choice="none",
+                response_format=self._action_choice_response_format(),
+                system_prompt=system_prompt,
+                suppress_thinking=True,
+            )
+        action_choice = self._parse_action_choice_response(response)
+        return self._action_manager.validate(self, action_choice, actions=actions)
+
+    def _action_choice_response_format(self) -> dict[str, str] | type[ActionChoice]:
+        if self.llm.llm_model.startswith("openai/"):
+            return {"type": "json_object"}
+        return ActionChoice
+
+    def _build_action_choice_prompt(
+        self,
+        prompt: str | list[str],
+        action_schemas: list[dict[str, Any]],
+    ) -> list[str]:
+        action_context = (
+            "Choose exactly one action from the available action specs below. "
+            "Return exactly one JSON object matching this shape: "
+            '{"name": str, "arguments": object, "rationale": str | null}. '
+            "The `name` value must be one of the listed action names. "
+            "The `arguments` value must be a JSON object for that action. "
+            "The `arguments` object may contain only properties declared for "
+            "the selected action. "
+            "Start your response with `{` and end it with `}`. "
+            "Do not include any other JSON objects. "
+            "Do not include Markdown fences, prose, or hidden reasoning. "
+            "Do not call tools and do not execute the action.\n\n"
+            f"Available actions:\n{json.dumps(action_schemas, indent=2)}"
+        )
+        output_contract = (
+            "Respond now with exactly one JSON object and nothing else. "
+            "Required keys: `name`, `arguments`, `rationale`."
+        )
+        if isinstance(prompt, str):
+            return [action_context, prompt, output_contract]
+        if isinstance(prompt, list):
+            return [action_context, *prompt, output_contract]
+        raise TypeError(
+            f"Invalid prompt type '{type(prompt).__name__}'. Expected str or list[str]."
+        )
+
+    def _parse_action_choice_response(self, response: Any) -> ActionChoice:
+        message = response.choices[0].message
+        missing_content = object()
+        content = getattr(message, "content", missing_content)
+        has_raw_content = content is not missing_content and content is not None
+        if isinstance(content, str):
+            has_raw_content = bool(content.strip())
+
+        if has_raw_content:
+            return self._action_choice_from_content(content)
+
+        parsed = getattr(message, "parsed", None)
+        if parsed is not None:
+            if isinstance(parsed, ActionChoice):
+                return parsed
+            if isinstance(parsed, dict):
+                return ActionChoice(**parsed)
+            if hasattr(parsed, "model_dump"):
+                return ActionChoice(**parsed.model_dump())
+
+        if content is missing_content:
+            content = message
+        return self._action_choice_from_content(content)
+
+    def _action_choice_from_content(self, content: Any) -> ActionChoice:
+        if isinstance(content, ActionChoice):
+            return content
+        if isinstance(content, dict):
+            return ActionChoice(**content)
+
+        if isinstance(content, str):
+            data = self._extract_single_action_choice_json(content)
+            return ActionChoice(**data)
+
+        raise TypeError(
+            "LLM action choice response must be an ActionChoice, dict, or JSON "
+            f"object string, got {type(content).__name__}."
+        )
+
+    def _extract_single_action_choice_json(
+        self,
+        content: str,
+    ) -> dict[str, Any]:
+        candidates = self._action_choice_json_candidates(content)
+
+        if not candidates:
+            raise ValueError(
+                "LLM action choice response did not include a JSON object matching "
+                "ActionChoice."
+            )
+        if len(candidates) > 1:
+            raise _AmbiguousActionChoiceJSONError(
+                "LLM action choice response must include exactly one JSON object "
+                "matching ActionChoice."
+            )
+        return candidates[0]
+
+    def _action_choice_json_candidates(self, content: str) -> list[dict[str, Any]]:
+        stripped_content = content.strip()
+        if not stripped_content:
+            return []
+
+        try:
+            data = _load_action_choice_json(stripped_content)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "LLM action choice response must be a JSON object matching "
+                    "ActionChoice."
+                )
+            return [data]
+
+        candidates: list[dict[str, Any]] = []
+        for object_text in self._iter_json_object_strings(stripped_content):
+            data = _load_action_choice_json(object_text)
+            if isinstance(data, dict):
+                candidates.append(data)
+        return candidates
+
+    def _iter_json_object_strings(self, content: str) -> list[str]:
+        objects: list[str] = []
+        start: int | None = None
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index, char in enumerate(content):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if depth and char == '"':
+                in_string = True
+            elif char == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif char == "}":
+                if depth == 0:
+                    raise ValueError(
+                        "LLM action choice response contains an unmatched closing "
+                        "brace."
+                    )
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objects.append(content[start : index + 1])
+                    start = None
+
+        if start is not None:
+            if in_string:
+                detail = (
+                    "an unterminated escape sequence in a JSON string"
+                    if escaped
+                    else "an unterminated JSON string"
+                )
+            else:
+                detail = "an unclosed JSON object"
+            raise ValueError(f"LLM action choice response contains {detail}.")
+
+        return objects
+
+    def _record_successful_action_event(
+        self,
+        action_choice: ActionChoice,
+        result: Any,
+    ) -> None:
+        content = {
+            "action": action_choice.model_dump(),
+            "result": result,
+        }
+        observer_errors: dict[str, Exception] = {}
+
+        memory_content: dict[str, Any] | None = None
+        try:
+            memory_content = copy.deepcopy(content)
+        except Exception as error:
+            observer_errors["memory"] = error
+
+        recorder = self.recorder
+        recorder_content: dict[str, Any] | None = None
+        if recorder is not None:
+            try:
+                recorder_content = copy.deepcopy(content)
+            except Exception as error:
+                observer_errors["recorder"] = error
+
+        if memory_content is not None:
+            try:
+                self.memory.add_to_memory(type="action", content=memory_content)
+            except Exception as error:
+                observer_errors["memory"] = error
+        if recorder is not None and recorder_content is not None:
+            try:
+                recorder.record_event(
+                    "action",
+                    content=recorder_content,
+                    agent_id=self.unique_id,
+                    metadata={"source": "LLMAgent.execute_action"},
+                )
+            except Exception as error:
+                observer_errors["recorder"] = error
+        if observer_errors:
+            raise ActionPostCommitError(action_choice, result, observer_errors)
+
+    async def _arecord_successful_action_event(
+        self,
+        action_choice: ActionChoice,
+        result: Any,
+    ) -> None:
+        content = {
+            "action": action_choice.model_dump(),
+            "result": result,
+        }
+        observer_errors: dict[str, Exception] = {}
+
+        memory_content: dict[str, Any] | None = None
+        try:
+            memory_content = copy.deepcopy(content)
+        except Exception as error:
+            observer_errors["memory"] = error
+
+        recorder = self.recorder
+        recorder_content: dict[str, Any] | None = None
+        if recorder is not None:
+            try:
+                recorder_content = copy.deepcopy(content)
+            except Exception as error:
+                observer_errors["recorder"] = error
+
+        if memory_content is not None:
+            try:
+                await self.memory.aadd_to_memory(
+                    type="action",
+                    content=memory_content,
+                )
+            except Exception as error:
+                observer_errors["memory"] = error
+        if recorder is not None and recorder_content is not None:
+            try:
+                recorder.record_event(
+                    "action",
+                    content=recorder_content,
+                    agent_id=self.unique_id,
+                    metadata={"source": "LLMAgent.execute_action"},
+                )
+            except Exception as error:
+                observer_errors["recorder"] = error
+        if observer_errors:
+            raise ActionPostCommitError(action_choice, result, observer_errors)
+
+    def _plan_message_recipients(
+        self, recipients: list[Agent]
+    ) -> list[tuple[int, Agent]]:
+        """Return unique non-self recipients in first-occurrence order."""
+        planned_recipients = []
+        seen_ids = set()
+        for recipient in recipients:
+            if recipient is self:
+                continue
+            recipient_id = recipient.unique_id
+            if recipient_id in seen_ids:
+                continue
+            seen_ids.add(recipient_id)
+            planned_recipients.append((recipient_id, recipient))
+        return planned_recipients
+
     def _format_message_status(
-        self, message: str, delivered_ids: list[int], skipped_ids: list[int]
+        self,
+        message: str,
+        delivered_ids: list[int],
+        skipped_ids: list[int],
+        *,
+        failed_ids: list[int],
+        sender_history_failed: bool,
     ) -> str:
-        """Format direct-message delivery status to match the speak_to tool."""
+        """Format direct-message delivery and sender-history status."""
         status_parts = []
         if delivered_ids:
             status_parts.append(f"sent message {message!r} to {delivered_ids}")
         if skipped_ids:
             status_parts.append(
-                f"skipped {skipped_ids} because they have no `memory` attribute"
+                f"skipped {skipped_ids} because they have no usable memory method"
             )
-        if not status_parts:
-            return f"Could not send message {message!r}: no matching recipients found."
+        if failed_ids:
+            status_parts.append(f"failed to deliver to {failed_ids}")
+        if not delivered_ids and not skipped_ids and not failed_ids:
+            status_parts.append(
+                f"Could not send message {message!r}: no matching recipients found."
+            )
+        if sender_history_failed:
+            status_parts.append(
+                "sender history recording failed after recipient delivery"
+            )
         return "; ".join(status_parts)
 
     async def aapply_plan(self, plan: Plan) -> list[dict]:
@@ -354,33 +930,95 @@ class LLMAgent(Agent):
         """
         delivered_ids = []
         skipped_ids = []
-        for recipient in recipients:
-            if recipient is self:
-                continue
-            if not hasattr(recipient, "memory"):
-                skipped_ids.append(recipient.unique_id)
-                logger.warning(
-                    "Agent %s has no memory attribute; skipping send_message.",
-                    recipient.unique_id,
+        failed_ids = []
+        planned_recipients = self._plan_message_recipients(recipients)
+        for recipient_id, recipient in planned_recipients:
+            try:
+                try:
+                    recipient_memory = recipient.memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient, "memory")
+                    except AttributeError:
+                        recipient_memory = None
+                    else:
+                        raise
+                if recipient_memory is None:
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable async memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                try:
+                    writer = recipient_memory.aadd_to_memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient_memory, "aadd_to_memory")
+                    except AttributeError:
+                        writer = None
+                    else:
+                        raise
+                if not callable(writer):
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable async memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                await writer(
+                    type="message",
+                    content={
+                        "message": message,
+                        "sender": self.unique_id,
+                    },
+                )
+            except Exception:
+                failed_ids.append(recipient_id)
+                logger.exception(
+                    "Message delivery from sender %s to recipient %s failed.",
+                    self.unique_id,
+                    recipient_id,
                 )
                 continue
-            delivered_ids.append(recipient.unique_id)
-            await recipient.memory.aadd_to_memory(
+            delivered_ids.append(recipient_id)
+
+        sender_history_failed = False
+        try:
+            sender_memory = self.memory
+            if sender_memory is None:
+                raise AttributeError("Sender has no memory.")
+            sender_writer = sender_memory.aadd_to_memory
+            if not callable(sender_writer):
+                raise TypeError("Sender async memory writer is not callable.")
+            await sender_writer(
                 type="message",
                 content={
                     "message": message,
                     "sender": self.unique_id,
+                    "recipients": delivered_ids.copy(),
                 },
             )
-        await self.memory.aadd_to_memory(
-            type="message",
-            content={
-                "message": message,
-                "sender": self.unique_id,
-                "recipients": delivered_ids,
-            },
+        except Exception:
+            sender_history_failed = True
+            logger.exception(
+                "Sender %s history recording failed after recipient delivery.",
+                self.unique_id,
+            )
+
+        return self._format_message_status(
+            message,
+            delivered_ids,
+            skipped_ids,
+            failed_ids=failed_ids,
+            sender_history_failed=sender_history_failed,
         )
-        return self._format_message_status(message, delivered_ids, skipped_ids)
 
     def send_message(self, message: str, recipients: list[Agent]) -> str:
         """
@@ -388,33 +1026,95 @@ class LLMAgent(Agent):
         """
         delivered_ids = []
         skipped_ids = []
-        for recipient in recipients:
-            if recipient is self:
-                continue
-            if not hasattr(recipient, "memory"):
-                skipped_ids.append(recipient.unique_id)
-                logger.warning(
-                    "Agent %s has no memory attribute; skipping send_message.",
-                    recipient.unique_id,
+        failed_ids = []
+        planned_recipients = self._plan_message_recipients(recipients)
+        for recipient_id, recipient in planned_recipients:
+            try:
+                try:
+                    recipient_memory = recipient.memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient, "memory")
+                    except AttributeError:
+                        recipient_memory = None
+                    else:
+                        raise
+                if recipient_memory is None:
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable sync memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                try:
+                    writer = recipient_memory.add_to_memory
+                except AttributeError:
+                    try:
+                        inspect.getattr_static(recipient_memory, "add_to_memory")
+                    except AttributeError:
+                        writer = None
+                    else:
+                        raise
+                if not callable(writer):
+                    skipped_ids.append(recipient_id)
+                    logger.warning(
+                        "Recipient %s has no usable sync memory method for "
+                        "send_message; "
+                        "skipping delivery from sender %s.",
+                        recipient_id,
+                        self.unique_id,
+                    )
+                    continue
+                writer(
+                    type="message",
+                    content={
+                        "message": message,
+                        "sender": self.unique_id,
+                    },
+                )
+            except Exception:
+                failed_ids.append(recipient_id)
+                logger.exception(
+                    "Message delivery from sender %s to recipient %s failed.",
+                    self.unique_id,
+                    recipient_id,
                 )
                 continue
-            delivered_ids.append(recipient.unique_id)
-            recipient.memory.add_to_memory(
+            delivered_ids.append(recipient_id)
+
+        sender_history_failed = False
+        try:
+            sender_memory = self.memory
+            if sender_memory is None:
+                raise AttributeError("Sender has no memory.")
+            sender_writer = sender_memory.add_to_memory
+            if not callable(sender_writer):
+                raise TypeError("Sender sync memory writer is not callable.")
+            sender_writer(
                 type="message",
                 content={
                     "message": message,
                     "sender": self.unique_id,
+                    "recipients": delivered_ids.copy(),
                 },
             )
-        self.memory.add_to_memory(
-            type="message",
-            content={
-                "message": message,
-                "sender": self.unique_id,
-                "recipients": delivered_ids,
-            },
+        except Exception:
+            sender_history_failed = True
+            logger.exception(
+                "Sender %s history recording failed after recipient delivery.",
+                self.unique_id,
+            )
+
+        return self._format_message_status(
+            message,
+            delivered_ids,
+            skipped_ids,
+            failed_ids=failed_ids,
+            sender_history_failed=sender_history_failed,
         )
-        return self._format_message_status(message, delivered_ids, skipped_ids)
 
     async def apre_step(self):
         """
@@ -447,10 +1147,11 @@ class LLMAgent(Agent):
         Subclasses should override this method for custom async behavior.
         If not overridden, falls back to calling the synchronous step() method.
         """
-        await self.apre_step()
 
-        raw_step = getattr(self.__class__, "_raw_user_step", None)
-        if raw_step is not None:
+        async def run_raw_step():
+            raw_step = getattr(self.__class__, "_raw_user_step", None)
+            if raw_step is None:
+                return None
             if not getattr(self.__class__, "_warned_sync_astep_fallback", False):
                 warnings.warn(
                     (
@@ -460,12 +1161,17 @@ class LLMAgent(Agent):
                         "threading parallel stepping."
                     ),
                     RuntimeWarning,
-                    stacklevel=2,
+                    stacklevel=4,
                 )
                 self.__class__._warned_sync_astep_fallback = True
-            raw_step(self)
+            return raw_step(self)
 
-        await self.apost_step()
+        await self.apre_step()
+        return await _arun_step_body_with_post(
+            run_raw_step,
+            self.apost_step,
+            "apost_step",
+        )
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -486,9 +1192,11 @@ class LLMAgent(Agent):
                 This is the wrapper that is used to integrate the pre_step and post_step methods into the step method of the child agent.
                 """
                 LLMAgent.pre_step(self, *args, **kwargs)
-                result = user_step(self, *args, **kwargs)
-                LLMAgent.post_step(self, *args, **kwargs)
-                return result
+                return _run_step_body_with_post(
+                    lambda: user_step(self, *args, **kwargs),
+                    lambda: LLMAgent.post_step(self, *args, **kwargs),
+                    "post_step",
+                )
 
             cls.step = wrapped
 
@@ -499,8 +1207,10 @@ class LLMAgent(Agent):
                 Async wrapper for astep method.
                 """
                 await self.apre_step()
-                result = await user_astep(self, *args, **kwargs)
-                await self.apost_step()
-                return result
+                return await _arun_step_body_with_post(
+                    lambda: user_astep(self, *args, **kwargs),
+                    self.apost_step,
+                    "apost_step",
+                )
 
             cls.astep = awrapped

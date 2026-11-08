@@ -31,12 +31,10 @@ class NegotiationModel(Model):
         vision: int,
         api_base: str | None = None,
         seed=None,
-        parallel_stepping=True,
     ):
         super().__init__(seed=seed)
         self.width = width
         self.height = height
-        self.parallel_stepping = parallel_stepping
         self.grid = MultiGrid(self.height, self.width, torus=False)
 
         # ---------------------Create the buyer agents---------------------
@@ -82,7 +80,7 @@ class NegotiationModel(Model):
             model=self,
             reasoning=reasoning,
             llm_model=llm_model,
-            system_prompt="You are a Seller in a negotiation game trying to sell shoes($40) and track suit($50) of brand A. You are trying to pitch your product to the Buyer type Agents. You are extremely good at persuading, and have good sales skills. You are also hardworking and dedicated to your work. To do any action, you must use the tools provided to you.",
+            system_prompt="You are a Seller in a negotiation game trying to sell shoes($40) and track suit($50) of brand A. You are trying to pitch your product to the Buyer type Agents. You are extremely good at persuading, and have good sales skills. You are also hardworking and dedicated to your work. To change simulation state, choose one of the actions provided to you.",
             vision=vision,
             internal_state=["hardworking", "dedicated", "persuasive"],
             api_base=api_base,
@@ -98,7 +96,7 @@ class NegotiationModel(Model):
             model=self,
             reasoning=reasoning,
             llm_model=llm_model,
-            system_prompt="You are a Seller in a negotiation game trying to sell shoes($35) and track suit($47) of brand B. You are trying to pitch your product to the Buyer type Agents. You are not interested in your work and are doing it for the sake of doing. To do any action, you must use the tools provided to you.",
+            system_prompt="You are a Seller in a negotiation game trying to sell shoes($35) and track suit($47) of brand B. You are trying to pitch your product to the Buyer type Agents. You are not interested in your work and are doing it for the sake of doing. To change simulation state, choose one of the actions provided to you.",
             vision=vision,
             internal_state=["lazy", "unmotivated"],
             api_base=api_base,

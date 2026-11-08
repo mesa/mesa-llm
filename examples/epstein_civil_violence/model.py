@@ -20,13 +20,11 @@ class EpsteinModel(Model):
         llm_model: str,
         vision: int,
         api_base: str | None = None,
-        parallel_stepping=True,
         seed=None,
     ):
         super().__init__(seed=seed)
         self.width = width
         self.height = height
-        self.parallel_stepping = parallel_stepping
         self.grid = MultiGrid(self.height, self.width, torus=False)
 
         model_reporters = {

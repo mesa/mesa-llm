@@ -1,13 +1,193 @@
+import json
+
+from examples.negotiation.actions import speak_to
+from mesa_llm.actions import ActionChoice, teleport_to_location, wait
 from mesa_llm.llm_agent import LLMAgent
-from mesa_llm.tools.defaults import legacy_tools
+from mesa_llm.memory.memory import _ordered_event_payloads
+from mesa_llm.reasoning.reasoning import Observation
+
+
+def _recent_memory_content_sources(agent):
+    """Return recent content objects and their private order sidecars."""
+    memory = agent.memory
+    sources = []
+    seen_entry_ids = set()
+    seen_content_ids = set()
+
+    def add_entry(entry):
+        content = getattr(entry, "content", None)
+        if not isinstance(content, dict) or id(entry) in seen_entry_ids:
+            return
+        # Distinct records can share a payload, including across model steps.
+        # Only collapse the same record exposed through multiple containers.
+        seen_entry_ids.add(id(entry))
+        seen_content_ids.add(id(content))
+        sources.append((content, getattr(entry, "_event_order", None)))
+
+    for entries_name in ("short_term_memory", "memory_entries"):
+        entries = getattr(memory, entries_name, None)
+        if entries is not None:
+            for entry in entries:
+                add_entry(entry)
+
+    buffer_entry = getattr(memory, "buffer", None)
+    if buffer_entry is not None:
+        add_entry(buffer_entry)
+
+    current_step_entry = getattr(memory, "_current_step_entry", None)
+    if current_step_entry is not None:
+        add_entry(current_step_entry)
+
+    step_content = getattr(memory, "step_content", None)
+    if isinstance(step_content, dict) and id(step_content) not in seen_content_ids:
+        sources.append(
+            (
+                step_content,
+                getattr(memory, "_step_event_order", None),
+            )
+        )
+
+    return sources
+
+
+def _memory_event_payloads(agent, event_type: str):
+    """Yield structured recent-memory payloads for one event type."""
+    for content, _event_order in _recent_memory_content_sources(agent):
+        if event_type not in content:
+            continue
+        payloads = content[event_type]
+        if not isinstance(payloads, list):
+            payloads = [payloads]
+        yield from (payload for payload in payloads if isinstance(payload, dict))
+
+
+def _dialogue_event_payloads(agent):
+    """Yield stored message and action payloads in insertion order."""
+    for content, event_order in _recent_memory_content_sources(agent):
+        for event_type, payload in _ordered_event_payloads(
+            content,
+            event_order,
+            ("message", "action"),
+        ):
+            if isinstance(payload, dict):
+                yield event_type, payload
+
+
+def _recent_dialogue_partner_ids(agent) -> set:
+    """Return structured sender/recipient IDs from recent dialogue events."""
+    partner_ids = set()
+
+    for message in _memory_event_payloads(agent, "message"):
+        sender = message.get("sender")
+        if hasattr(sender, "unique_id"):
+            sender = sender.unique_id
+        if sender is not None and not isinstance(sender, bool):
+            partner_ids.add(sender)
+
+        recipients = message.get("recipients", ())
+        if isinstance(recipients, list | tuple):
+            partner_ids.update(
+                recipient for recipient in recipients if not isinstance(recipient, bool)
+            )
+
+    for event in _memory_event_payloads(agent, "action"):
+        action_choice = event.get("action")
+        if (
+            not isinstance(action_choice, dict)
+            or action_choice.get("name") != "speak_to"
+        ):
+            continue
+
+        result = event.get("result")
+        if isinstance(result, dict) and "delivered" in result:
+            delivered = result["delivered"]
+            if isinstance(delivered, list | tuple):
+                partner_ids.update(
+                    recipient
+                    for recipient in delivered
+                    if not isinstance(recipient, bool)
+                )
+            continue
+
+        arguments = action_choice.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        recipients = arguments.get("listener_agents_unique_ids", ())
+        if isinstance(recipients, list | tuple):
+            partner_ids.update(
+                recipient for recipient in recipients if not isinstance(recipient, bool)
+            )
+
+    return partner_ids
+
+
+def get_eligible_recipients(agent, observation, recipient_type: str) -> list[dict]:
+    """Return visible and recent dialogue partners with explicit integer IDs."""
+    visible_labels = set(observation.local_state)
+    recent_partner_ids = _recent_dialogue_partner_ids(agent)
+    recipients = []
+
+    for candidate in agent.model.agents:
+        label = f"{type(candidate).__name__} {candidate.unique_id}"
+        is_visible = label in visible_labels
+        is_recent_partner = candidate.unique_id in recent_partner_ids
+        if (
+            candidate is agent
+            or type(candidate).__name__ != recipient_type
+            or not (is_visible or is_recent_partner)
+        ):
+            continue
+        recipients.append(
+            {
+                "label": label,
+                "unique_id": int(candidate.unique_id),
+                "currently_visible": is_visible,
+                "recent_dialogue_partner": is_recent_partner,
+            }
+        )
+
+    return sorted(recipients, key=lambda recipient: recipient["unique_id"])
+
+
+def _get_current_eligible_recipient_ids(agent, recipient_type: str) -> list[int]:
+    """Recompute eligible recipient IDs from current simulation state."""
+    self_state, local_state = agent._build_observation()
+    observation = Observation(
+        step=agent.model.steps,
+        self_state=self_state,
+        local_state=local_state,
+    )
+    return [
+        recipient["unique_id"]
+        for recipient in get_eligible_recipients(agent, observation, recipient_type)
+    ]
+
+
+def get_recipient_prompt(recipients: list[dict]) -> str:
+    """Format visible identities and the strict speak_to argument contract."""
+    if not recipients:
+        return (
+            "Eligible speak_to recipients: []. No eligible recipient is available. "
+            "Do not invent a recipient ID. If speak_to is the only available action, "
+            "set listener_agents_unique_ids to []. "
+        )
+
+    example_recipient = recipients[0]
+    example_ids = json.dumps([example_recipient["unique_id"]])
+    return (
+        f"Eligible speak_to recipients: {json.dumps(recipients)}. "
+        "When using speak_to, set listener_agents_unique_ids to a JSON list "
+        "of the raw integer unique_id values shown above. For example, to target "
+        f"{example_recipient['label']}, use {example_ids}. "
+        "Never pass agent labels or names. "
+    )
 
 
 def get_dialogue_history(agent, max_messages: int = 5) -> str:
     """Extract and format recent dialogue from an agent's memory.
 
     This helper function supports both STLTMemory (short_term_memory) and
-    EpisodicMemory (memory_entries). It efficiently extracts the last N
-    dialogue messages by iterating in reverse order.
+    EpisodicMemory (memory_entries), including messages in the current step.
 
     Args:
         agent: The LLMAgent whose memory to extract dialogue from
@@ -16,53 +196,85 @@ def get_dialogue_history(agent, max_messages: int = 5) -> str:
     Returns:
         Formatted dialogue history string, or "No recent dialogue." if empty
     """
+    if max_messages <= 0:
+        return "No recent dialogue."
+
     dialogue = []
+    for event_type, event in _dialogue_event_payloads(agent):
+        if event_type == "message":
+            sender = event.get("sender", "Unknown")
+            msg = event.get("message", "")
 
-    # Support both STLTMemory and EpisodicMemory
-    memory_source = None
-    if hasattr(agent.memory, "short_term_memory"):
-        memory_source = agent.memory.short_term_memory
-    elif hasattr(agent.memory, "memory_entries"):
-        memory_source = agent.memory.memory_entries
+            if hasattr(sender, "unique_id"):
+                sender_name = f"{type(sender).__name__} {sender.unique_id}"
+            elif isinstance(sender, int) and not isinstance(sender, bool):
+                agent_obj = next(
+                    (
+                        candidate
+                        for candidate in agent.model.agents
+                        if candidate.unique_id == sender
+                    ),
+                    None,
+                )
+                sender_name = (
+                    f"{type(agent_obj).__name__} {sender}"
+                    if agent_obj is not None
+                    else f"Agent {sender}"
+                )
+            else:
+                sender_name = str(sender)
 
-    if memory_source:
-        # Iterate in reverse to efficiently get last N messages
-        # We check at most max_messages * 2 recent entries to account for
-        # non-dialogue entries (observations, movements, etc.)
-        entries_to_check = min(len(memory_source), max_messages * 2)
+            dialogue.append(f"- {sender_name}: {msg}")
+            continue
 
-        for entry in reversed(list(memory_source)[-entries_to_check:]):
-            # Stop if we already have enough dialogue messages
-            if len(dialogue) >= max_messages:
-                break
+        action_choice = event.get("action")
+        if (
+            not isinstance(action_choice, dict)
+            or action_choice.get("name") != "speak_to"
+        ):
+            continue
 
-            # Check if entry.content is a dict and has 'message'
-            if isinstance(entry.content, dict) and "message" in entry.content:
-                sender = entry.content.get("sender", "Unknown")
-                msg = entry.content.get("message", "")
+        arguments = action_choice.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        message = arguments.get("message")
+        if not isinstance(message, str):
+            continue
 
-                # Handle both agent objects and agent IDs
-                if hasattr(sender, "unique_id"):
-                    # sender is an agent object (from send_message())
-                    sender_name = f"{type(sender).__name__} {sender.unique_id}"
-                elif isinstance(sender, int):
-                    # sender is an ID (from speak_to tool)
-                    # Try to find the agent by ID to get its type
-                    try:
-                        agent_obj = next(
-                            a for a in agent.model.agents if a.unique_id == sender
-                        )
-                        sender_name = f"{type(agent_obj).__name__} {sender}"
-                    except StopIteration:
-                        sender_name = f"Agent {sender}"
-                else:
-                    sender_name = str(sender)
+        result = event.get("result")
+        if not isinstance(result, dict):
+            continue
+        delivered = result.get("delivered")
+        if (
+            not isinstance(delivered, list | tuple)
+            or not delivered
+            or not all(
+                isinstance(recipient_id, int) and not isinstance(recipient_id, bool)
+                for recipient_id in delivered
+            )
+        ):
+            continue
 
-                dialogue.append(f"- {sender_name}: {msg}")
+        recipient_names = []
+        for recipient_id in delivered:
+            recipient = next(
+                (
+                    candidate
+                    for candidate in agent.model.agents
+                    if candidate.unique_id == recipient_id
+                ),
+                None,
+            )
+            recipient_names.append(
+                f"{type(recipient).__name__} {recipient_id}"
+                if recipient is not None
+                else f"Agent {recipient_id}"
+            )
 
-    # Reverse to get chronological order (oldest first)
-    dialogue.reverse()
-    return "\n".join(dialogue) if dialogue else "No recent dialogue."
+        sender_name = f"{type(agent).__name__} {agent.unique_id}"
+        dialogue.append(f"- {sender_name} to [{', '.join(recipient_names)}]: {message}")
+
+    return "\n".join(dialogue[-max_messages:]) if dialogue else "No recent dialogue."
 
 
 class SellerAgent(LLMAgent):
@@ -84,44 +296,69 @@ class SellerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            tools=legacy_tools(),
+            actions=[speak_to, wait],
         )
 
         self.sales = 0
 
-    def step(self):
-        observation = self.generate_obs()
-        dialogue_history = get_dialogue_history(self)
+    def _get_eligible_speak_to_recipient_ids(self) -> list[int]:
+        """Return currently eligible buyer IDs for local message delivery."""
+        return _get_current_eligible_recipient_ids(self, "BuyerAgent")
 
-        prompt = (
+    def _seller_step_prompt(self, dialogue_history, eligible_buyers):
+        return (
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
+            f"{get_recipient_prompt(eligible_buyers)}"
             "Don't move around. If there are any buyers in your cell or in the neighboring cells, "
-            "pitch them your product using the speak_to tool. "
+            "pitch them your product using the speak_to action. "
             "Talk to them until they agree or definitely refuse to buy your product. "
             "Use the dialogue history to inform your next response (e.g., if you already offered a price, stick to it or negotiate)."
         )
 
-        plan = self.reasoning.plan(prompt=prompt, obs=observation, tools=["speak_to"])
-        self.apply_plan(plan)
+    def step(self):
+        observation = self.generate_obs()
+        eligible_buyers = get_eligible_recipients(
+            self,
+            observation,
+            "BuyerAgent",
+        )
+        if not eligible_buyers:
+            self.execute_action(
+                ActionChoice(name="wait", arguments={}),
+                actions=["wait"],
+            )
+            return
+
+        dialogue_history = get_dialogue_history(self)
+        prompt = self._seller_step_prompt(dialogue_history, eligible_buyers)
+
+        self.act(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=["speak_to"],
+        )
 
     async def astep(self):
         observation = self.generate_obs()
+        eligible_buyers = get_eligible_recipients(
+            self,
+            observation,
+            "BuyerAgent",
+        )
+        if not eligible_buyers:
+            await self.aexecute_action(
+                ActionChoice(name="wait", arguments={}),
+                actions=["wait"],
+            )
+            return
+
         dialogue_history = get_dialogue_history(self)
+        prompt = self._seller_step_prompt(dialogue_history, eligible_buyers)
 
-        prompt = (
-            f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
-            "INSTRUCTIONS:\n"
-            "Don't move around. If there are any buyers in your cell or in the neighboring cells, "
-            "pitch them your product using the speak_to tool. "
-            "Talk to them until they agree or definitely refuse to buy your product. "
-            "Use the dialogue history to inform your next response."
+        await self.aact(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=["speak_to"],
         )
-
-        plan = await self.reasoning.aplan(
-            prompt=prompt, obs=observation, tools=["speak_to"]
-        )
-        self.apply_plan(plan)
 
 
 class BuyerAgent(LLMAgent):
@@ -144,49 +381,85 @@ class BuyerAgent(LLMAgent):
             api_base=api_base,
             vision=vision,
             internal_state=internal_state,
-            tools=[*legacy_tools(), "buy_product"],
+            actions=[teleport_to_location, speak_to, "buy_product"],
         )
         self.budget = budget
         self.products = []
 
-    def step(self):
-        observation = self.generate_obs()
-        dialogue_history = get_dialogue_history(self)
+    def _get_eligible_speak_to_recipient_ids(self) -> list[int]:
+        """Return currently eligible seller IDs for local message delivery."""
+        return _get_current_eligible_recipient_ids(self, "SellerAgent")
 
-        prompt = (
+    def _buyer_step_prompt_and_actions(self, observation, dialogue_history):
+        eligible_sellers = get_eligible_recipients(self, observation, "SellerAgent")
+        visible_sellers = [
+            seller for seller in eligible_sellers if seller["currently_visible"]
+        ]
+        has_dialogue = dialogue_history != "No recent dialogue."
+
+        base_prompt = (
             f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
             "INSTRUCTIONS:\n"
             f"Your budget is ${self.budget}. "
-            f"Move around by using the teleport_to_location tool if you are not talking to a seller, "
-            f"grid dimensions are {self.model.grid.width} x {self.model.grid.height}. "
-            "Seller agents around you might try to pitch their product by sending you messages, get as much information as possible. "
-            "When you have enough information, decide what to buy the product. "
-            "Refer to the dialogue history to recall previous prices offered."
+            "Seller agents around you might try to pitch their product by "
+            "sending you messages; get as much information as possible. "
+            "When you have enough information, decide what product to buy. "
+            "Refer to the dialogue history to recall previous prices offered. "
         )
-        plan = self.reasoning.plan(
-            prompt=prompt,
-            obs=observation,
-            tools=["teleport_to_location", "speak_to", "buy_product"],
+
+        if visible_sellers or has_dialogue:
+            seller_context = (
+                get_recipient_prompt(eligible_sellers)
+                if eligible_sellers
+                else get_recipient_prompt([])
+            )
+            next_action_instruction = (
+                "Use speak_to to ask or answer sellers, or use buy_product if "
+                "you are ready to purchase."
+                if has_dialogue
+                else "Use speak_to to ask a visible seller about their products and prices."
+            )
+            actions = ["speak_to", "buy_product"] if has_dialogue else ["speak_to"]
+            prompt = (
+                base_prompt
+                + seller_context
+                + "A seller or recent seller dialogue is available, so do not "
+                f"move this turn. {next_action_instruction}"
+            )
+            return prompt, actions
+
+        target_x = int(self.model.rng.integers(0, self.model.grid.width))
+        target_y = int(self.model.rng.integers(0, self.model.grid.height))
+        prompt = (
+            base_prompt
+            + "No seller is visible yet, so you may explore with teleport_to_location. "
+            f"Grid dimensions are {self.model.grid.width} x {self.model.grid.height}; "
+            "coordinates must be inside the grid with 0 <= x < width and "
+            "0 <= y < height. If you choose teleport_to_location, set "
+            f"target_coordinates to exactly [{target_x}, {target_y}]. "
+            "Never use null, None, an empty value, or an omitted "
+            "target_coordinates value."
         )
-        self.apply_plan(plan)
+        return prompt, ["teleport_to_location"]
+
+    def step(self):
+        observation = self.generate_obs()
+        dialogue_history = get_dialogue_history(self)
+        prompt, actions = self._buyer_step_prompt_and_actions(
+            observation, dialogue_history
+        )
+        self.act(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=actions,
+        )
 
     async def astep(self):
         observation = self.generate_obs()
         dialogue_history = get_dialogue_history(self)
-
-        prompt = (
-            f"DIALOGUE HISTORY:\n{dialogue_history}\n\n"
-            "INSTRUCTIONS:\n"
-            f"Your budget is ${self.budget}. "
-            f"Move around by using the teleport_to_location tool if you are not talking to a seller, "
-            f"grid dimensions are {self.model.grid.width} x {self.model.grid.height}. "
-            "Seller agents around you might try to pitch their product by sending you messages, get as much information as possible. "
-            "When you have enough information, decide what to buy the product. "
-            "Refer to the dialogue history to recall previous prices offered."
+        prompt, actions = self._buyer_step_prompt_and_actions(
+            observation, dialogue_history
         )
-        plan = await self.reasoning.aplan(
-            prompt=prompt,
-            obs=observation,
-            tools=["teleport_to_location", "speak_to", "buy_product"],
+        await self.aact(
+            prompt=[f"OBSERVATION:\n{observation}", prompt],
+            actions=actions,
         )
-        self.apply_plan(plan)

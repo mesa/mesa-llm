@@ -35,6 +35,7 @@ class STLTMemory(Memory):
         consolidation_capacity: int = 2,
         display: bool = True,
         llm_model: str | None = None,
+        fallback_model: str | None = None,
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
     ):
@@ -58,6 +59,7 @@ class STLTMemory(Memory):
         super().__init__(
             agent=agent,
             llm_model=llm_model,
+            fallback_model=fallback_model,
             api_base=api_base,
             display=display,
             additive_event_types=additive_event_types,
@@ -138,8 +140,10 @@ class STLTMemory(Memory):
                 content=self.step_content,
                 step=None,
             )
+            new_entry._event_order = list(self._step_event_order)
             self.short_term_memory.append(new_entry)
             self.step_content = {}
+            self._reset_step_event_order()
             return None, []
 
         if not self.short_term_memory or self.short_term_memory[-1].step is not None:
@@ -154,8 +158,21 @@ class STLTMemory(Memory):
             content=merged_content,
             step=self.agent.model.steps,
         )
+        staged_event_order = self._normalized_step_event_order(
+            pre_step_entry.content,
+            getattr(pre_step_entry, "_event_order", ()),
+        )
+        current_event_order = self._normalized_step_event_order(
+            self.step_content,
+            self._step_event_order,
+        )
+        new_entry._event_order = [
+            *staged_event_order,
+            *current_event_order,
+        ]
         self.short_term_memory.append(new_entry)
         self.step_content = {}
+        self._reset_step_event_order()
 
         evicted: list[MemoryEntry] = []
 

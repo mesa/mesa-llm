@@ -72,6 +72,19 @@ def step(self):
    self.apply_plan(plan)
 ```
 
+`send_message` and `asend_message` process unique, non-self recipients in
+order. Ordinary delivery failures are included in the returned status while
+later recipients continue to be attempted. Sender-history recording happens
+once after recipient delivery; if it fails, the returned status reports a
+post-delivery history failure. Already delivered messages must not be retried
+in response to that status.
+
+## Post-commit observer failures
+
+A normal return from an action commits its state change before Mesa-LLM records the result in memory and an optional recorder. If either post-commit observer raises an `Exception`, Mesa-LLM still attempts the other configured observer once, then raises `ActionPostCommitError`, available from `mesa_llm.actions` and top-level `mesa_llm`. The error reports `committed=True`, the validated `action`, the committed `result`, and the original exception objects in `observer_errors` under `memory` and/or `recorder`.
+
+This error means the action is already committed but may not be fully recorded. Do not retry the action in response: Mesa-LLM does not retry or roll back the action or its observers.
+
 ## API Reference
 
 ```{eval-rst}

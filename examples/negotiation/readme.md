@@ -14,9 +14,9 @@ This model is a simple negotiation model where two types of agents (buyer and se
 
 ## Agent Decision Logic
 
-Both buyers and sellers are implemented as LLM-powered agents. Their actions (such as moving, speaking, or buying) are determined by a reasoning module that receives the agent’s internal state, local observations, and a set of available tools.
-Sellers do not move; they use the `speak_to` tool to pitch products to buyers in their cell or neighboring cells, attempting to persuade buyers until a sale is made or the buyer refuses.
-Buyers can move using the `teleport_to_location` tool if not engaged with a seller, gather information from sellers using `speak_to`, and make purchases using the `buy_product` tool. Their decision is influenced by their budget and the information received from sellers.
+Both buyers and sellers are implemented as LLM-powered agents. Their actions (such as moving, speaking, or buying) are selected by an action workflow that receives the agent’s internal state, local observations, and a set of available actions.
+Sellers do not move; they use the `speak_to` action to pitch products to buyers in their cell or neighboring cells, attempting to persuade buyers until a sale is made or the buyer refuses.
+Buyers can move using the `teleport_to_location` action if not engaged with a seller, gather information from sellers using `speak_to`, and make purchases using the `buy_product` action. Their decision is influenced by their budget and the information received from sellers.
 
 ## Agent Attributes
 
@@ -25,8 +25,8 @@ Buyers can move using the `teleport_to_location` tool if not engaged with a sell
 
 ## Negotiation Protocol
 
-The negotiation is conducted through tool-based interactions, where sellers initiate conversations and buyers respond, gather information, and decide on purchases.
-The reasoning module plans actions based on prompts and observations, simulating realistic negotiation dynamics.
+The negotiation is conducted through action-based interactions, where sellers initiate conversations and buyers respond, gather information, and decide on purchases.
+The action workflow selects state-changing behavior based on prompts and observations, simulating realistic negotiation dynamics.
 
 ## Data Collection
 
@@ -50,4 +50,4 @@ Once you have configured `.env` and `llm_model`, run the following command from 
 * ``model.py``: Core model code.
 * ``agent.py``: Agent classes.
 * ``app.py``: Sets up the interactive visualization.
-* ``tools.py``: Tools for the llm-agents to use.
+* ``actions.py``: Custom actions for the llm-agents to use.

@@ -1,12 +1,6 @@
-"""Explicit tool-set factories for Mesa-LLM capability configuration."""
+"""Canonical read-only tool factories."""
 
 from collections.abc import Callable
-
-from mesa_llm.tools.inbuilt_tools import (
-    move_one_step,
-    speak_to,
-    teleport_to_location,
-)
 
 
 def default_tools() -> tuple[Callable, ...]:
@@ -39,16 +33,10 @@ def external_tools() -> tuple[Callable, ...]:
     return ()
 
 
-def legacy_tools() -> tuple[Callable, Callable, Callable]:
-    """Return the compatibility tools for old implicit built-in behavior."""
-    return (move_one_step, teleport_to_location, speak_to)
-
-
 __all__ = [
     "default_tools",
     "environment_tools",
     "external_tools",
-    "legacy_tools",
     "math_tools",
     "social_query_tools",
     "spatial_tools",

@@ -1,3 +1,7 @@
+import math
+from enum import Enum
+from typing import ClassVar, Final, Literal
+
 import pytest
 
 from mesa_llm.tools.tool_decorator import (
@@ -7,6 +11,10 @@ from mesa_llm.tools.tool_decorator import (
     _python_to_json_type,
     tool,
 )
+
+
+class _ExampleLiteralEnum(Enum):
+    VALUE = "value"
 
 
 class TestToolDecoractor:
@@ -55,16 +63,29 @@ class TestToolDecoractor:
             "items": {"type": "integer"},
         }
 
-        # Tuple with mixed types yields anyOf
-        tuple_schema = _python_to_json_type(tuple[str, int])
-        assert tuple_schema.get("type") == "array"
-        assert "anyOf" in tuple_schema.get("items", {})
-        item_types = {t.get("type") for t in tuple_schema["items"]["anyOf"]}
-        assert {"string", "integer"} == item_types
+        # Tuple with mixed types yields ordered anyOf
+        assert _python_to_json_type(tuple[str, int]) == {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                ]
+            },
+        }
 
         # Optional type (int | None) includes null
-        optional_schema = _python_to_json_type(int | None)
-        assert set(optional_schema.get("type", [])) == {"integer", "null"}
+        assert _python_to_json_type(int | None) == {
+            "type": ["integer", "null"],
+        }
+
+        # Non-null unions preserve declaration order
+        assert _python_to_json_type(int | str) == {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "string"},
+            ]
+        }
 
         # Dict with value types
         dict_schema = _python_to_json_type(dict[str, int])
@@ -74,6 +95,462 @@ class TestToolDecoractor:
         # Set maps to array
         set_schema = _python_to_json_type(set[str])
         assert set_schema == {"type": "array", "items": {"type": "string"}}
+
+    @pytest.mark.parametrize(
+        ("annotation", "item_schema", "length"),
+        [
+            pytest.param(
+                tuple[int, int],
+                {"type": "integer"},
+                2,
+                id="two-integers",
+            ),
+            pytest.param(
+                tuple[str, str, str],
+                {"type": "string"},
+                3,
+                id="three-strings",
+            ),
+            pytest.param(
+                tuple[int | float, int | float],
+                {
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "number"},
+                    ]
+                },
+                2,
+                id="two-numeric-unions",
+            ),
+        ],
+    )
+    def test_python_to_json_type_homogeneous_fixed_tuple_has_exact_length(
+        self,
+        annotation,
+        item_schema,
+        length,
+    ):
+        assert _python_to_json_type(annotation) == {
+            "type": "array",
+            "items": item_schema,
+            "minItems": length,
+            "maxItems": length,
+        }
+
+    @pytest.mark.parametrize(
+        ("annotation", "item_schema"),
+        [
+            (tuple[int, ...], {"type": "integer"}),
+            (tuple[str, ...], {"type": "string"}),
+            (
+                tuple[list[int], ...],
+                {"type": "array", "items": {"type": "integer"}},
+            ),
+        ],
+        ids=["integers", "strings", "nested-lists"],
+    )
+    def test_python_to_json_type_variadic_tuple_uses_homogeneous_items(
+        self,
+        annotation,
+        item_schema,
+    ):
+        assert _python_to_json_type(annotation) == {
+            "type": "array",
+            "items": item_schema,
+        }
+
+    def test_python_to_json_type_literal_and_nullable_union_schemas(self):
+        assert _python_to_json_type(Literal["a", "b"]) == {
+            "type": "string",
+            "enum": ["a", "b"],
+        }
+        assert _python_to_json_type(Literal["b", "a"]) == {
+            "type": "string",
+            "enum": ["b", "a"],
+        }
+        assert _python_to_json_type(int | str | None) == {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        }
+        assert _python_to_json_type(Literal["a", "b"] | None) == {
+            "anyOf": [
+                {
+                    "type": "string",
+                    "enum": ["a", "b"],
+                },
+                {"type": "null"},
+            ]
+        }
+
+    def test_python_to_json_type_homogeneous_literal_schemas(self):
+        assert _python_to_json_type(Literal[1, 2]) == {
+            "type": "integer",
+            "enum": [1, 2],
+        }
+        assert _python_to_json_type(Literal[True, False]) == {
+            "type": "boolean",
+            "enum": [True, False],
+        }
+        assert _python_to_json_type(Literal[1.5, 2.5]) == {
+            "type": "number",
+            "enum": [1.5, 2.5],
+        }
+        assert _python_to_json_type(Literal[1.0]) == {
+            "type": "number",
+            "enum": [1.0],
+        }
+
+    @pytest.mark.parametrize(
+        "literal_type",
+        [Literal[1, 1.0], Literal[1.0, 1]],
+        ids=["integer-first", "float-first"],
+    )
+    def test_python_to_json_type_rejects_ambiguous_numeric_literals(
+        self,
+        literal_type,
+    ):
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            _python_to_json_type(literal_type)
+
+    @pytest.mark.parametrize(
+        "literal_type",
+        [
+            Literal[1] | Literal[1.0],
+            list[Literal[1] | Literal[1.0]],
+        ],
+        ids=["split-union", "nested-split-union"],
+    )
+    def test_python_to_json_type_rejects_split_ambiguous_numeric_literals(
+        self,
+        literal_type,
+    ):
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            _python_to_json_type(literal_type)
+
+    @pytest.mark.parametrize(
+        "literal_type",
+        [
+            list[Literal[1]] | set[Literal[1.0]],
+            dict[str, list[Literal[1]]] | dict[str, set[Literal[1.0]]],
+        ],
+        ids=["collection-branches", "nested-dictionary-branches"],
+    )
+    def test_python_to_json_type_rejects_structurally_ambiguous_numeric_literals(
+        self,
+        literal_type,
+    ):
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            _python_to_json_type(literal_type)
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            type[Literal[1] | Literal[1.0]],
+            ClassVar[Literal[1] | Literal[1.0]],
+            Final[Literal[1] | Literal[1.0]],
+        ],
+        ids=["type", "class-var", "final"],
+    )
+    def test_python_to_json_type_preserves_unsupported_generic_fallback(
+        self,
+        annotation,
+    ):
+        assert _python_to_json_type(annotation) == {"type": "object"}
+
+    def test_python_to_json_type_heterogeneous_json_literal_omits_type(self):
+        assert _python_to_json_type(Literal["a", 2, False, None, 1.5]) == {
+            "enum": ["a", 2, False, None, 1.5],
+        }
+
+    @pytest.mark.parametrize(
+        "literal_value",
+        [
+            b"bytes",
+            _ExampleLiteralEnum.VALUE,
+            1 + 2j,
+            math.nan,
+            math.inf,
+            -math.inf,
+        ],
+        ids=[
+            "bytes",
+            "enum-member",
+            "complex",
+            "nan",
+            "positive-infinity",
+            "negative-infinity",
+        ],
+    )
+    def test_python_to_json_type_rejects_non_json_literal_values(
+        self,
+        literal_value,
+    ):
+        with pytest.raises(
+            TypeError,
+            match="Literal schemas support only finite JSON scalar values",
+        ):
+            _python_to_json_type(Literal[literal_value])
+
+    def test_tool_schema_exposes_literal_and_nullable_union(self):
+        @tool
+        def select_value(
+            agent,
+            mode: Literal["a", "b"],
+            optional_mode: Literal["a", "b"] | None,
+            value: int | str | None,
+        ) -> str:
+            """Select a typed value.
+
+            Args:
+                agent: The agent making the request.
+                mode: Selection mode.
+                optional_mode: Optional selection mode.
+                value: Optional selected value.
+
+            Returns:
+                Selection confirmation.
+            """
+            del agent, optional_mode, value
+            return mode
+
+        try:
+            properties = select_value.__tool_schema__["function"]["parameters"][
+                "properties"
+            ]
+
+            assert properties["mode"] == {
+                "type": "string",
+                "enum": ["a", "b"],
+                "description": "Selection mode.",
+            }
+            assert properties["optional_mode"] == {
+                "anyOf": [
+                    {
+                        "type": "string",
+                        "enum": ["a", "b"],
+                    },
+                    {"type": "null"},
+                ],
+                "description": "Optional selection mode.",
+            }
+            assert properties["value"] == {
+                "anyOf": [
+                    {"type": "integer"},
+                    {"type": "string"},
+                    {"type": "null"},
+                ],
+                "description": "Optional selected value.",
+            }
+        finally:
+            _GLOBAL_TOOL_REGISTRY.pop("select_value", None)
+
+    def test_tool_schema_rejects_ambiguous_numeric_literal_without_registration(self):
+        _GLOBAL_TOOL_REGISTRY.pop("select_numeric_value", None)
+
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+
+            @tool
+            def select_numeric_value(agent, value: Literal[1, 1.0]) -> int | float:
+                """Select a numeric value.
+
+                Args:
+                    agent: The agent making the request.
+                    value: Numeric value to select.
+
+                Returns:
+                    The selected value.
+                """
+                del agent
+                return value
+
+        assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            Literal[1] | Literal[1.0],
+            list[Literal[1] | Literal[1.0]],
+        ],
+        ids=["split-union", "nested-split-union"],
+    )
+    def test_tool_schema_rejects_split_ambiguous_numeric_literal_without_registration(
+        self,
+        annotation,
+    ):
+        _GLOBAL_TOOL_REGISTRY.pop("select_numeric_value", None)
+
+        def select_numeric_value(agent, value) -> int | float:
+            """Select a numeric value.
+
+            Args:
+                agent: The agent making the request.
+                value: Numeric value to select.
+
+            Returns:
+                The selected value.
+            """
+            del agent
+            return value
+
+        select_numeric_value.__annotations__["value"] = annotation
+
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            tool(select_numeric_value)
+
+        assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            list[Literal[1]] | set[Literal[1.0]],
+            dict[str, list[Literal[1]]] | dict[str, set[Literal[1.0]]],
+        ],
+        ids=["collection-branches", "nested-dictionary-branches"],
+    )
+    def test_tool_schema_rejects_structurally_ambiguous_literal_without_side_effects(
+        self,
+        annotation,
+    ):
+        _GLOBAL_TOOL_REGISTRY.pop("select_numeric_value", None)
+        mutations = []
+
+        def select_numeric_value(agent, value) -> int | float:
+            """Select a numeric value.
+
+            Args:
+                agent: The agent making the request.
+                value: Numeric value to select.
+
+            Returns:
+                The selected value.
+            """
+            mutations.append((agent, value))
+            return value
+
+        select_numeric_value.__annotations__["value"] = annotation
+
+        with pytest.raises(
+            TypeError,
+            match=r"JSON-equivalent|ambiguous|indistinguishable",
+        ):
+            tool(select_numeric_value)
+
+        assert "select_numeric_value" not in _GLOBAL_TOOL_REGISTRY
+        assert mutations == []
+
+    def test_tool_preserves_list_variadic_tuple_numeric_literal_union_acceptance(
+        self,
+    ):
+        annotation = list[Literal[1]] | tuple[Literal[1.0], ...]
+        expected_schema = {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1]},
+                },
+                {
+                    "type": "array",
+                    "items": {"type": "number", "enum": [1.0]},
+                },
+            ]
+        }
+        _GLOBAL_TOOL_REGISTRY.pop("select_nested_numeric_value", None)
+        mutations = []
+
+        def select_nested_numeric_value(agent, value) -> object:
+            """Select a nested numeric value.
+
+            Args:
+                agent: The agent making the request.
+                value: Value to select.
+
+            Returns:
+                The selected value.
+            """
+            mutations.append((agent, value))
+            return value
+
+        select_nested_numeric_value.__annotations__["value"] = annotation
+
+        assert _python_to_json_type(annotation) == expected_schema
+        decorated_tool = tool(select_nested_numeric_value)
+
+        try:
+            assert decorated_tool is select_nested_numeric_value
+            assert (
+                _GLOBAL_TOOL_REGISTRY["select_nested_numeric_value"]
+                is select_nested_numeric_value
+            )
+            value_schema = decorated_tool.__tool_schema__["function"]["parameters"][
+                "properties"
+            ]["value"]
+            assert value_schema == {
+                **expected_schema,
+                "description": "Value to select.",
+            }
+            assert mutations == []
+        finally:
+            _GLOBAL_TOOL_REGISTRY.pop("select_nested_numeric_value", None)
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            type[Literal[1] | Literal[1.0]],
+            ClassVar[Literal[1] | Literal[1.0]],
+            Final[Literal[1] | Literal[1.0]],
+        ],
+        ids=["type", "class-var", "final"],
+    )
+    def test_tool_schema_preserves_unsupported_generic_object_fallback(
+        self,
+        annotation,
+    ):
+        _GLOBAL_TOOL_REGISTRY.pop("inspect_legacy_value", None)
+
+        def inspect_legacy_value(agent, value) -> str:
+            """Inspect a legacy generic value.
+
+            Args:
+                agent: The agent making the request.
+                value: Value to inspect.
+
+            Returns:
+                Inspection confirmation.
+            """
+            del agent, value
+            return "inspected"
+
+        inspect_legacy_value.__annotations__["value"] = annotation
+        decorated_tool = tool(inspect_legacy_value)
+
+        try:
+            properties = decorated_tool.__tool_schema__["function"]["parameters"][
+                "properties"
+            ]
+            assert properties["value"] == {
+                "type": "object",
+                "description": "Value to inspect.",
+            }
+        finally:
+            _GLOBAL_TOOL_REGISTRY.pop("inspect_legacy_value", None)
 
     def test_tool(self):
         _GLOBAL_TOOL_REGISTRY.clear()

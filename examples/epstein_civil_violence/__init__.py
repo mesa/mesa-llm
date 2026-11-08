@@ -1,1 +1,1 @@
-import examples.epstein_civil_violence.tools  # noqa: F401, to register tools
+import examples.epstein_civil_violence.actions  # noqa: F401, to register actions

@@ -6,7 +6,7 @@ This model is based on Joshua Epstein's simulation of how civil unrest grows and
 
 The model generates mass uprising as self-reinforcing processes: if enough agents are rebelling, the probability of any individual agent being arrested is reduced, making more agents more likely to join the uprising. However, the more rebelling Citizens the Cops arrest, the less likely additional agents become to join.
 
-This model is implemented using Mesa-LLM unlike the original Mesa and NetLogo versions. All agents have the ability to think and use tools (arresting citizens for cops, changing their state, etc.) depending on their reasoning method.
+This model is implemented using Mesa-LLM unlike the original Mesa and NetLogo versions. All agents have the ability to choose actions (arresting citizens for cops, changing their state, etc.) depending on their reasoning method.
 
 ## Technical Details
 
@@ -64,11 +64,11 @@ Where:
 
 Both Citizens and Cops are implemented as **LLM-powered agents**, meaning:
 
-- Their actions (e.g., `move`, `change state`, `arrest`) are determined by a **reasoning module**.
-- This module takes as input:
+- Their actions (e.g., `move`, `change state`, `arrest`) are selected by an **action workflow**.
+- This workflow takes as input:
   - The agent’s internal state
   - Local observations
-  - A set of available tools
+  - A set of available actions
 
 This design enables **flexible, context-aware decision-making** that incorporates both:
 
@@ -96,7 +96,7 @@ Once you have configured `.env` and `llm_model`, run the following command from 
 * ``model.py``: Core model code.
 * ``agent.py``: Agent classes.
 * ``app.py``: Sets up the interactive visualization.
-* ``tools.py``: Tools for the llm-agents to use.
+* ``actions.py``: Custom actions for the llm-agents to use.
 
 ## Further Reading
 

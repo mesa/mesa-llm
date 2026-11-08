@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import inspect
+import math
 import re
 import textwrap
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 try:  # Python 3.10+ provides UnionType for PEP 604 unions (e.g., int | str)
     from types import UnionType  # type: ignore[attr-defined]
@@ -40,6 +50,132 @@ _RET_HEADER_RE = re.compile(r"^\s*Returns?:\s*$", re.IGNORECASE)
 _PARAM_LINE_RE = re.compile(r"^\s*(\w+)\s*:\s*(.+)$")
 
 
+def _validate_numeric_literal_schema_ambiguity(annotation: Any) -> None:
+    """Reject Python numeric Literal alternatives that JSON Schema conflates."""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Literal:
+        _reject_json_equivalent_numeric_literal_values(args)
+        return
+
+    if origin is Annotated:
+        if args:
+            _validate_numeric_literal_schema_ambiguity(args[0])
+        return
+
+    if origin is Union or (UnionType is not None and origin is UnionType):
+        numeric_values_by_branch = [
+            _nested_numeric_literal_values(member) for member in args
+        ]
+        for index, branch_values in enumerate(numeric_values_by_branch):
+            for other_branch_values in numeric_values_by_branch[index + 1 :]:
+                _reject_cross_branch_numeric_literal_ambiguity(
+                    branch_values,
+                    other_branch_values,
+                )
+        for member in args:
+            _validate_numeric_literal_schema_ambiguity(member)
+        return
+
+    if origin in {list, set}:
+        if args:
+            _validate_numeric_literal_schema_ambiguity(args[0])
+        return
+
+    if origin is tuple:
+        for item_annotation in args:
+            if item_annotation is not Ellipsis:
+                _validate_numeric_literal_schema_ambiguity(item_annotation)
+        return
+
+    if origin is dict and len(args) >= 2:
+        _validate_numeric_literal_schema_ambiguity(args[1])
+
+
+def _nested_numeric_literal_values(
+    annotation: Any,
+    annotation_path: tuple[tuple[Any, int], ...] = (),
+) -> list[tuple[tuple[tuple[Any, int], ...], int | float]]:
+    """Return numeric Literal values nested within one union member."""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Literal:
+        return [
+            (annotation_path, value) for value in args if type(value) in {int, float}
+        ]
+    if origin is Annotated and args:
+        return _nested_numeric_literal_values(args[0], annotation_path)
+    if origin is Union or (UnionType is not None and origin is UnionType):
+        return [
+            value
+            for member in args
+            for value in _nested_numeric_literal_values(member, annotation_path)
+        ]
+
+    if origin in {list, set} and args:
+        return _nested_numeric_literal_values(
+            args[0],
+            (*annotation_path, ("array", 0)),
+        )
+
+    if origin is tuple:
+        return [
+            value
+            for index, item_annotation in enumerate(args)
+            if item_annotation is not Ellipsis
+            for value in _nested_numeric_literal_values(
+                item_annotation,
+                (*annotation_path, (tuple, index)),
+            )
+        ]
+
+    if origin is dict and len(args) >= 2:
+        return _nested_numeric_literal_values(
+            args[1],
+            (*annotation_path, (dict, 1)),
+        )
+
+    return []
+
+
+def _reject_cross_branch_numeric_literal_ambiguity(
+    values: list[tuple[tuple[tuple[Any, int], ...], int | float]],
+    other_values: list[tuple[tuple[tuple[Any, int], ...], int | float]],
+) -> None:
+    for annotation_path, value in values:
+        for other_annotation_path, other_value in other_values:
+            if (
+                annotation_path == other_annotation_path
+                and type(value) is not type(other_value)
+                and value == other_value
+            ):
+                _raise_json_equivalent_numeric_literal_error(value, other_value)
+
+
+def _reject_json_equivalent_numeric_literal_values(
+    values: tuple[Any, ...] | list[int | float],
+) -> None:
+    numeric_values = [value for value in values if type(value) in {int, float}]
+    for index, value in enumerate(numeric_values):
+        for other_value in numeric_values[index + 1 :]:
+            if type(value) is not type(other_value) and value == other_value:
+                _raise_json_equivalent_numeric_literal_error(value, other_value)
+
+
+def _raise_json_equivalent_numeric_literal_error(
+    value: int | float,
+    other_value: int | float,
+) -> None:
+    raise TypeError(
+        "Literal schemas cannot contain JSON-equivalent numeric "
+        "values with different Python types; "
+        f"got {value!r} ({type(value).__name__}) and "
+        f"{other_value!r} ({type(other_value).__name__})."
+    )
+
+
 def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     """
     Convert Python type hints to JSON Schema type definitions.
@@ -48,10 +184,13 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     - Basic types: int, str, float, bool
     - Collections: list, tuple, set
     - Generics: list[int], tuple[int, int], etc.
+    - Literal types: Literal["a", "b"]
     - Union types: Union[int, str], int | str
     - Optional types: Optional[int], int | None
     - Nested types: list[tuple[int, str]]
     """
+
+    _validate_numeric_literal_schema_ambiguity(py_type)
 
     # Handle None type
     if py_type is type(None):
@@ -119,6 +258,32 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
     origin = get_origin(py_type)
     args = get_args(py_type)
 
+    # Handle Literal before the generic fallback treats it as an object.
+    if origin is Literal:
+        literal_type_mapping = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            type(None): "null",
+        }
+        literal_types = []
+        for value in args:
+            value_type = type(value)
+            if value_type not in literal_type_mapping or (
+                value_type is float and not math.isfinite(value)
+            ):
+                raise TypeError(
+                    "Literal schemas support only finite JSON scalar values; "
+                    f"got {value!r}."
+                )
+            literal_types.append(literal_type_mapping[value_type])
+
+        schema: dict[str, Any] = {"enum": list(args)}
+        if literal_types and len(set(literal_types)) == 1:
+            schema = {"type": literal_types[0], **schema}
+        return schema
+
     # Handle Union types (including Optional which is Union[T, None])
     if origin is Union or (UnionType is not None and origin is UnionType):
         # Check if it's Optional (Union with None)
@@ -127,6 +292,8 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
         if len(non_none_args) == 1 and type(None) in args:
             # This is Optional[T] - handle the non-None type but allow null
             base_schema = _python_to_json_type(non_none_args[0])
+            if "enum" in base_schema:
+                return {"anyOf": [base_schema, {"type": "null"}]}
             # Add null as an allowed type
             if "type" in base_schema:
                 if isinstance(base_schema["type"], list):
@@ -139,13 +306,7 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
 
         elif len(non_none_args) > 1:
             # Multiple non-None types - create anyOf schema
-            return {
-                "anyOf": [
-                    _python_to_json_type(arg)
-                    for arg in non_none_args
-                    if arg is not type(None)
-                ]
-            }
+            return {"anyOf": [_python_to_json_type(arg) for arg in args]}
         else:
             # Only None type
             return {"type": "null"}
@@ -155,6 +316,19 @@ def _python_to_json_type(py_type: Any) -> dict[str, Any]:
         # Handle list, tuple, set as arrays
         if origin in (list, tuple, set):
             if args:
+                if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+                    return {
+                        "type": "array",
+                        "items": _python_to_json_type(args[0]),
+                    }
+                if origin is tuple and all(arg == args[0] for arg in args[1:]):
+                    arity = len(args)
+                    return {
+                        "type": "array",
+                        "items": _python_to_json_type(args[0]),
+                        "minItems": arity,
+                        "maxItems": arity,
+                    }
                 # Handle tuple with specific types like tuple[int, str]
                 if origin is tuple and len(args) > 1:
                     # For tuples with multiple specific types, we'll use array with mixed items

@@ -1,0 +1,1697 @@
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import contextlib
+import copy
+import inspect
+import json
+import math
+from collections.abc import Callable
+from types import UnionType
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+)
+
+from pydantic import BaseModel, Field
+from terminal_style import style
+
+from mesa_llm.actions._asyncgen_cleanup import (
+    close_asyncgen_best_effort,
+    close_asyncgen_without_loop,
+)
+from mesa_llm.actions.action_decorator import (
+    _GLOBAL_ACTION_REGISTRY,
+    ActionAnnotationContractError,
+    _get_action_parameter_contract,
+    _get_action_parameters,
+    _get_action_type_hints,
+    _get_required_action_parameter_names,
+    _is_keyword_injectable_parameter,
+    _validate_action_callable,
+    _validate_injected_agent_parameters,
+)
+
+_UNSET = object()
+_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS = 0.5
+ActionRef = Callable | str
+ActionSelection = ActionRef | list[ActionRef] | tuple[ActionRef, ...] | None
+
+
+class ActionChoice(BaseModel):
+    """Structured model output for one locally validated action choice."""
+
+    name: str = Field(description="Name of the configured action to execute.")
+    arguments: dict[str, Any] = Field(
+        description="JSON-compatible arguments for the selected action."
+    )
+    rationale: str | None = Field(
+        default=None,
+        description="Optional explanation for why this action was selected.",
+    )
+
+
+class ActionManager:
+    """
+    Manager for registering and querying explicit Mesa-LLM actions.
+
+    Bare managers expose no actions; pass ``actions=`` to configure the exact
+    action capabilities a manager should expose. Constructor string references
+    may resolve globally registered bare ``@action`` names, while per-call
+    selectors are constrained to the manager's configured actions.
+    """
+
+    def __init__(
+        self,
+        actions: list[ActionRef] | tuple[ActionRef, ...] | None = None,
+    ):
+        self.actions: dict[str, Callable] = {}
+
+        if actions is not None:
+            self.register_many(actions)
+
+    def register(self, fn: Callable):
+        """Register an action function by name."""
+        action_name = self._preflight_registration(fn, self.actions)
+        if action_name not in self.actions:
+            self.actions[action_name] = fn
+
+    def register_many(self, actions: list[ActionRef] | tuple[ActionRef, ...]):
+        """Register explicit action callables or registered action names."""
+        staged_actions = dict(self.actions)
+        for action_ref in actions:
+            fn = self._resolve_registration_action_ref(
+                action_ref,
+                registered_actions=staged_actions,
+            )
+            action_name = self._preflight_registration(fn, staged_actions)
+            if action_name not in staged_actions:
+                staged_actions[action_name] = fn
+
+        self.actions.update(
+            (name, fn)
+            for name, fn in staged_actions.items()
+            if name not in self.actions
+        )
+
+    def _preflight_registration(
+        self,
+        fn: Callable,
+        registered_actions: dict[str, Callable],
+    ) -> str:
+        """Validate one resolved registration without mutating manager state."""
+        _validate_action_callable(fn)
+        _validate_injected_agent_parameters(fn)
+        action_name = fn.__name__
+        if (
+            action_name in registered_actions
+            and registered_actions[action_name] is not fn
+        ):
+            raise ValueError(
+                f"Action name {action_name!r} is already registered to a "
+                "different callable in this manager."
+            )
+
+        self._get_action_schema(fn, schema_name=action_name)
+        _get_action_parameter_contract(fn)
+        return action_name
+
+    def has_action(self, name: str) -> bool:
+        """Return whether this manager has a configured action by name."""
+        return name in self.actions
+
+    def available_actions(
+        self,
+        agent: Any = None,
+        actions: ActionSelection | object = _UNSET,
+    ) -> dict[str, Callable]:
+        """Return configured actions, optionally narrowed by explicit selectors."""
+        del agent
+        if actions is _UNSET:
+            return dict(self.actions)
+        if actions is None:
+            return {}
+        return dict(self._resolve_action_items(actions))
+
+    def get_actions_schema(
+        self,
+        agent: Any = None,
+        actions: ActionSelection | object = _UNSET,
+    ) -> list[dict[str, Any]]:
+        """Return action schemas for configured actions or an explicit subset."""
+        return [
+            self._get_action_schema(fn, schema_name=name)
+            for name, fn in self.available_actions(agent, actions).items()
+        ]
+
+    def _get_action_schema(
+        self,
+        action: ActionRef,
+        schema_name: str | None = None,
+    ) -> dict[str, Any]:
+        fn = (
+            self._resolve_configured_action_ref(action)
+            if isinstance(action, str)
+            else action
+        )
+        schema_name = schema_name or getattr(fn, "__name__", repr(fn))
+        schema = getattr(fn, "__action_schema__", None)
+        if schema is None:
+            raise ActionAnnotationContractError(
+                f"Action {schema_name!r} must be decorated with @action before "
+                "registration; missing __action_schema__."
+            )
+
+        if schema.get("name") == schema_name:
+            return schema
+
+        aliased_schema = copy.deepcopy(schema)
+        aliased_schema["name"] = schema_name
+        return aliased_schema
+
+    def _unknown_action_error(self, action_name: str) -> ValueError:
+        return self._unknown_action_choice_error(action_name, self.actions)
+
+    def _unknown_action_choice_error(
+        self,
+        action_name: str,
+        available_actions: dict[str, Callable],
+    ) -> ValueError:
+        return ValueError(
+            style(
+                "Unknown action name(s): "
+                f"{[action_name]}. Available actions: {sorted(available_actions)}",
+                color="red",
+            )
+        )
+
+    def _invalid_action_ref_error(self, action_ref: Any) -> TypeError:
+        return TypeError(
+            style(
+                "Actions must be callables or registered action names, "
+                f"got {type(action_ref).__name__}.",
+                color="red",
+            )
+        )
+
+    def _resolve_registration_action_ref(
+        self,
+        action_ref: ActionRef,
+        *,
+        registered_actions: dict[str, Callable] | None = None,
+    ) -> Callable:
+        """Resolve constructor action references."""
+        registered_actions = (
+            self.actions if registered_actions is None else registered_actions
+        )
+        if callable(action_ref):
+            return action_ref
+
+        if isinstance(action_ref, str):
+            if action_ref in registered_actions:
+                return registered_actions[action_ref]
+            if action_ref in _GLOBAL_ACTION_REGISTRY:
+                return _GLOBAL_ACTION_REGISTRY[action_ref]
+            raise ValueError(
+                style(
+                    "Unknown action name(s): "
+                    f"{[action_ref]}. Available actions: "
+                    f"{sorted(set(registered_actions) | set(_GLOBAL_ACTION_REGISTRY))}",
+                    color="red",
+                )
+            )
+
+        raise self._invalid_action_ref_error(action_ref)
+
+    def _resolve_configured_action_ref(self, action_ref: ActionRef) -> Callable:
+        """Resolve per-call action selectors against configured actions only."""
+        return self._resolve_configured_action_item(action_ref)[1]
+
+    def _resolve_configured_action_item(
+        self,
+        action_ref: ActionRef,
+    ) -> tuple[str, Callable]:
+        """Resolve a selector while preserving configured action names."""
+        if isinstance(action_ref, str):
+            if action_ref in self.actions:
+                return action_ref, self.actions[action_ref]
+            raise self._unknown_action_error(action_ref)
+
+        if callable(action_ref):
+            action_name = getattr(action_ref, "__name__", repr(action_ref))
+            if action_name in self.actions and self.actions[action_name] is action_ref:
+                return action_name, self.actions[action_name]
+            for configured_name, configured_fn in self.actions.items():
+                if configured_fn is action_ref:
+                    return configured_name, configured_fn
+            raise self._unknown_action_error(action_name)
+
+        raise self._invalid_action_ref_error(action_ref)
+
+    def _normalize_action_selection(
+        self,
+        actions: ActionSelection,
+    ) -> list[ActionRef]:
+        """Normalize one or many explicit action selectors to a list."""
+        if actions is None:
+            return []
+        if isinstance(actions, list | tuple):
+            return list(actions)
+        if isinstance(actions, str) or callable(actions):
+            return [actions]
+        raise self._invalid_action_ref_error(actions)
+
+    def _resolve_action_items(
+        self,
+        actions: ActionSelection,
+    ) -> list[tuple[str, Callable]]:
+        return [
+            self._resolve_configured_action_item(action_ref)
+            for action_ref in self._normalize_action_selection(actions)
+        ]
+
+    def validate(
+        self,
+        agent: Any,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _UNSET,
+    ) -> ActionChoice:
+        """Validate one structured action choice without executing it.
+
+        Omitted ``actions`` validates against the manager's configured actions.
+        Explicit ``actions=None`` or ``[]`` validates against no actions, and an
+        explicit selector narrows validation to that configured subset.
+        """
+        choice = self._coerce_action_choice(action_choice)
+        available_actions = self.available_actions(agent=agent, actions=actions)
+        if choice.name not in available_actions:
+            raise self._unknown_action_choice_error(choice.name, available_actions)
+
+        validated_arguments = self._validate_action_arguments(
+            available_actions[choice.name],
+            choice,
+        )
+        return ActionChoice(
+            name=choice.name,
+            arguments=validated_arguments,
+            rationale=choice.rationale,
+        )
+
+    def execute(
+        self,
+        agent: Any,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _UNSET,
+    ) -> Any:
+        """Validate and execute one configured action locally."""
+        choice, result = self._call_validated_action(
+            agent,
+            action_choice,
+            actions=actions,
+            reject_async_callable=True,
+        )
+        self._reject_generator_action_result(choice.name, result)
+        if isinstance(result, concurrent.futures.Future):
+            self._reject_concurrent_future_action_result(choice.name, result)
+        if inspect.isawaitable(result):
+            primary_error = self._synchronous_awaitable_error(choice.name)
+            if not self._skip_foreign_loop_cleanup(primary_error, result):
+                self._close_awaitable_if_safe(result)
+            raise primary_error
+        return result
+
+    def _call_validated_action(
+        self,
+        agent: Any,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _UNSET,
+        *,
+        reject_async_callable: bool = False,
+    ) -> tuple[ActionChoice, Any]:
+        choice = self.validate(agent, action_choice, actions=actions)
+        action_fn = self.available_actions(agent=agent, actions=actions)[choice.name]
+        if reject_async_callable and inspect.iscoroutinefunction(action_fn):
+            raise self._synchronous_awaitable_error(choice.name)
+
+        call_arguments = dict(choice.arguments)
+        agent_parameter = self._get_agent_parameter_name(action_fn)
+        if agent_parameter is not None:
+            call_arguments[agent_parameter] = agent
+
+        return choice, action_fn(**call_arguments)
+
+    def _close_awaitable_if_safe(self, result: Any) -> None:
+        if isinstance(result, asyncio.Future):
+            result.cancel()
+        elif inspect.iscoroutine(result):
+            result.close()
+
+    def _skip_foreign_loop_cleanup(
+        self,
+        primary_error: TypeError,
+        result: Any,
+    ) -> bool:
+        """Leave pending asyncio objects untouched outside their owning loop."""
+        if not isinstance(result, asyncio.Future) or result.done():
+            return False
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if result.get_loop() is running_loop:
+            return False
+        primary_error.add_note(
+            "Cleanup unresolved: the rejected asyncio Future or Task belongs "
+            "to another event loop, or no event loop is running in this thread; "
+            "it was left untouched rather than cancelled or drained here."
+        )
+        return True
+
+    def _synchronous_awaitable_error(self, action_name: str) -> TypeError:
+        return TypeError(
+            style(
+                f"Action {action_name!r} requires asynchronous execution but was "
+                "passed to synchronous ActionManager.execute(...). Async actions "
+                "require ActionManager.aexecute(...), "
+                "LLMAgent.aexecute_action(...), or LLMAgent.aact(...).",
+                color="red",
+            )
+        )
+
+    def _generator_action_result_error(self, action_name: str) -> TypeError:
+        return TypeError(
+            style(
+                f"Action {action_name!r} must return one completed result; "
+                "generator and async-generator results are not supported as "
+                "actions.",
+                color="red",
+            )
+        )
+
+    def _note_generator_cleanup_failure(
+        self,
+        primary_error: TypeError,
+        result_kind: str,
+        cleanup_error: Exception,
+    ) -> None:
+        try:
+            cleanup_text = str(cleanup_error)
+        except BaseException:
+            try:
+                cleanup_text = repr(cleanup_error)
+            except BaseException:
+                cleanup_text = "<unprintable cleanup exception>"
+
+        primary_error.add_note(
+            f"Cleanup of the rejected {result_kind} result failed with "
+            f"{type(cleanup_error).__name__}: {cleanup_text}"
+        )
+
+    def _reject_generator_action_result(
+        self,
+        action_name: str,
+        result: Any,
+    ) -> None:
+        if not (inspect.isgenerator(result) or inspect.isasyncgen(result)):
+            return
+
+        primary_error = self._generator_action_result_error(action_name)
+        result_kind = "generator" if inspect.isgenerator(result) else "async-generator"
+
+        if result_kind == "generator":
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_generator_cleanup_failure(
+                    primary_error,
+                    result_kind,
+                    cleanup_error,
+                )
+            raise primary_error
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                close_asyncgen_without_loop(result, primary_error)
+            except Exception as cleanup_error:
+                self._note_generator_cleanup_failure(
+                    primary_error,
+                    result_kind,
+                    cleanup_error,
+                )
+        else:
+            # Synchronous execution cannot await aclose() without nesting the
+            # active loop or scheduling cleanup beyond this execution boundary.
+            primary_error.add_note(
+                "The rejected async-generator result was not closed because "
+                "synchronous ActionManager.execute(...) cannot await aclose() "
+                "while an event loop is already running in this thread."
+            )
+        raise primary_error
+
+    async def _areject_generator_action_result(
+        self,
+        action_name: str,
+        result: Any,
+    ) -> None:
+        if not (inspect.isgenerator(result) or inspect.isasyncgen(result)):
+            return
+
+        primary_error = self._generator_action_result_error(action_name)
+        result_kind = "generator" if inspect.isgenerator(result) else "async-generator"
+        try:
+            if result_kind == "generator":
+                result.close()
+            else:
+                await close_asyncgen_best_effort(
+                    result,
+                    primary_error,
+                    _TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
+        except Exception as cleanup_error:
+            self._note_generator_cleanup_failure(
+                primary_error,
+                result_kind,
+                cleanup_error,
+            )
+        raise primary_error
+
+    def _concurrent_future_action_result_error(
+        self,
+        action_name: str,
+    ) -> TypeError:
+        return TypeError(
+            style(
+                f"Action {action_name!r} must return one completed result; "
+                "concurrent.futures.Future results are deferred work and are "
+                "not supported as completed action results.",
+                color="red",
+            )
+        )
+
+    def _cancel_concurrent_future_if_pending(
+        self,
+        primary_error: TypeError,
+        result: concurrent.futures.Future,
+    ) -> bool:
+        if result.cancelled() or result.done():
+            return True
+
+        try:
+            cancelled = result.cancel()
+        except Exception as cleanup_error:
+            self._note_nested_awaitable_cleanup_failure(
+                primary_error,
+                "concurrent Future",
+                cleanup_error,
+            )
+            return False
+
+        if cancelled or result.cancelled() or result.done():
+            return True
+
+        primary_error.add_note(
+            "Cleanup unresolved: the rejected concurrent Future is already "
+            "running and could not be cancelled."
+        )
+        return False
+
+    def _cleanup_nested_deferred_action_result_sync(
+        self,
+        primary_error: TypeError,
+        result: Any,
+        seen: set[int],
+    ) -> None:
+        """Clean nested deferred results without driving asynchronous work."""
+        result_identity = id(result)
+        if result_identity in seen:
+            primary_error.add_note(
+                "Cleanup of the rejected deferred action result stopped after "
+                "detecting an identity cycle."
+            )
+            return
+        seen.add(result_identity)
+
+        if isinstance(result, concurrent.futures.Future):
+            if not self._cancel_concurrent_future_if_pending(
+                primary_error,
+                result,
+            ):
+                return
+            if result.cancelled():
+                return
+
+            try:
+                nested_result = result.result()
+            except concurrent.futures.CancelledError:
+                return
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "completed concurrent Future",
+                    cleanup_error,
+                )
+                return
+
+            if self._is_deferred_action_result(nested_result):
+                self._cleanup_nested_deferred_action_result_sync(
+                    primary_error,
+                    nested_result,
+                    seen,
+                )
+            return
+
+        if isinstance(result, asyncio.Future):
+            if self._skip_foreign_loop_cleanup(primary_error, result):
+                return
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+
+            if isinstance(result, asyncio.Task) and result is current_task:
+                primary_error.add_note(
+                    "The rejected nested asyncio Task was not cancelled because "
+                    "it is the current task running ActionManager.execute(...); "
+                    "self-cancellation is unsafe."
+                )
+                return
+
+            if result.cancelled():
+                return
+
+            if not result.done():
+                if isinstance(result, asyncio.Task) and result.cancelling() > 0:
+                    primary_error.add_note(
+                        "Cleanup unresolved: the rejected nested asyncio Task "
+                        "was already cancelling, but synchronous "
+                        "ActionManager.execute(...) cannot drain its cleanup."
+                    )
+                    return
+
+                try:
+                    result.cancel()
+                except Exception as cleanup_error:
+                    self._note_nested_awaitable_cleanup_failure(
+                        primary_error,
+                        "asyncio Future or Task",
+                        cleanup_error,
+                    )
+                    return
+
+                if result.cancelled():
+                    return
+                if not result.done():
+                    primary_error.add_note(
+                        "Cleanup unresolved: the rejected nested asyncio Future "
+                        "or Task remained live after cancellation was requested; "
+                        "synchronous ActionManager.execute(...) cannot drain "
+                        "asynchronous cleanup."
+                    )
+                    return
+
+            if result.cancelled():
+                return
+
+            if type(result) is not asyncio.Future and not isinstance(
+                result, asyncio.Task
+            ):
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected asyncio Future subclass is "
+                    "terminal, but completion of any underlying child work cannot "
+                    "be established from its public Future interface."
+                )
+
+            try:
+                nested_result = result.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "completed asyncio Future or Task",
+                    cleanup_error,
+                )
+                return
+
+            if self._is_deferred_action_result(nested_result):
+                self._cleanup_nested_deferred_action_result_sync(
+                    primary_error,
+                    nested_result,
+                    seen,
+                )
+            return
+
+        if inspect.isgenerator(result):
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "generator",
+                    cleanup_error,
+                )
+            return
+
+        if inspect.isasyncgen(result):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    close_asyncgen_without_loop(result, primary_error)
+                except Exception as cleanup_error:
+                    self._note_nested_awaitable_cleanup_failure(
+                        primary_error,
+                        "async-generator",
+                        cleanup_error,
+                    )
+            else:
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected nested async-generator "
+                    "could not be closed because synchronous "
+                    "ActionManager.execute(...) cannot await aclose() while an "
+                    "event loop is running in this thread."
+                )
+            return
+
+        if inspect.iscoroutine(result):
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "native coroutine",
+                    cleanup_error,
+                )
+            return
+
+        primary_error.add_note(
+            "Cleanup unresolved: the rejected nested custom awaitable was not "
+            "cleaned up because synchronous ActionManager.execute(...) does not "
+            "drive opaque custom awaitables."
+        )
+
+    def _reject_concurrent_future_action_result(
+        self,
+        action_name: str,
+        result: concurrent.futures.Future,
+    ) -> None:
+        primary_error = self._concurrent_future_action_result_error(action_name)
+        self._cleanup_nested_deferred_action_result_sync(
+            primary_error,
+            result,
+            set(),
+        )
+        raise primary_error
+
+    @staticmethod
+    def _is_deferred_action_result(result: Any) -> bool:
+        return (
+            isinstance(
+                result,
+                (asyncio.Future, concurrent.futures.Future),
+            )
+            or inspect.isawaitable(result)
+            or inspect.isgenerator(result)
+            or inspect.isasyncgen(result)
+        )
+
+    def _nested_awaitable_action_result_error(
+        self,
+        action_name: str,
+    ) -> TypeError:
+        return TypeError(
+            style(
+                f"Action {action_name!r} must return one completed result after "
+                "the supported asynchronous execution boundary; nested "
+                "awaitable and concurrent-future results are not supported.",
+                color="red",
+            )
+        )
+
+    def _note_nested_awaitable_cleanup_failure(
+        self,
+        primary_error: TypeError,
+        result_kind: str,
+        cleanup_error: Exception,
+    ) -> None:
+        try:
+            cleanup_text = str(cleanup_error)
+        except BaseException:
+            try:
+                cleanup_text = repr(cleanup_error)
+            except BaseException:
+                cleanup_text = "<unprintable cleanup exception>"
+
+        primary_error.add_note(
+            f"Cleanup of the rejected nested {result_kind} result failed with "
+            f"{type(cleanup_error).__name__}: {cleanup_text}"
+        )
+
+    async def _drain_rejected_task(
+        self,
+        primary_error: TypeError,
+        task: asyncio.Task,
+        seen: set[int],
+    ) -> None:
+        """Request cancellation once and wait briefly for terminal cleanup."""
+        if task is asyncio.current_task():
+            primary_error.add_note(
+                "The rejected nested asyncio Task was not cancelled because "
+                "it is the current task running ActionManager.aexecute(...); "
+                "self-cancellation is unsafe."
+            )
+            return
+
+        if self._skip_foreign_loop_cleanup(primary_error, task):
+            return
+
+        if not task.done():
+            try:
+                if task.cancelling() == 0:
+                    task.cancel()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "asyncio Task",
+                    cleanup_error,
+                )
+                return
+
+            try:
+                done, _ = await asyncio.wait(
+                    {task},
+                    timeout=_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "asyncio Task cancellation drain",
+                    cleanup_error,
+                )
+                return
+
+            if task not in done:
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected nested asyncio Task "
+                    "remained live after cancellation was requested and the "
+                    "bounded cancellation-drain timeout elapsed."
+                )
+                return
+
+        if task.cancelled():
+            return
+
+        try:
+            nested_result = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as cleanup_error:
+            self._note_nested_awaitable_cleanup_failure(
+                primary_error,
+                "completed asyncio Task",
+                cleanup_error,
+            )
+            return
+
+        if self._is_deferred_action_result(nested_result):
+            await self._cleanup_nested_awaitable_action_result(
+                primary_error,
+                nested_result,
+                seen,
+            )
+
+    async def _cleanup_nested_awaitable_action_result(
+        self,
+        primary_error: TypeError,
+        result: Any,
+        seen: set[int],
+    ) -> None:
+        result_identity = id(result)
+        if result_identity in seen:
+            primary_error.add_note(
+                "Cleanup of the rejected nested awaitable stopped after "
+                "detecting an identity cycle."
+            )
+            return
+        seen.add(result_identity)
+
+        if isinstance(result, concurrent.futures.Future):
+            if not self._cancel_concurrent_future_if_pending(
+                primary_error,
+                result,
+            ):
+                return
+            if result.cancelled():
+                return
+
+            try:
+                nested_result = result.result()
+            except concurrent.futures.CancelledError:
+                return
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "completed concurrent Future",
+                    cleanup_error,
+                )
+                return
+
+            if self._is_deferred_action_result(nested_result):
+                await self._cleanup_nested_awaitable_action_result(
+                    primary_error,
+                    nested_result,
+                    seen,
+                )
+            return
+
+        if isinstance(result, asyncio.Task):
+            await self._drain_rejected_task(primary_error, result, seen)
+            return
+
+        if isinstance(result, asyncio.Future):
+            if result.cancelled():
+                return
+
+            if not result.done():
+                if self._skip_foreign_loop_cleanup(primary_error, result):
+                    return
+
+                try:
+                    result.cancel()
+                except Exception as cleanup_error:
+                    self._note_nested_awaitable_cleanup_failure(
+                        primary_error,
+                        "asyncio Future",
+                        cleanup_error,
+                    )
+                    return
+
+                # Composite Futures can accept cancellation without finishing.
+                # Wait only for this Future, without scheduling or driving children.
+                if not result.done():
+                    try:
+                        done, _ = await asyncio.wait(
+                            {result},
+                            timeout=_TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                        )
+                    except Exception as cleanup_error:
+                        self._note_nested_awaitable_cleanup_failure(
+                            primary_error,
+                            "asyncio Future cancellation drain",
+                            cleanup_error,
+                        )
+                        return
+
+                    if result not in done:
+                        primary_error.add_note(
+                            "Cleanup unresolved: the rejected nested asyncio Future "
+                            "remained pending after the bounded cancellation-drain "
+                            "timeout elapsed."
+                        )
+                        return
+
+            if result.cancelled():
+                return
+
+            # A Future subclass can finish before its underlying work does (for
+            # example, gather can finish on the first child's cancellation).
+            # Do not infer child completion or depend on private child attributes.
+            if type(result) is not asyncio.Future:
+                primary_error.add_note(
+                    "Cleanup unresolved: the rejected asyncio Future subclass is "
+                    "terminal, but completion of any underlying child work cannot "
+                    "be established from its public Future interface."
+                )
+
+            try:
+                nested_result = result.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "completed asyncio Future",
+                    cleanup_error,
+                )
+                return
+
+            if self._is_deferred_action_result(nested_result):
+                await self._cleanup_nested_awaitable_action_result(
+                    primary_error,
+                    nested_result,
+                    seen,
+                )
+            return
+
+        if inspect.isgenerator(result):
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "generator",
+                    cleanup_error,
+                )
+            return
+
+        if inspect.isasyncgen(result):
+            try:
+                await close_asyncgen_best_effort(
+                    result,
+                    primary_error,
+                    _TASK_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "async-generator",
+                    cleanup_error,
+                )
+            return
+
+        if inspect.iscoroutine(result):
+            try:
+                result.close()
+            except Exception as cleanup_error:
+                self._note_nested_awaitable_cleanup_failure(
+                    primary_error,
+                    "native coroutine",
+                    cleanup_error,
+                )
+            return
+
+        primary_error.add_note(
+            "The rejected nested custom awaitable was not cleaned up because "
+            "it has no safe native coroutine-close or asyncio Future/Task-"
+            "cancel mechanism; ActionManager.aexecute(...) does not drive "
+            "opaque custom awaitables during cleanup."
+        )
+
+    async def _reject_nested_awaitable_action_result(
+        self,
+        action_name: str,
+        result: Any,
+    ) -> None:
+        if not (
+            isinstance(result, concurrent.futures.Future) or inspect.isawaitable(result)
+        ):
+            return
+
+        primary_error = self._nested_awaitable_action_result_error(action_name)
+        await self._cleanup_nested_awaitable_action_result(
+            primary_error,
+            result,
+            set(),
+        )
+        raise primary_error
+
+    async def aexecute(
+        self,
+        agent: Any,
+        action_choice: ActionChoice | dict[str, Any],
+        actions: ActionSelection | object = _UNSET,
+    ) -> Any:
+        """Validate and asynchronously execute one configured action locally."""
+        choice, result = self._call_validated_action(
+            agent,
+            action_choice,
+            actions=actions,
+        )
+        await self._areject_generator_action_result(choice.name, result)
+        if isinstance(result, concurrent.futures.Future):
+            await self._reject_nested_awaitable_action_result(choice.name, result)
+        if inspect.isawaitable(result):
+            result = await result
+            await self._areject_generator_action_result(choice.name, result)
+            await self._reject_nested_awaitable_action_result(choice.name, result)
+        return result
+
+    def _coerce_action_choice(
+        self,
+        action_choice: ActionChoice | dict[str, Any],
+    ) -> ActionChoice:
+        if isinstance(action_choice, ActionChoice):
+            return action_choice
+        if isinstance(action_choice, dict):
+            return ActionChoice(**action_choice)
+        raise TypeError(
+            style(
+                "Action choice must be an ActionChoice or dict, "
+                f"got {type(action_choice).__name__}.",
+                color="red",
+            )
+        )
+
+    def _validate_action_arguments(
+        self,
+        action_fn: Callable,
+        action_choice: ActionChoice,
+    ) -> dict[str, Any]:
+        contract = self._get_action_argument_contract(action_fn)
+        arguments = dict(action_choice.arguments)
+        argument_names = set(arguments)
+
+        supplied_agent_arguments = sorted(
+            name for name in argument_names if name.lower() == "agent"
+        )
+        if supplied_agent_arguments:
+            raise ValueError(
+                style(
+                    "Action arguments must not include framework-injected "
+                    f"argument(s) for action {action_choice.name!r}: "
+                    f"{supplied_agent_arguments}",
+                    color="red",
+                )
+            )
+
+        missing = sorted(contract["required"] - argument_names)
+        if missing:
+            raise ValueError(
+                style(
+                    "Missing required argument(s) for action "
+                    f"{action_choice.name!r}: {missing}",
+                    color="red",
+                )
+            )
+
+        if not contract["accepts_extra_arguments"]:
+            extra = sorted(argument_names - contract["allowed"])
+            if extra:
+                raise ValueError(
+                    style(
+                        "Unexpected argument(s) for action "
+                        f"{action_choice.name!r}: {extra}",
+                        color="red",
+                    )
+                )
+
+        return self._validate_and_coerce_action_argument_types(
+            action_fn,
+            action_choice.name,
+            arguments,
+            contract,
+        )
+
+    def _validate_and_coerce_action_argument_types(
+        self,
+        action_fn: Callable,
+        action_name: str,
+        arguments: dict[str, Any],
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        type_hints = _get_action_type_hints(
+            action_fn,
+            parameter_names=contract["allowed"],
+        )
+
+        coerced_arguments = dict(arguments)
+        for argument_name in contract["allowed"]:
+            if argument_name not in coerced_arguments:
+                continue
+
+            coerced_arguments[argument_name] = self._validate_and_coerce_value(
+                action_name=action_name,
+                argument_path=argument_name,
+                value=coerced_arguments[argument_name],
+                expected_type=type_hints[argument_name],
+            )
+
+        return coerced_arguments
+
+    def _validate_and_coerce_value(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+    ) -> Any:
+        expected_type = self._normalize_action_annotation(expected_type)
+        if expected_type is Any or expected_type is object:
+            raise self._unsupported_runtime_action_annotation_error(
+                action_name,
+                argument_path,
+                expected_type,
+            )
+
+        origin = get_origin(expected_type)
+        args = get_args(expected_type)
+
+        if origin is Annotated:
+            if not args:
+                raise self._unsupported_runtime_action_annotation_error(
+                    action_name,
+                    argument_path,
+                    expected_type,
+                )
+            return self._validate_and_coerce_value(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=args[0],
+            )
+
+        if origin in {Union, UnionType}:
+            return self._validate_and_coerce_union_value(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=expected_type,
+                union_args=args,
+            )
+
+        if origin is Literal:
+            return self._validate_and_coerce_literal_value(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=expected_type,
+                literal_values=args,
+            )
+
+        if expected_type is type(None):
+            if value is None:
+                return value
+            raise self._invalid_action_argument_type_error(
+                action_name,
+                argument_path,
+                expected_type,
+                value,
+            )
+
+        if expected_type in {int, float}:
+            coerced_value = self._coerce_numeric_action_value(value, expected_type)
+            if self._is_valid_numeric_action_value(coerced_value, expected_type):
+                return coerced_value
+            raise self._invalid_action_argument_type_error(
+                action_name,
+                argument_path,
+                expected_type,
+                value,
+            )
+
+        if expected_type is str:
+            if isinstance(value, str):
+                return value
+            raise self._invalid_action_argument_type_error(
+                action_name,
+                argument_path,
+                expected_type,
+                value,
+            )
+
+        if expected_type is bool:
+            if isinstance(value, bool):
+                return value
+            raise self._invalid_action_argument_type_error(
+                action_name,
+                argument_path,
+                expected_type,
+                value,
+            )
+
+        if origin in {list, tuple, set} or expected_type in {list, tuple, set}:
+            return self._validate_and_coerce_sequence_value(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=expected_type,
+                origin=origin,
+                args=args,
+            )
+
+        if origin is dict or expected_type is dict:
+            return self._validate_and_coerce_mapping_value(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                args=args,
+            )
+
+        raise self._unsupported_runtime_action_annotation_error(
+            action_name,
+            argument_path,
+            expected_type,
+        )
+
+    def _validate_and_coerce_literal_value(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+        literal_values: tuple[Any, ...],
+    ) -> Any:
+        for candidate in literal_values:
+            if type(value) is type(candidate) and value == candidate:
+                return candidate
+
+        if type(value) in {int, float}:
+            numeric_matches = [
+                candidate
+                for candidate in literal_values
+                if type(candidate) in {int, float} and value == candidate
+            ]
+            if numeric_matches:
+                return numeric_matches[0]
+
+        raise self._invalid_action_argument_type_error(
+            action_name,
+            argument_path,
+            expected_type,
+            value,
+        )
+
+    def _validate_and_coerce_union_value(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+        union_args: tuple[Any, ...],
+    ) -> Any:
+        for union_type in union_args:
+            if self._is_exact_action_value_match(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=union_type,
+            ):
+                return value
+
+        for union_type in union_args:
+            with contextlib.suppress(ValueError):
+                return self._validate_and_coerce_value(
+                    action_name=action_name,
+                    argument_path=argument_path,
+                    value=value,
+                    expected_type=union_type,
+                )
+
+        raise self._invalid_action_argument_type_error(
+            action_name,
+            argument_path,
+            expected_type,
+            value,
+        )
+
+    def _is_exact_action_value_match(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+    ) -> bool:
+        """Return whether a value satisfies an annotation without coercion."""
+        expected_type = self._normalize_action_annotation(expected_type)
+        if expected_type is Any or expected_type is object:
+            raise self._unsupported_runtime_action_annotation_error(
+                action_name,
+                argument_path,
+                expected_type,
+            )
+
+        origin = get_origin(expected_type)
+        args = get_args(expected_type)
+
+        if origin is Annotated:
+            if not args:
+                raise self._unsupported_runtime_action_annotation_error(
+                    action_name,
+                    argument_path,
+                    expected_type,
+                )
+            return self._is_exact_action_value_match(
+                action_name=action_name,
+                argument_path=argument_path,
+                value=value,
+                expected_type=args[0],
+            )
+
+        if origin in {Union, UnionType}:
+            return any(
+                self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=argument_path,
+                    value=value,
+                    expected_type=union_type,
+                )
+                for union_type in args
+            )
+
+        if origin is Literal:
+            return any(
+                type(value) is type(candidate) and value == candidate
+                for candidate in args
+            )
+
+        if expected_type is type(None):
+            return value is None
+
+        if expected_type in {int, float}:
+            return self._is_valid_numeric_action_value(value, expected_type)
+
+        if expected_type is str:
+            return isinstance(value, str)
+
+        if expected_type is bool:
+            return isinstance(value, bool)
+
+        if origin in {list, tuple, set} or expected_type in {list, tuple, set}:
+            container_type = origin or expected_type
+            if not isinstance(value, container_type):
+                return False
+
+            if container_type is tuple and args and args[-1] is not Ellipsis:
+                if len(value) != len(args):
+                    return False
+                return all(
+                    self._is_exact_action_value_match(
+                        action_name=action_name,
+                        argument_path=f"{argument_path}[{index}]",
+                        value=item,
+                        expected_type=args[index],
+                    )
+                    for index, item in enumerate(value)
+                )
+
+            item_type = args[0] if args else Any
+            return all(
+                self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}[{index}]",
+                    value=item,
+                    expected_type=item_type,
+                )
+                for index, item in enumerate(value)
+            )
+
+        if origin is dict or expected_type is dict:
+            if not isinstance(value, dict):
+                return False
+
+            key_type = args[0] if len(args) >= 1 else Any
+            value_type = args[1] if len(args) >= 2 else Any
+            return all(
+                self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}.<key>",
+                    value=key,
+                    expected_type=key_type,
+                )
+                and self._is_exact_action_value_match(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}[{key!r}]",
+                    value=item_value,
+                    expected_type=value_type,
+                )
+                for key, item_value in value.items()
+            )
+
+        raise self._unsupported_runtime_action_annotation_error(
+            action_name,
+            argument_path,
+            expected_type,
+        )
+
+    def _validate_and_coerce_sequence_value(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        expected_type: Any,
+        origin: Any,
+        args: tuple[Any, ...],
+    ) -> Any:
+        container_type = origin or expected_type
+        item_types = args
+        if isinstance(value, str):
+            coerced_sequence = self._coerce_string_sequence_value(value)
+            if coerced_sequence is not None:
+                value = coerced_sequence
+
+        if not isinstance(value, (list, tuple, set)):
+            raise self._invalid_action_argument_type_error(
+                action_name,
+                argument_path,
+                expected_type,
+                value,
+            )
+
+        if container_type is tuple and item_types and item_types[-1] is not Ellipsis:
+            if len(value) != len(item_types):
+                raise self._invalid_action_argument_type_error(
+                    action_name,
+                    argument_path,
+                    expected_type,
+                    value,
+                )
+            coerced_items = [
+                self._validate_and_coerce_value(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}[{index}]",
+                    value=item,
+                    expected_type=item_types[index],
+                )
+                for index, item in enumerate(value)
+            ]
+        else:
+            item_type = item_types[0] if item_types else Any
+            coerced_items = [
+                self._validate_and_coerce_value(
+                    action_name=action_name,
+                    argument_path=f"{argument_path}[{index}]",
+                    value=item,
+                    expected_type=item_type,
+                )
+                for index, item in enumerate(value)
+            ]
+
+        if container_type is tuple:
+            return tuple(coerced_items)
+        if container_type is set:
+            try:
+                return set(coerced_items)
+            except TypeError as exc:
+                raise self._invalid_action_argument_type_error(
+                    action_name,
+                    argument_path,
+                    expected_type,
+                    value,
+                ) from exc
+        return list(coerced_items)
+
+    def _coerce_string_sequence_value(
+        self,
+        value: str,
+    ) -> list[Any] | None:
+        value = value.strip()
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                return decoded
+
+        return None
+
+    def _validate_and_coerce_mapping_value(
+        self,
+        *,
+        action_name: str,
+        argument_path: str,
+        value: Any,
+        args: tuple[Any, ...],
+    ) -> dict[Any, Any]:
+        if not isinstance(value, dict):
+            raise self._invalid_action_argument_type_error(
+                action_name,
+                argument_path,
+                dict,
+                value,
+            )
+
+        key_type = args[0] if len(args) >= 1 else Any
+        value_type = args[1] if len(args) >= 2 else Any
+        return {
+            self._validate_and_coerce_value(
+                action_name=action_name,
+                argument_path=f"{argument_path}.<key>",
+                value=key,
+                expected_type=key_type,
+            ): self._validate_and_coerce_value(
+                action_name=action_name,
+                argument_path=f"{argument_path}[{key!r}]",
+                value=item_value,
+                expected_type=value_type,
+            )
+            for key, item_value in value.items()
+        }
+
+    def _coerce_numeric_action_value(self, value: Any, expected_type: type) -> Any:
+        if self._is_boolean_scalar(value):
+            return value
+        if self._is_valid_numeric_action_value(value, expected_type):
+            return value
+
+        with contextlib.suppress(OverflowError, ValueError, TypeError):
+            coerced_value = expected_type(value)
+            if expected_type is int and not self._is_lossless_int_coercion(
+                value, coerced_value
+            ):
+                return value
+            return coerced_value
+
+        return value
+
+    def _is_lossless_int_coercion(self, value: Any, coerced_value: int) -> bool:
+        if isinstance(value, str):
+            return True
+        return coerced_value == value
+
+    def _is_valid_numeric_action_value(self, value: Any, expected_type: type) -> bool:
+        if self._is_boolean_scalar(value):
+            return False
+        if expected_type is int:
+            return isinstance(value, int)
+        if expected_type is float:
+            return isinstance(value, int) or (
+                isinstance(value, float) and math.isfinite(value)
+            )
+        return False
+
+    @staticmethod
+    def _is_boolean_scalar(value: Any) -> bool:
+        if isinstance(value, bool):
+            return True
+        return getattr(getattr(value, "dtype", None), "kind", None) == "b"
+
+    def _normalize_action_annotation(self, annotation: Any) -> Any:
+        if not isinstance(annotation, str):
+            return annotation
+
+        return {
+            "Any": Any,
+            "any": Any,
+            "bool": bool,
+            "dict": dict,
+            "float": float,
+            "int": int,
+            "list": list,
+            "None": type(None),
+            "NoneType": type(None),
+            "object": object,
+            "set": set,
+            "str": str,
+            "tuple": tuple,
+        }.get(annotation, annotation)
+
+    def _unsupported_runtime_action_annotation_error(
+        self,
+        action_name: str,
+        argument_path: str,
+        expected_type: Any,
+    ) -> ActionAnnotationContractError:
+        return ActionAnnotationContractError(
+            "Unsupported annotation reached runtime validation for action "
+            f"{action_name!r} argument {argument_path!r}: {expected_type!r}."
+        )
+
+    def _invalid_action_argument_type_error(
+        self,
+        action_name: str,
+        argument_path: str,
+        expected_type: Any,
+        value: Any,
+    ) -> ValueError:
+        return ValueError(
+            style(
+                "Invalid argument type for action "
+                f"{action_name!r}: {argument_path!r} expected "
+                f"{self._format_action_expected_type(expected_type)}, "
+                f"got {type(value).__name__}.",
+                color="red",
+            )
+        )
+
+    def _format_action_expected_type(self, expected_type: Any) -> str:
+        expected_type = self._normalize_action_annotation(expected_type)
+        origin = get_origin(expected_type)
+        args = get_args(expected_type)
+
+        if expected_type is Any:
+            return "Any"
+        if origin is Annotated and args:
+            return self._format_action_expected_type(args[0])
+        if origin in {Union, UnionType}:
+            return " | ".join(self._format_action_expected_type(arg) for arg in args)
+        if origin is Literal:
+            return "one of " + repr(args)
+        if expected_type is type(None):
+            return "None"
+        if origin is not None:
+            return str(expected_type).replace("typing.", "")
+        if hasattr(expected_type, "__name__"):
+            return expected_type.__name__
+        return repr(expected_type)
+
+    def _get_action_argument_contract(self, action_fn: Callable) -> dict[str, Any]:
+        signature_allowed: set[str] = set()
+        signature_required: set[str] = set()
+        signature_available = False
+
+        try:
+            signature = inspect.signature(action_fn)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None:
+            signature_available = True
+            action_params = _get_action_parameters(action_fn, signature)
+            signature_allowed = set(action_params)
+            signature_required = set(
+                _get_required_action_parameter_names(action_params)
+            )
+
+        schema = getattr(action_fn, "__action_schema__", None)
+        schema_allowed: set[str] = set()
+        schema_required: set[str] = set()
+        if isinstance(schema, dict):
+            parameters = schema.get("parameters", {})
+            if isinstance(parameters, dict):
+                properties = parameters.get("properties", {})
+                if isinstance(properties, dict):
+                    schema_allowed = set(properties)
+                required = parameters.get("required", [])
+                if isinstance(required, list | tuple):
+                    schema_required = set(required)
+
+        return {
+            "allowed": signature_allowed if signature_available else schema_allowed,
+            "required": (
+                signature_required if signature_available else schema_required
+            ),
+            "accepts_extra_arguments": False,
+        }
+
+    def _get_agent_parameter_name(self, action_fn: Callable) -> str | None:
+        try:
+            signature = inspect.signature(action_fn)
+        except (TypeError, ValueError):
+            return None
+
+        for param_name, param in signature.parameters.items():
+            if param_name.lower() != "agent":
+                continue
+            if _is_keyword_injectable_parameter(param):
+                return param_name
+
+        return None

@@ -64,7 +64,7 @@ from mesa.model import Model
 
 from mesa_llm.llm_agent import LLMAgent
 from mesa_llm.reasoning.cot import CoTReasoning
-from mesa_llm.tools.tool_decorator import tool
+from mesa_llm.tools import tool
 
 @tool
 def inspect_status(agent) -> str:

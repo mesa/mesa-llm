@@ -1,20 +1,43 @@
 # tests/test_llm_agent.py
 
+import asyncio
+import gc
 import json
 import logging
 import warnings
-from unittest.mock import Mock
+import weakref
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from litellm.exceptions import APIConnectionError, RateLimitError, Timeout
 from mesa.agent import Agent
 from mesa.discrete_space import OrthogonalMooreGrid
 from mesa.model import Model
 from mesa.space import ContinuousSpace, MultiGrid, SingleGrid
 
-from mesa_llm import Plan
+import mesa_llm.actions as action_exports
+import mesa_llm.llm_agent as llm_agent_module
+from mesa_llm import (
+    ActionPostCommitError as RootActionPostCommitError,
+)
+from mesa_llm import (
+    Plan,
+)
+from mesa_llm.actions import (
+    ActionChoice,
+    ActionManager,
+    ActionPostCommitError,
+    action,
+    wait,
+)
+from mesa_llm.actions.action_decorator import _GLOBAL_ACTION_REGISTRY
+from mesa_llm.actions.action_manager import _UNSET as _ACTIONS_UNSET
 from mesa_llm.llm_agent import LLMAgent
+from mesa_llm.memory.episodic_memory import EpisodicMemory
 from mesa_llm.memory.st_memory import ShortTermMemory
 from mesa_llm.reasoning.react import ReActReasoning
+from mesa_llm.reasoning.reasoning import _UNSET as _TOOLS_UNSET
 from mesa_llm.tools.tool_decorator import tool
 from mesa_llm.tools.tool_manager import ToolManager
 
@@ -104,6 +127,4113 @@ def test_llm_agent_tools_constructor_tri_state():
     assert explicit_tools_agent._tool_manager.tools == {
         "agent_constructor_tool": agent_constructor_tool
     }
+
+
+def test_llm_agent_actions_constructor_tri_state():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    model = DummyModel()
+
+    no_actions_agent = LLMAgent(model, reasoning=ReActReasoning, actions=None)
+    empty_actions_agent = LLMAgent(model, reasoning=ReActReasoning, actions=[])
+    explicit_actions_agent = LLMAgent(
+        model,
+        reasoning=ReActReasoning,
+        actions=[wait],
+    )
+
+    assert no_actions_agent._action_manager.actions == {}
+    assert empty_actions_agent._action_manager.actions == {}
+    assert explicit_actions_agent._action_manager.actions == {"wait": wait}
+    assert explicit_actions_agent._action_manager.available_actions() == {"wait": wait}
+
+
+def test_llm_agent_actions_constructor_accepts_registered_action_name():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    original_registry = dict(_GLOBAL_ACTION_REGISTRY)
+    try:
+
+        @action
+        def llm_agent_registered_action(agent, value: int) -> int:
+            """Registered action.
+
+            Args:
+                value: Value to return.
+
+            Returns:
+                The value.
+            """
+            del agent
+            return value
+
+        agent = LLMAgent(
+            DummyModel(),
+            reasoning=ReActReasoning,
+            actions=["llm_agent_registered_action"],
+        )
+
+        assert agent._action_manager.actions == {
+            "llm_agent_registered_action": llm_agent_registered_action
+        }
+        assert agent._action_manager.available_actions() == {
+            "llm_agent_registered_action": llm_agent_registered_action
+        }
+    finally:
+        _GLOBAL_ACTION_REGISTRY.clear()
+        _GLOBAL_ACTION_REGISTRY.update(original_registry)
+
+
+def _exception_signature(call):
+    try:
+        call()
+    except Exception as exc:
+        return type(exc), str(exc)
+    pytest.fail("Expected construction to raise an exception.")
+
+
+def _assert_failed_llm_agent_construction_is_cleaned_up(
+    monkeypatch,
+    constructor,
+    expected_exception,
+    expected_exception_object=None,
+):
+    model = Model(rng=42)
+    baseline_agent = Agent(model)
+    baseline_count = len(model.agents)
+    registered_agents = []
+    original_register_agent = model.register_agent
+
+    def capture_registered_agent(agent):
+        result = original_register_agent(agent)
+        registered_agents.append(agent)
+        return result
+
+    monkeypatch.setattr(model, "register_agent", capture_registered_agent)
+
+    try:
+        constructor(model)
+    except Exception as exc:
+        initialization_error = exc
+    else:
+        pytest.fail("Expected LLMAgent construction to raise an exception.")
+
+    assert (type(initialization_error), str(initialization_error)) == expected_exception
+    if expected_exception_object is not None:
+        assert initialization_error is expected_exception_object
+    assert len(registered_agents) == 1
+
+    failed_agent = registered_agents.pop()
+    failed_agent_ref = weakref.ref(failed_agent)
+
+    assert len(model.agents) == baseline_count
+    assert baseline_agent in model.agents
+    assert failed_agent not in model.agents
+    assert all(
+        failed_agent not in typed_agents
+        for typed_agents in model.agents_by_type.values()
+    )
+
+    initialization_error.__traceback__ = None
+    del initialization_error, failed_agent
+    gc.collect()
+
+    assert failed_agent_ref() is None
+
+
+def test_llm_agent_registration_failure_after_mesa_mutation_is_cleaned_up():
+    registration_error = RuntimeError("register_agent failed after registration")
+
+    class RaiseAfterRegistrationModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+            self.registered_agent_ref = None
+
+        def register_agent(self, agent):
+            super().register_agent(agent)
+            self.registered_agent_ref = weakref.ref(agent)
+            raise registration_error
+
+    model = RaiseAfterRegistrationModel()
+
+    def construct_and_assert_cleanup():
+        with pytest.raises(RuntimeError) as exc_info:
+            LLMAgent(model, reasoning=ReActReasoning)
+
+        assert exc_info.value is registration_error
+        assert str(exc_info.value) == "register_agent failed after registration"
+
+        failed_agent_ref = model.registered_agent_ref
+        assert failed_agent_ref is not None
+        failed_agent = failed_agent_ref()
+        assert failed_agent is not None
+        assert failed_agent not in model.agents
+        assert all(
+            failed_agent not in typed_agents
+            for typed_agents in model.agents_by_type.values()
+        )
+
+        exc_info.value.__traceback__ = None
+        return failed_agent_ref
+
+    failed_agent_ref = construct_and_assert_cleanup()
+    gc.collect()
+
+    assert failed_agent_ref() is None
+
+
+def test_llm_agent_unknown_action_failure_cleans_up_mesa_registration(monkeypatch):
+    missing_action_name = "missing_llm_agent_lifecycle_action"
+    expected_exception = _exception_signature(
+        lambda: ActionManager(actions=[missing_action_name])
+    )
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(
+            model,
+            reasoning=ReActReasoning,
+            actions=[missing_action_name],
+        ),
+        expected_exception,
+    )
+
+
+def test_llm_agent_undecorated_action_failure_cleans_up_mesa_registration(
+    monkeypatch,
+):
+    def undecorated_action(agent, value: int) -> int:
+        """Return a value supplied by an agent."""
+        del agent
+        return value
+
+    expected_exception = _exception_signature(
+        lambda: ActionManager(actions=[undecorated_action])
+    )
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(
+            model,
+            reasoning=ReActReasoning,
+            actions=[undecorated_action],
+        ),
+        expected_exception,
+    )
+
+
+def test_llm_agent_invalid_tool_failure_cleans_up_mesa_registration(monkeypatch):
+    invalid_tool = object()
+    expected_exception = _exception_signature(lambda: ToolManager(tools=[invalid_tool]))
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(
+            model,
+            reasoning=ReActReasoning,
+            tools=[invalid_tool],
+        ),
+        expected_exception,
+    )
+
+
+def test_llm_agent_reasoning_failure_cleans_up_mesa_registration(monkeypatch):
+    reasoning_error = RuntimeError("reasoning constructor failed")
+
+    class FailingReasoning(ReActReasoning):
+        def __init__(self, agent):
+            del agent
+            raise reasoning_error
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LLMAgent(model, reasoning=FailingReasoning),
+        (RuntimeError, "reasoning constructor failed"),
+        expected_exception_object=reasoning_error,
+    )
+
+
+def test_llm_agent_late_failure_bypasses_overridden_remove_during_cleanup(
+    monkeypatch,
+):
+    late_initialization_error = RuntimeError("late LLMAgent initialization failed")
+
+    class LateFailingLLMAgent(LLMAgent):
+        remove_calls = 0
+
+        @LLMAgent.system_prompt.setter
+        def system_prompt(self, value):
+            del value
+            raise late_initialization_error
+
+        def remove(self):
+            type(self).remove_calls += 1
+            raise AssertionError("failed-construction cleanup called remove override")
+
+    _assert_failed_llm_agent_construction_is_cleaned_up(
+        monkeypatch,
+        lambda model: LateFailingLLMAgent(model, reasoning=ReActReasoning),
+        (RuntimeError, "late LLMAgent initialization failed"),
+        expected_exception_object=late_initialization_error,
+    )
+
+    assert LateFailingLLMAgent.remove_calls == 0
+
+
+def test_successful_llm_agent_construction_remains_registered():
+    model = Model(rng=42)
+    baseline_agent = Agent(model)
+    baseline_count = len(model.agents)
+
+    agent = LLMAgent(model, reasoning=ReActReasoning)
+
+    assert len(model.agents) == baseline_count + 1
+    assert baseline_agent in model.agents
+    assert agent in model.agents
+    assert agent in model.agents_by_type[type(agent)]
+
+
+def test_llm_agent_does_not_expose_public_action_manager_property():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+
+    assert agent._action_manager.available_actions() == {"wait": wait}
+    assert not hasattr(agent, "action_manager")
+
+
+def test_execute_action_validates_before_mutation_and_executes_configured_action():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[increment_counter],
+    )
+    agent.counter = 0
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        agent.execute_action(
+            ActionChoice(name="increment_counter", arguments={}),
+        )
+
+    assert agent.counter == 0
+
+    result = agent.execute_action(
+        ActionChoice(
+            name="increment_counter",
+            arguments={"amount": "2"},
+        ),
+    )
+
+    assert result == "incremented"
+    assert agent.counter == 2
+
+
+def test_execute_action_respects_omitted_explicit_and_narrowed_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def selected_action(agent, amount: int) -> str:
+        """Selected action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Selection confirmation.
+        """
+        agent.selected += amount
+        return "selected"
+
+    @action(action_manager=ActionManager())
+    def other_action(agent, amount: int) -> str:
+        """Other action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Other confirmation.
+        """
+        agent.other += amount
+        return "other"
+
+    @action(action_manager=ActionManager())
+    def unconfigured_action(agent) -> str:
+        """Unconfigured action.
+
+        Returns:
+            Unconfigured confirmation.
+        """
+        agent.unconfigured += 1
+        return "unconfigured"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[selected_action, other_action],
+    )
+    agent.selected = 0
+    agent.other = 0
+    agent.unconfigured = 0
+
+    assert (
+        agent.execute_action(
+            ActionChoice(name="other_action", arguments={"amount": 3}),
+        )
+        == "other"
+    )
+    assert agent.other == 3
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="Unknown action name"):
+            agent.execute_action(
+                ActionChoice(name="selected_action", arguments={"amount": 1}),
+                actions=no_actions,
+            )
+
+    assert agent.selected == 0
+
+    assert (
+        agent.execute_action(
+            ActionChoice(name="selected_action", arguments={"amount": 2}),
+            actions=["selected_action"],
+        )
+        == "selected"
+    )
+    assert agent.selected == 2
+
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.execute_action(
+            ActionChoice(name="other_action", arguments={"amount": 1}),
+            actions=[selected_action],
+        )
+
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.execute_action(
+            ActionChoice(name="selected_action", arguments={"amount": 1}),
+            actions=[unconfigured_action],
+        )
+
+    assert agent.selected == 2
+    assert agent.other == 3
+    assert agent.unconfigured == 0
+
+
+def _action_choice_response(content, reasoning_content=None):
+    message = SimpleNamespace(content=content, reasoning_content=reasoning_content)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(choices=[choice])
+
+
+_ACTION_CHOICE_CONTENT_ABSENT = object()
+
+
+def _action_choice_response_with_parsed(
+    *,
+    parsed,
+    content=_ACTION_CHOICE_CONTENT_ABSENT,
+):
+    message_fields = {"parsed": parsed}
+    if content is not _ACTION_CHOICE_CONTENT_ABSENT:
+        message_fields["content"] = content
+    message = SimpleNamespace(**message_fields)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(choices=[choice])
+
+
+def _close_possible_coroutine(result):
+    possible_coroutine = getattr(result, "result", result)
+    if asyncio.iscoroutine(possible_coroutine):
+        possible_coroutine.close()
+
+
+def _assert_rejects_async_action_without_unawaited_warning(call):
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always", RuntimeWarning)
+        result = None
+        try:
+            result = call()
+        except TypeError as exc:
+            message = str(exc).lower()
+            assert any(term in message for term in ("async", "await", "coroutine"))
+        else:
+            _close_possible_coroutine(result)
+            pytest.fail("Expected sync execution to reject an async action.")
+        finally:
+            result = None
+            gc.collect()
+
+    unawaited_warnings = [
+        warning
+        for warning in caught_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and "was never awaited" in str(warning.message)
+    ]
+    assert unawaited_warnings == []
+
+
+def _make_local_action_choice_agent(
+    llm_model: str = "gemini/gemini-2.0-flash",
+    api_base: str | None = None,
+):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def local_increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        llm_model=llm_model,
+        api_base=api_base,
+        actions=[local_increment_counter],
+    )
+    agent.counter = 0
+    return agent, local_increment_counter
+
+
+def _make_nested_action_choice_agent():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def local_accept_payload(
+        agent,
+        payload: dict[str, list[dict[str, str]]],
+    ) -> str:
+        """Accept a nested payload.
+
+        Args:
+            payload: Nested object and array data to accept.
+
+        Returns:
+            Acceptance confirmation.
+        """
+        agent.counter += 1
+        return "accepted"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        llm_model="openai/gpt-4o",
+        actions=[local_accept_payload],
+    )
+    agent.counter = 0
+    return agent
+
+
+_ACTION_SELECTION_TRANSPORT_ERRORS = (
+    APIConnectionError,
+    Timeout,
+    RateLimitError,
+)
+
+_ACTION_SELECTION_RESPONSE_FORMAT_CASES = (
+    pytest.param(
+        "openai/gpt-4o",
+        None,
+        {"type": "json_object"},
+        id="openai-json-object",
+    ),
+    pytest.param(
+        "openai/strict-compatible-model",
+        "http://strict-openai-compatible.test/v1",
+        {"type": "json_object"},
+        id="custom-api-base-openai-json-object",
+    ),
+    pytest.param(
+        "gemini/gemini-2.0-flash",
+        None,
+        ActionChoice,
+        id="gemini-action-choice",
+    ),
+    pytest.param(
+        "ollama/llama3.2:3b",
+        None,
+        ActionChoice,
+        id="ollama-action-choice",
+    ),
+    pytest.param(
+        "ollama_chat/llama3.2:3b",
+        None,
+        ActionChoice,
+        id="ollama-chat-action-choice",
+    ),
+)
+
+
+_VALID_PARSED_ACTION_CHOICE = {
+    "name": "local_increment_counter",
+    "arguments": {"amount": "41"},
+    "rationale": "Keep this parsed rationale exactly.",
+}
+
+_DUPLICATE_TOP_LEVEL_NAME_JSON = (
+    '{"name":"ignored_duplicate_name",'
+    '"name":"local_increment_counter",'
+    '"arguments":{"amount":1},'
+    '"rationale":"Keep the raw name rationale exactly."}'
+)
+_DUPLICATE_TOP_LEVEL_ARGUMENTS_JSON = (
+    '{"name":"local_increment_counter",'
+    '"arguments":{"amount":999,"unexpected":"ignored duplicate"},'
+    '"arguments":{"amount":2},'
+    '"rationale":"Keep the raw arguments rationale exactly."}'
+)
+_DUPLICATE_NESTED_ARGUMENT_JSON = (
+    '{"name":"local_increment_counter",'
+    '"arguments":{"amount":999,"amount":3},'
+    '"rationale":"Keep the nested arguments rationale exactly."}'
+)
+
+_DUPLICATE_ACTION_CHOICE_JSON_OBJECTS = (
+    ("top-level-name", _DUPLICATE_TOP_LEVEL_NAME_JSON),
+    ("top-level-arguments", _DUPLICATE_TOP_LEVEL_ARGUMENTS_JSON),
+    ("nested-arguments", _DUPLICATE_NESTED_ARGUMENT_JSON),
+)
+_ACTION_CHOICE_JSON_ENVELOPES = (
+    ("plain", "", ""),
+    ("fenced", "```json\n", "\n```"),
+    ("embedded", "Selected action follows:\n", "\nEnd selected action."),
+)
+_DUPLICATE_ACTION_CHOICE_CONTENT_CASES = tuple(
+    pytest.param(prefix + object_text + suffix, id=f"{envelope_id}-{duplicate_id}")
+    for duplicate_id, object_text in _DUPLICATE_ACTION_CHOICE_JSON_OBJECTS
+    for envelope_id, prefix, suffix in _ACTION_CHOICE_JSON_ENVELOPES
+)
+
+_PARSED_ONLY_RAW_CONTENT_CASES = (
+    pytest.param(_ACTION_CHOICE_CONTENT_ABSENT, id="missing-content-attribute"),
+    pytest.param(None, id="none-raw-content"),
+    pytest.param(" \n\t ", id="blank-raw-content"),
+)
+
+_NO_PARSED_ACTION_CHOICE = object()
+_VALID_RAW_ACTION_CHOICE_JSON = json.dumps(
+    {
+        "name": "local_increment_counter",
+        "arguments": {"amount": 1},
+        "rationale": "Use the complete action choice.",
+    },
+    separators=(",", ":"),
+)
+_FINAL_A8_REJECTION_CASES = (
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + '\n{"name":',
+        _NO_PARSED_ACTION_CHOICE,
+        id="valid-plus-incomplete-second",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + "\n}",
+        _NO_PARSED_ACTION_CHOICE,
+        id="unmatched-closing-brace",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + '\n{"name":"local_increment_counter',
+        _NO_PARSED_ACTION_CHOICE,
+        id="second-unterminated-string",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + '\n{"name":"local_increment_counter\\',
+        _NO_PARSED_ACTION_CHOICE,
+        id="second-unfinished-escape",
+    ),
+    pytest.param(
+        _VALID_RAW_ACTION_CHOICE_JSON + "\n" + _VALID_RAW_ACTION_CHOICE_JSON,
+        _NO_PARSED_ACTION_CHOICE,
+        id="complete-second-object",
+    ),
+    pytest.param(
+        '{"name":"local_increment_counter","arguments":{"amount":1},'
+        '"rationale":"cut off"',
+        _NO_PARSED_ACTION_CHOICE,
+        id="standalone-truncated-object",
+    ),
+    pytest.param(
+        '{"name":"local_increment_counter","arguments":{"amount":1,},'
+        '"rationale":"malformed"}',
+        _NO_PARSED_ACTION_CHOICE,
+        id="malformed-balanced-candidate",
+    ),
+    pytest.param(
+        "invalid nonblank raw action choice",
+        _VALID_PARSED_ACTION_CHOICE,
+        id="invalid-raw-with-valid-parsed",
+    ),
+)
+
+_VALID_NESTED_ACTION_ARGUMENTS = {
+    "payload": {
+        "items": [
+            {"text": "Braces are string data: {left} and } right."},
+            {"text": 'Escaped quotes remain string data: "choose this".'},
+        ]
+    }
+}
+_VALID_NESTED_ACTION_CHOICE_JSON = json.dumps(
+    {
+        "name": "local_accept_payload",
+        "arguments": _VALID_NESTED_ACTION_ARGUMENTS,
+        "rationale": 'Nested arrays, braces, and "quotes" are valid.',
+    },
+    separators=(",", ":"),
+)
+_FINAL_A8_VALID_CONTROL_CASES = (
+    pytest.param(_VALID_NESTED_ACTION_CHOICE_JSON, id="plain"),
+    pytest.param(
+        "```json\n" + _VALID_NESTED_ACTION_CHOICE_JSON + "\n```",
+        id="fenced",
+    ),
+    pytest.param(
+        "Selected action follows:\n"
+        + _VALID_NESTED_ACTION_CHOICE_JSON
+        + "\nEnd selected action.",
+        id="prose-embedded",
+    ),
+)
+
+
+def _make_action_selection_transport_error(error_type):
+    return error_type(
+        message="selection transport failure",
+        llm_provider="openai",
+        model="openai/gpt-4o",
+        max_retries=0,
+        num_retries=0,
+    )
+
+
+def _action_selection_state(agent):
+    return (
+        agent.counter,
+        tuple(agent.internal_state),
+        agent.model.steps,
+        tuple(agent.memory.short_term_memory),
+        dict(agent.memory.step_content),
+    )
+
+
+def _assert_normalized_action_selection_transport_error(
+    error,
+    error_type,
+):
+    assert type(error) is error_type
+    assert error.llm_provider == "openai"
+    assert error.model == "openai/gpt-4o"
+    assert error.num_retries == 0
+    assert error.max_retries == 0
+    assert "selection transport failure" in str(error)
+
+    if error_type is RateLimitError:
+        assert "Rate limit exceeded for model 'openai/gpt-4o'." in str(error)
+        assert "https://developers.openai.com/api/docs/guides/rate-limits" in str(error)
+    else:
+        assert str(error) == (
+            f"litellm.{error_type.__name__}: selection transport failure"
+        )
+
+
+def _assert_action_selection_response_format(actual, expected):
+    if expected is ActionChoice:
+        assert actual is ActionChoice
+    else:
+        assert actual == expected
+
+
+def _assert_one_shot_action_selection_provider_call(provider_calls):
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+
+
+def _final_a8_action_choice_response(content, parsed):
+    if parsed is _NO_PARSED_ACTION_CHOICE:
+        return _action_choice_response(content)
+    return _action_choice_response_with_parsed(content=content, parsed=parsed)
+
+
+def _guard_action_selection_side_effects(agent):
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("rejected action choice must not execute")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("rejected action choice must not execute")
+    )
+    agent.memory.add_to_memory = Mock(
+        side_effect=AssertionError("rejected action choice must not reach memory")
+    )
+    agent.memory.aadd_to_memory = AsyncMock(
+        side_effect=AssertionError("rejected action choice must not reach memory")
+    )
+    return _action_selection_state(agent)
+
+
+def _assert_no_action_selection_side_effects(agent, state_before):
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("llm_model", "api_base", "expected_response_format"),
+    _ACTION_SELECTION_RESPONSE_FORMAT_CASES,
+)
+def test_choose_action_routes_response_format_and_validates_raw_json_locally(
+    monkeypatch,
+    llm_model,
+    api_base,
+    expected_response_format,
+):
+    provider_calls = []
+
+    def _raw_json_completion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "9"},
+                    "rationale": "Validate this raw provider JSON locally.",
+                }
+            )
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _raw_json_completion)
+    agent, _ = _make_local_action_choice_agent(
+        llm_model=llm_model,
+        api_base=api_base,
+    )
+    generate = Mock(wraps=agent.llm.generate)
+    agent.llm.generate = generate
+
+    choice = agent.choose_action("Choose one local action.")
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 9},
+        rationale="Validate this raw provider JSON locally.",
+    )
+    assert agent.counter == 0
+
+    generate.assert_called_once()
+    selection_kwargs = generate.call_args.kwargs
+    assert selection_kwargs["tool_schema"] is None
+    assert selection_kwargs["tool_choice"] == "none"
+    assert selection_kwargs["suppress_thinking"] is True
+    _assert_action_selection_response_format(
+        selection_kwargs["response_format"],
+        expected_response_format,
+    )
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is selection_kwargs["response_format"]
+    if api_base is not None:
+        assert provider_kwargs["api_base"] == api_base
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_rationale"),
+    [
+        (
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "3"},
+                    "rationale": "Plain local JSON.",
+                },
+            ),
+            "Plain local JSON.",
+        ),
+        (
+            "```json\n"
+            + json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "4"},
+                    "rationale": "Fenced local JSON.",
+                },
+            )
+            + "\n```",
+            "Fenced local JSON.",
+        ),
+        (
+            "I will commit to this action:\n"
+            + json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "5"},
+                    "rationale": "Embedded local JSON.",
+                },
+            )
+            + "\nNo tools are needed.",
+            "Embedded local JSON.",
+        ),
+    ],
+)
+def test_choose_action_parses_local_json_fallbacks_and_validates_choice(
+    content,
+    expected_rationale,
+):
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.generate = Mock(return_value=_action_choice_response(content))
+
+    choice = agent.choose_action("Choose one local action.")
+
+    assert choice.name == "local_increment_counter"
+    assert isinstance(choice.arguments["amount"], int)
+    assert choice.rationale == expected_rationale
+    assert agent.counter == 0
+
+    agent.llm.generate.assert_called_once()
+    call_kwargs = agent.llm.generate.call_args.kwargs
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.parametrize("entrypoint", ["choose_action", "act"])
+@pytest.mark.parametrize(("content", "parsed"), _FINAL_A8_REJECTION_CASES)
+def test_final_a8_sync_entrypoints_reject_invalid_or_ambiguous_raw_content_once(
+    monkeypatch,
+    entrypoint,
+    content,
+    parsed,
+):
+    provider_calls = []
+
+    def _completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("invalid action choice triggered a retry or repair")
+        return _final_a8_action_choice_response(content, parsed)
+
+    async_completion = AsyncMock(
+        side_effect=AssertionError("sync action selection called acompletion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", async_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    generate = Mock(wraps=agent.llm.generate)
+    agent.llm.generate = generate
+    state_before = _guard_action_selection_side_effects(agent)
+
+    with pytest.raises(ValueError):
+        getattr(agent, entrypoint)("Reject structurally invalid action output.")
+
+    generate.assert_called_once()
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+    async_completion.assert_not_awaited()
+
+
+@pytest.mark.parametrize("content", _FINAL_A8_VALID_CONTROL_CASES)
+def test_final_a8_choose_action_accepts_nested_string_and_envelope_controls_once(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    def _completion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(content)
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _completion)
+    agent = _make_nested_action_choice_agent()
+    state_before = _guard_action_selection_side_effects(agent)
+
+    choice = agent.choose_action("Choose the nested payload action.")
+
+    assert choice == ActionChoice(
+        name="local_accept_payload",
+        arguments=_VALID_NESTED_ACTION_ARGUMENTS,
+        rationale='Nested arrays, braces, and "quotes" are valid.',
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+
+
+@pytest.mark.parametrize("content", _DUPLICATE_ACTION_CHOICE_CONTENT_CASES)
+def test_choose_action_rejects_raw_duplicate_keys_before_valid_parsed_fallback(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    def _duplicate_completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content=content,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _duplicate_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("choose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        agent.choose_action("Reject duplicate keys in the raw action choice.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_act_rejects_raw_duplicate_keys_once_without_execution_or_recording(
+    monkeypatch,
+):
+    provider_calls = []
+
+    def _duplicate_completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content="```json\n" + _DUPLICATE_TOP_LEVEL_ARGUMENTS_JSON + "\n```",
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _duplicate_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("act must not execute a duplicate action choice")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        agent.act("Reject duplicate keys before executing an action.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize("content", _PARSED_ONLY_RAW_CONTENT_CASES)
+def test_choose_action_uses_parsed_fallback_only_when_raw_content_is_unavailable(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    def _parsed_completion(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError(
+                "parsed-only action choice triggered an implicit retry"
+            )
+        return _action_choice_response_with_parsed(
+            content=content,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _parsed_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("choose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    choice = agent.choose_action("Use parsed data only without usable raw content.")
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 41},
+        rationale="Keep this parsed rationale exactly.",
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"name": "local_increment_counter", "arguments": {"amount":',
+        json.dumps({"name": "local_increment_counter"}),
+        json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": 1},
+            },
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": 2},
+            },
+        ),
+    ],
+)
+def test_choose_action_rejects_invalid_or_ambiguous_local_output_before_mutation(
+    content,
+):
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.generate = Mock(return_value=_action_choice_response(content))
+    agent.execute_action = Mock(side_effect=AssertionError("must not execute"))
+
+    with pytest.raises(ValueError):
+        agent.choose_action("Choose one local action.")
+
+    assert agent.counter == 0
+    agent.llm.generate.assert_called_once()
+    agent.execute_action.assert_not_called()
+
+
+def test_choose_action_invalid_output_makes_one_provider_request_without_tools(
+    monkeypatch,
+):
+    calls = []
+
+    def _invalid_completion(**kwargs):
+        calls.append(kwargs)
+        return _action_choice_response("not valid action JSON")
+
+    monkeypatch.setattr("mesa_llm.module_llm.completion", _invalid_completion)
+    agent, _ = _make_local_action_choice_agent(llm_model="ollama/llama3.2:3b")
+
+    with pytest.raises(ValueError):
+        agent.choose_action("Choose one local action.")
+
+    assert len(calls) == 1
+    provider_kwargs = calls[0]
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is ActionChoice
+    assert provider_kwargs["think"] is False
+    assert agent.counter == 0
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    _ACTION_SELECTION_TRANSPORT_ERRORS,
+    ids=lambda error_type: error_type.__name__,
+)
+def test_act_transport_error_is_one_shot_and_mutation_free(
+    monkeypatch,
+    error_type,
+):
+    provider_calls = []
+    original_error = _make_action_selection_transport_error(error_type)
+
+    def _raise_transport_error(**kwargs):
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("action selection retried after a transport error")
+        raise original_error
+
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.completion",
+        _raise_transport_error,
+    )
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("transport failure must prevent action execution")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(error_type) as exc_info:
+        agent.act("Choose and execute one local action.")
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] == {"type": "json_object"}
+    _assert_normalized_action_selection_transport_error(
+        exc_info.value,
+        error_type,
+    )
+    assert _action_selection_state(agent) == state_before
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_act_extra_argument_fails_after_one_provider_request_before_mutation(
+    monkeypatch,
+):
+    provider_calls = []
+
+    def _extra_argument_completion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": 1, "undeclared": "reject me"},
+                    "rationale": "Attempt an invalid local action.",
+                }
+            )
+        )
+
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.completion",
+        _extra_argument_completion,
+    )
+    agent, _ = _make_local_action_choice_agent()
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("act must not execute an invalid selection")
+    )
+
+    with pytest.raises(ValueError, match="Unexpected argument"):
+        agent.act("Choose and execute one local action.")
+
+    assert len(provider_calls) == 1
+    assert agent.counter == 0
+    assert "action" not in agent.memory.step_content
+    agent.execute_action.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_choose_action_prefers_final_content_over_reasoning_json():
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "8"},
+                    "rationale": "Use final content.",
+                },
+            ),
+            reasoning_content=(
+                "Reasoning considered another object: "
+                '{"name": "local_increment_counter", "arguments": {"amount": 1}}'
+            ),
+        ),
+    )
+
+    choice = agent.choose_action("Choose one local action.")
+
+    assert choice.name == "local_increment_counter"
+    assert choice.arguments == {"amount": 8}
+    assert choice.rationale == "Use final content."
+    assert agent.counter == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("llm_model", "api_base", "expected_response_format"),
+    _ACTION_SELECTION_RESPONSE_FORMAT_CASES,
+)
+async def test_achoose_action_routes_response_format_and_validates_raw_json_locally(
+    monkeypatch,
+    llm_model,
+    api_base,
+    expected_response_format,
+):
+    provider_calls = []
+
+    async def _raw_json_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": "10"},
+                    "rationale": "Validate this async provider JSON locally.",
+                }
+            )
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _raw_json_acompletion)
+    agent, _ = _make_local_action_choice_agent(
+        llm_model=llm_model,
+        api_base=api_base,
+    )
+    agenerate = AsyncMock(wraps=agent.llm.agenerate)
+    agent.llm.agenerate = agenerate
+
+    choice = await agent.achoose_action("Choose one async local action.")
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 10},
+        rationale="Validate this async provider JSON locally.",
+    )
+    assert agent.counter == 0
+
+    agenerate.assert_awaited_once()
+    selection_kwargs = agenerate.call_args.kwargs
+    assert selection_kwargs["tool_schema"] is None
+    assert selection_kwargs["tool_choice"] == "none"
+    assert selection_kwargs["suppress_thinking"] is True
+    _assert_action_selection_response_format(
+        selection_kwargs["response_format"],
+        expected_response_format,
+    )
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is selection_kwargs["response_format"]
+    if api_base is not None:
+        assert provider_kwargs["api_base"] == api_base
+    sync_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```json\n"
+        + json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": "6"},
+                "rationale": "Async fenced local JSON.",
+            },
+        )
+        + "\n```",
+        "The selected action is "
+        + json.dumps(
+            {
+                "name": "local_increment_counter",
+                "arguments": {"amount": "7"},
+                "rationale": "Async embedded local JSON.",
+            },
+        ),
+    ],
+)
+async def test_achoose_action_parses_local_json_fallbacks_without_tools(content):
+    agent, _ = _make_local_action_choice_agent()
+    agent.llm.agenerate = AsyncMock(return_value=_action_choice_response(content))
+
+    choice = await agent.achoose_action("Choose one async local action.")
+
+    assert choice.name == "local_increment_counter"
+    assert isinstance(choice.arguments["amount"], int)
+    assert agent.counter == 0
+
+    agent.llm.agenerate.assert_awaited_once()
+    call_kwargs = agent.llm.agenerate.call_args.kwargs
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["suppress_thinking"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["achoose_action", "aact"])
+@pytest.mark.parametrize(("content", "parsed"), _FINAL_A8_REJECTION_CASES)
+async def test_final_a8_async_entrypoints_reject_invalid_or_ambiguous_raw_content_once(
+    monkeypatch,
+    entrypoint,
+    content,
+    parsed,
+):
+    provider_calls = []
+
+    async def _acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("invalid action choice triggered a retry or repair")
+        return _final_a8_action_choice_response(content, parsed)
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agenerate = AsyncMock(wraps=agent.llm.agenerate)
+    agent.llm.agenerate = agenerate
+    state_before = _guard_action_selection_side_effects(agent)
+
+    with pytest.raises(ValueError):
+        await getattr(agent, entrypoint)("Reject structurally invalid action output.")
+
+    agenerate.assert_awaited_once()
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+    sync_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", _FINAL_A8_VALID_CONTROL_CASES)
+async def test_final_a8_achoose_action_accepts_nested_string_and_envelope_controls_once(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    async def _acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        return _action_choice_response(content)
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _acompletion)
+    agent = _make_nested_action_choice_agent()
+    state_before = _guard_action_selection_side_effects(agent)
+
+    choice = await agent.achoose_action("Choose the nested payload action.")
+
+    assert choice == ActionChoice(
+        name="local_accept_payload",
+        arguments=_VALID_NESTED_ACTION_ARGUMENTS,
+        rationale='Nested arrays, braces, and "quotes" are valid.',
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    _assert_no_action_selection_side_effects(agent, state_before)
+    sync_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_rejects_raw_duplicate_keys_before_valid_parsed_fallback(
+    monkeypatch,
+):
+    provider_calls = []
+
+    async def _duplicate_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content=(
+                "Selected action follows:\n"
+                + _DUPLICATE_NESTED_ARGUMENT_JSON
+                + "\nEnd selected action."
+            ),
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _duplicate_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        await agent.achoose_action("Reject duplicate keys in the raw action choice.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aact_rejects_raw_duplicate_keys_once_without_execution_or_recording(
+    monkeypatch,
+):
+    provider_calls = []
+
+    async def _duplicate_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError("duplicate action JSON triggered an implicit retry")
+        return _action_choice_response_with_parsed(
+            content=_DUPLICATE_TOP_LEVEL_NAME_JSON,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _duplicate_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("aact must not call execute_action")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("aact must not execute a duplicate action choice")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        await agent.aact("Reject duplicate keys before executing an action.")
+
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", _PARSED_ONLY_RAW_CONTENT_CASES)
+async def test_achoose_action_uses_parsed_fallback_when_raw_content_is_unavailable(
+    monkeypatch,
+    content,
+):
+    provider_calls = []
+
+    async def _parsed_acompletion(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError(
+                "parsed-only action choice triggered an implicit retry"
+            )
+        return _action_choice_response_with_parsed(
+            content=content,
+            parsed=_VALID_PARSED_ACTION_CHOICE,
+        )
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _parsed_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("achoose_action must not execute an action")
+    )
+    state_before = _action_selection_state(agent)
+
+    choice = await agent.achoose_action(
+        "Use parsed data only without usable raw content."
+    )
+
+    assert choice == ActionChoice(
+        name="local_increment_counter",
+        arguments={"amount": 41},
+        rationale="Keep this parsed rationale exactly.",
+    )
+    _assert_one_shot_action_selection_provider_call(provider_calls)
+    assert _action_selection_state(agent) == state_before
+    assert "action" not in agent.memory.step_content
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_invalid_output_makes_one_provider_request_without_tools(
+    monkeypatch,
+):
+    calls = []
+
+    async def _invalid_acompletion(**kwargs):
+        calls.append(kwargs)
+        return _action_choice_response("not valid action JSON")
+
+    monkeypatch.setattr("mesa_llm.module_llm.acompletion", _invalid_acompletion)
+    agent, _ = _make_local_action_choice_agent(llm_model="ollama_chat/llama3.2:3b")
+
+    with pytest.raises(ValueError):
+        await agent.achoose_action("Choose one async local action.")
+
+    assert len(calls) == 1
+    provider_kwargs = calls[0]
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] is ActionChoice
+    assert provider_kwargs["think"] is False
+    assert agent.counter == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    _ACTION_SELECTION_TRANSPORT_ERRORS,
+    ids=lambda error_type: error_type.__name__,
+)
+async def test_aact_transport_error_is_one_shot_and_mutation_free(
+    monkeypatch,
+    error_type,
+):
+    provider_calls = []
+    original_error = _make_action_selection_transport_error(error_type)
+
+    async def _raise_transport_error(**kwargs):
+        await asyncio.sleep(0)
+        provider_calls.append(kwargs)
+        if len(provider_calls) > 1:
+            raise AssertionError(
+                "async action selection retried after a transport error"
+            )
+        raise original_error
+
+    sync_completion = Mock(
+        side_effect=AssertionError("async action selection called completion()")
+    )
+    monkeypatch.setattr("mesa_llm.module_llm.completion", sync_completion)
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.acompletion",
+        _raise_transport_error,
+    )
+    agent, _ = _make_local_action_choice_agent(llm_model="openai/gpt-4o")
+    agent.recorder = Mock()
+    agent.execute_action = Mock(
+        side_effect=AssertionError("async action selection called execute_action()")
+    )
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("transport failure must prevent action execution")
+    )
+    state_before = _action_selection_state(agent)
+
+    with pytest.raises(error_type) as exc_info:
+        await agent.aact("Choose and execute one async local action.")
+
+    assert len(provider_calls) == 1
+    provider_kwargs = provider_calls[0]
+    assert provider_kwargs["num_retries"] == 0
+    assert provider_kwargs["max_retries"] == 0
+    assert provider_kwargs["fallbacks"] == []
+    assert provider_kwargs["tools"] is None
+    assert provider_kwargs["tool_choice"] is None
+    assert provider_kwargs["response_format"] == {"type": "json_object"}
+    _assert_normalized_action_selection_transport_error(
+        exc_info.value,
+        error_type,
+    )
+    assert _action_selection_state(agent) == state_before
+    sync_completion.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aact_extra_argument_fails_after_one_provider_request_before_mutation(
+    monkeypatch,
+):
+    provider_calls = []
+
+    async def _extra_argument_acompletion(**kwargs):
+        provider_calls.append(kwargs)
+        return _action_choice_response(
+            json.dumps(
+                {
+                    "name": "local_increment_counter",
+                    "arguments": {"amount": 1, "undeclared": "reject me"},
+                    "rationale": "Attempt an invalid async local action.",
+                }
+            )
+        )
+
+    monkeypatch.setattr(
+        "mesa_llm.module_llm.acompletion",
+        _extra_argument_acompletion,
+    )
+    agent, _ = _make_local_action_choice_agent()
+    agent.recorder = Mock()
+    agent.aexecute_action = AsyncMock(
+        side_effect=AssertionError("aact must not execute an invalid selection")
+    )
+
+    with pytest.raises(ValueError, match="Unexpected argument"):
+        await agent.aact("Choose and execute one async local action.")
+
+    assert len(provider_calls) == 1
+    assert agent.counter == 0
+    assert "action" not in agent.memory.step_content
+    agent.aexecute_action.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_choose_action_uses_structured_output_context_and_does_not_execute():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[increment_counter],
+    )
+    agent.counter = 0
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "increment_counter",
+                    "arguments": {"amount": "4"},
+                    "rationale": "Need to update the counter.",
+                },
+            ),
+        ),
+    )
+
+    choice = agent.choose_action(
+        "Choose the next committed action.",
+        system_prompt="system action prompt",
+    )
+
+    assert choice.name == "increment_counter"
+    assert choice.arguments == {"amount": 4}
+    assert choice.rationale == "Need to update the counter."
+    assert agent.counter == 0
+
+    agent.llm.generate.assert_called_once()
+    call_kwargs = agent.llm.generate.call_args.kwargs
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["system_prompt"] == "system action prompt"
+    assert call_kwargs["suppress_thinking"] is True
+
+    action_context = call_kwargs["prompt"][0]
+    assert "Available actions:" in action_context
+    assert (
+        "The `arguments` object may contain only properties declared for "
+        "the selected action."
+    ) in action_context
+    assert '"name": "increment_counter"' in action_context
+    assert '"amount"' in action_context
+    assert "Choose the next committed action." in call_kwargs["prompt"][1]
+
+
+def test_choose_action_fails_fast_when_no_actions_are_available():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    no_action_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=None,
+    )
+    no_action_agent.llm.generate = Mock()
+
+    with pytest.raises(ValueError, match="No actions are available"):
+        no_action_agent.choose_action("Choose an action.")
+
+    no_action_agent.llm.generate.assert_not_called()
+
+    configured_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[wait],
+    )
+    configured_agent.llm.generate = Mock()
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="No actions are available"):
+            configured_agent.choose_action("Choose an action.", actions=no_actions)
+
+    configured_agent.llm.generate.assert_not_called()
+
+
+def test_choose_action_respects_narrowed_actions_and_validates_returned_choice():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def selected_action(agent, amount: int) -> str:
+        """Selected action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Selection confirmation.
+        """
+        agent.selected += amount
+        return "selected"
+
+    @action(action_manager=ActionManager())
+    def other_action(agent, amount: int) -> str:
+        """Other action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Other confirmation.
+        """
+        agent.other += amount
+        return "other"
+
+    @action(action_manager=ActionManager())
+    def unconfigured_action(agent) -> str:
+        """Unconfigured action.
+
+        Returns:
+            Unconfigured confirmation.
+        """
+        agent.unconfigured += 1
+        return "unconfigured"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[selected_action, other_action],
+    )
+    agent.selected = 0
+    agent.other = 0
+    agent.unconfigured = 0
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "selected_action",
+                    "arguments": {"amount": 5},
+                },
+            ),
+        ),
+    )
+
+    choice = agent.choose_action(
+        "Choose from the narrowed action set.",
+        actions=[selected_action],
+    )
+
+    assert choice.name == "selected_action"
+    assert choice.arguments == {"amount": 5}
+    action_context = agent.llm.generate.call_args.kwargs["prompt"][0]
+    assert '"name": "selected_action"' in action_context
+    assert '"name": "other_action"' not in action_context
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "other_action",
+                    "arguments": {"amount": 1},
+                },
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.choose_action(
+            "Choose from the narrowed action set.",
+            actions=[selected_action],
+        )
+
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    agent.llm.generate = Mock()
+    with pytest.raises(ValueError, match="Unknown action name"):
+        agent.choose_action(
+            "Choose from an unconfigured action set.",
+            actions=[unconfigured_action],
+        )
+
+    agent.llm.generate.assert_not_called()
+    assert agent.unconfigured == 0
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_uses_structured_output_context_and_does_not_execute():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def increment_counter(agent, amount: int) -> str:
+        """Increment the counter.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Mutation confirmation.
+        """
+        agent.counter += amount
+        return "incremented"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[increment_counter],
+    )
+    agent.counter = 0
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "increment_counter",
+                    "arguments": {"amount": "4"},
+                    "rationale": "Need to update the counter.",
+                },
+            ),
+        ),
+    )
+
+    choice = await agent.achoose_action(
+        "Choose the next committed action.",
+        system_prompt="async system action prompt",
+    )
+
+    assert choice.name == "increment_counter"
+    assert choice.arguments == {"amount": 4}
+    assert choice.rationale == "Need to update the counter."
+    assert agent.counter == 0
+
+    agent.llm.agenerate.assert_awaited_once()
+    call_kwargs = agent.llm.agenerate.call_args.kwargs
+    assert call_kwargs["response_format"] is ActionChoice
+    assert call_kwargs["tool_schema"] is None
+    assert call_kwargs["tool_choice"] == "none"
+    assert call_kwargs["system_prompt"] == "async system action prompt"
+    assert call_kwargs["suppress_thinking"] is True
+
+    action_context = call_kwargs["prompt"][0]
+    assert "Available actions:" in action_context
+    assert (
+        "The `arguments` object may contain only properties declared for "
+        "the selected action."
+    ) in action_context
+    assert '"name": "increment_counter"' in action_context
+    assert '"amount"' in action_context
+    assert "Choose the next committed action." in call_kwargs["prompt"][1]
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_fails_fast_when_no_actions_are_available():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    no_action_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=None,
+    )
+    no_action_agent.llm.agenerate = AsyncMock()
+
+    with pytest.raises(ValueError, match="No actions are available"):
+        await no_action_agent.achoose_action("Choose an action.")
+
+    no_action_agent.llm.agenerate.assert_not_called()
+
+    configured_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[wait],
+    )
+    configured_agent.llm.agenerate = AsyncMock()
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="No actions are available"):
+            await configured_agent.achoose_action(
+                "Choose an action.",
+                actions=no_actions,
+            )
+
+    configured_agent.llm.agenerate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_achoose_action_respects_omitted_explicit_and_narrowed_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def selected_action(agent, amount: int) -> str:
+        """Selected action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Selection confirmation.
+        """
+        agent.selected += amount
+        return "selected"
+
+    @action(action_manager=ActionManager())
+    def other_action(agent, amount: int) -> str:
+        """Other action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Other confirmation.
+        """
+        agent.other += amount
+        return "other"
+
+    @action(action_manager=ActionManager())
+    def unconfigured_action(agent) -> str:
+        """Unconfigured action.
+
+        Returns:
+            Unconfigured confirmation.
+        """
+        agent.unconfigured += 1
+        return "unconfigured"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[selected_action, other_action],
+    )
+    agent.selected = 0
+    agent.other = 0
+    agent.unconfigured = 0
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "other_action",
+                    "arguments": {"amount": 2},
+                },
+            ),
+        ),
+    )
+
+    omitted_choice = await agent.achoose_action("Use the configured action set.")
+
+    assert omitted_choice.name == "other_action"
+    assert omitted_choice.arguments == {"amount": 2}
+    omitted_context = agent.llm.agenerate.call_args.kwargs["prompt"][0]
+    assert '"name": "selected_action"' in omitted_context
+    assert '"name": "other_action"' in omitted_context
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    for no_actions in [None, []]:
+        agent.llm.agenerate = AsyncMock()
+        with pytest.raises(ValueError, match="No actions are available"):
+            await agent.achoose_action(
+                "Explicitly disable actions.",
+                actions=no_actions,
+            )
+        agent.llm.agenerate.assert_not_called()
+
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "selected_action",
+                    "arguments": {"amount": 5},
+                },
+            ),
+        ),
+    )
+
+    narrowed_choice = await agent.achoose_action(
+        "Choose from the narrowed action set.",
+        actions=[selected_action],
+    )
+
+    assert narrowed_choice.name == "selected_action"
+    assert narrowed_choice.arguments == {"amount": 5}
+    narrowed_context = agent.llm.agenerate.call_args.kwargs["prompt"][0]
+    assert '"name": "selected_action"' in narrowed_context
+    assert '"name": "other_action"' not in narrowed_context
+    assert agent.selected == 0
+    assert agent.other == 0
+
+    agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "other_action",
+                    "arguments": {"amount": 1},
+                },
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="Unknown action name"):
+        await agent.achoose_action(
+            "Choose from the narrowed action set.",
+            actions=[selected_action],
+        )
+
+    agent.llm.agenerate = AsyncMock()
+    with pytest.raises(ValueError, match="Unknown action name"):
+        await agent.achoose_action(
+            "Choose from an unconfigured action set.",
+            actions=[unconfigured_action],
+        )
+
+    agent.llm.agenerate.assert_not_called()
+    assert agent.selected == 0
+    assert agent.other == 0
+    assert agent.unconfigured == 0
+
+
+def test_plan_delegates_to_reasoning_without_exposing_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @tool
+    def workflow_plan_tool(agent, value: int) -> int:
+        """Workflow plan tool.
+
+        Args:
+            value: Value to return.
+
+        Returns:
+            The value.
+        """
+        del agent
+        return value
+
+    @action(action_manager=ActionManager())
+    def workflow_action(agent) -> str:
+        """Workflow action.
+
+        Returns:
+            Action result.
+        """
+        agent.executed = True
+        return "executed"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        tools=[workflow_plan_tool],
+        actions=[workflow_action],
+    )
+    expected_plan = Plan(step=3, llm_plan="planned", ttl=2, tools=[workflow_plan_tool])
+    obs = object()
+    agent.reasoning.plan = Mock(return_value=expected_plan)
+    agent.choose_action = Mock()
+    agent.execute_action = Mock()
+    agent._action_manager.get_actions_schema = Mock(
+        side_effect=AssertionError("plan() must not expose action specs")
+    )
+
+    result = agent.plan(
+        prompt="Create a read-only plan.",
+        obs=obs,
+        ttl=2,
+        tools=[workflow_plan_tool],
+        tool_calls="required",
+    )
+
+    assert result is expected_plan
+    agent.reasoning.plan.assert_called_once()
+    plan_kwargs = agent.reasoning.plan.call_args.kwargs
+    assert plan_kwargs["prompt"] == "Create a read-only plan."
+    assert plan_kwargs["obs"] is obs
+    assert plan_kwargs["ttl"] == 2
+    assert plan_kwargs["tools"] == [workflow_plan_tool]
+    assert plan_kwargs["tool_calls"] == "required"
+    if "selected_tools" in plan_kwargs:
+        assert plan_kwargs["selected_tools"] is _TOOLS_UNSET
+    assert "actions" not in agent.reasoning.plan.call_args.kwargs
+    agent.choose_action.assert_not_called()
+    agent.execute_action.assert_not_called()
+    agent._action_manager.get_actions_schema.assert_not_called()
+
+
+def test_act_calls_public_wrappers_in_order_and_returns_act_result():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    choice = ActionChoice(
+        name="wait", arguments={}, rationale="No state change needed."
+    )
+    calls = []
+
+    def fake_choose_action(
+        prompt,
+        actions=_ACTIONS_UNSET,
+        system_prompt=None,
+    ):
+        calls.append(("choose_action", prompt, actions, system_prompt))
+        return choice
+
+    def fake_execute_action(action_choice, actions=_ACTIONS_UNSET):
+        calls.append(("execute_action", action_choice, actions))
+        return "waited"
+
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.choose_action = fake_choose_action
+    agent.execute_action = fake_execute_action
+
+    result = agent.act("Take one turn.")
+
+    assert [call[0] for call in calls] == ["choose_action", "execute_action"]
+    assert calls[0] == (
+        "choose_action",
+        "Take one turn.",
+        _ACTIONS_UNSET,
+        None,
+    )
+    assert calls[1] == ("execute_action", choice, _ACTIONS_UNSET)
+    agent.plan.assert_not_called()
+    assert result.__class__.__name__ == "ActResult"
+    assert result.action is choice
+    assert result.result == "waited"
+    assert not hasattr(result, "plan")
+    assert not hasattr(result, "success")
+
+
+def test_act_preserves_explicit_action_selector():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    choice = ActionChoice(name="wait", arguments={})
+    calls = []
+
+    def fake_choose_action(
+        prompt,
+        actions=_ACTIONS_UNSET,
+        system_prompt=None,
+    ):
+        calls.append(("choose_action", actions))
+        return choice
+
+    def fake_execute_action(action_choice, actions=_ACTIONS_UNSET):
+        calls.append(("execute_action", actions))
+        return "waited"
+
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.choose_action = fake_choose_action
+    agent.execute_action = fake_execute_action
+
+    result = agent.act("Take one turn.", actions=[wait])
+
+    assert result.result == "waited"
+    assert calls == [
+        ("choose_action", [wait]),
+        ("execute_action", [wait]),
+    ]
+    agent.plan.assert_not_called()
+
+
+def test_plan_then_act_composition_passes_plan_through_prompt():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    plan = Plan(step=1, llm_plan="planned")
+    choice = ActionChoice(name="wait", arguments={})
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.choose_action = Mock(return_value=choice)
+    agent.execute_action = Mock(return_value="waited")
+
+    prompt = f"Use this plan: {plan}"
+    result = agent.act(prompt=prompt)
+
+    assert result.action is choice
+    assert result.result == "waited"
+    agent.plan.assert_not_called()
+    agent.choose_action.assert_called_once_with(
+        prompt,
+        actions=_ACTIONS_UNSET,
+        system_prompt=None,
+    )
+    agent.execute_action.assert_called_once_with(choice, actions=_ACTIONS_UNSET)
+
+
+def test_act_fails_fast_when_explicit_actions_expose_no_actions():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    agent.plan = Mock(side_effect=AssertionError("act() must not call plan()"))
+    agent.execute_action = Mock()
+    agent.llm.generate = Mock()
+
+    for no_actions in [None, []]:
+        with pytest.raises(ValueError, match="No actions are available"):
+            agent.act("Take one turn.", actions=no_actions)
+
+    agent.plan.assert_not_called()
+    agent.llm.generate.assert_not_called()
+    agent.execute_action.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aact_awaits_action_choice_executes_once_and_returns_act_result():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    agent = LLMAgent(DummyModel(), reasoning=ReActReasoning, actions=[wait])
+    choice = ActionChoice(
+        name="wait", arguments={}, rationale="No state change needed."
+    )
+    agent.plan = Mock(side_effect=AssertionError("aact() must not call plan()"))
+    agent.reasoning.aplan = AsyncMock(
+        side_effect=AssertionError("aact() must not call aplan()")
+    )
+    agent.achoose_action = AsyncMock(return_value=choice)
+    agent.execute_action = Mock(
+        side_effect=AssertionError("aact() must not call sync execute_action()")
+    )
+    agent.aexecute_action = AsyncMock(return_value="waited")
+
+    result = await agent.aact(
+        "Take one async turn.",
+        actions=[wait],
+        system_prompt="async action system prompt",
+    )
+
+    agent.achoose_action.assert_awaited_once_with(
+        "Take one async turn.",
+        actions=[wait],
+        system_prompt="async action system prompt",
+    )
+    agent.aexecute_action.assert_awaited_once_with(choice, actions=[wait])
+    agent.execute_action.assert_not_called()
+    agent.plan.assert_not_called()
+    agent.reasoning.aplan.assert_not_called()
+    assert result.__class__.__name__ == "ActResult"
+    assert result.action is choice
+    assert result.result == "waited"
+    assert not hasattr(result, "plan")
+    assert not hasattr(result, "success")
+
+
+@pytest.mark.asyncio
+async def test_aact_records_successful_execution_and_does_not_record_failures():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def recorded_async_action(agent, amount: int) -> str:
+        """Recorded async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        await asyncio.sleep(0)
+        assert "action" not in agent.memory.step_content
+        agent.counter += amount
+        agent.awaited = True
+        return "recorded"
+
+    successful_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[recorded_async_action],
+    )
+    successful_agent.memory = ShortTermMemory(
+        agent=successful_agent,
+        n=5,
+        display=False,
+    )
+    successful_agent.recorder = Mock()
+    successful_agent.counter = 0
+    successful_agent.awaited = False
+    successful_agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "recorded_async_action",
+                    "arguments": {"amount": 3},
+                },
+            ),
+        ),
+    )
+
+    result = await successful_agent.aact("Take one recorded async action.")
+
+    assert result.action.name == "recorded_async_action"
+    assert result.action.arguments == {"amount": 3}
+    assert result.result == "recorded"
+    assert successful_agent.counter == 3
+    assert successful_agent.awaited is True
+    expected_content = {
+        "action": {
+            "name": "recorded_async_action",
+            "arguments": {"amount": 3},
+            "rationale": None,
+        },
+        "result": "recorded",
+    }
+    actions = successful_agent.memory.step_content["action"]
+    assert actions == [expected_content]
+    successful_agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=successful_agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+    @action(action_manager=ActionManager())
+    async def failing_async_action(agent, amount: int) -> str:
+        """Failing async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Never returns.
+        """
+        await asyncio.sleep(0)
+        agent.started = True
+        del amount
+        raise RuntimeError("async action failed")
+
+    failing_agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[failing_async_action],
+    )
+    failing_agent.memory = ShortTermMemory(agent=failing_agent, n=5, display=False)
+    failing_agent.recorder = Mock()
+    failing_agent.started = False
+    failing_agent.llm.agenerate = AsyncMock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "failing_async_action",
+                    "arguments": {"amount": 1},
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="async action failed"):
+        await failing_agent.aact("Take one failing async action.")
+
+    assert failing_agent.started is True
+    assert "action" not in failing_agent.memory.step_content
+    failing_agent.recorder.record_event.assert_not_called()
+
+
+class _ObserverAbort(BaseException):
+    """Sentinel proving observer boundaries catch Exception, not BaseException."""
+
+
+class _A5SnapshotProbe:
+    """Control successive deepcopy outcomes without changing production seams."""
+
+    def __init__(self, outcomes=()):
+        self._outcomes = tuple(outcomes)
+        self.copy_attempts = 0
+
+    def __deepcopy__(self, memo):
+        attempt = self.copy_attempts
+        self.copy_attempts += 1
+        outcome = self._outcomes[attempt] if attempt < len(self._outcomes) else None
+        if outcome is not None:
+            raise outcome
+
+        snapshot = type(self)()
+        memo[id(self)] = snapshot
+        return snapshot
+
+
+_A5_SNAPSHOT_FAILURE_SCENARIOS = (
+    "memory-snapshot",
+    "recorder-snapshot",
+    "dual-snapshot",
+    "memory-snapshot-and-recorder-observer",
+    "memory-observer-and-recorder-snapshot",
+)
+
+
+def _make_a5_snapshot_failure_case(scenario):
+    memory_snapshot_error = RuntimeError("memory snapshot failed")
+    recorder_snapshot_error = LookupError("recorder snapshot failed")
+    memory_observer_error = ValueError("memory observer failed")
+    recorder_observer_error = OSError("recorder observer failed")
+
+    memory_snapshot_fails = scenario in {
+        "memory-snapshot",
+        "dual-snapshot",
+        "memory-snapshot-and-recorder-observer",
+    }
+    recorder_snapshot_fails = scenario in {
+        "recorder-snapshot",
+        "dual-snapshot",
+        "memory-observer-and-recorder-snapshot",
+    }
+    memory_observer_fails = scenario == "memory-observer-and-recorder-snapshot"
+    recorder_observer_fails = scenario == "memory-snapshot-and-recorder-observer"
+
+    expected_errors = {}
+    if memory_snapshot_fails:
+        expected_errors["memory"] = memory_snapshot_error
+    elif memory_observer_fails:
+        expected_errors["memory"] = memory_observer_error
+    if recorder_snapshot_fails:
+        expected_errors["recorder"] = recorder_snapshot_error
+    elif recorder_observer_fails:
+        expected_errors["recorder"] = recorder_observer_error
+
+    return SimpleNamespace(
+        probe=_A5SnapshotProbe(
+            (
+                memory_snapshot_error if memory_snapshot_fails else None,
+                recorder_snapshot_error if recorder_snapshot_fails else None,
+            )
+        ),
+        memory_observer_error=(
+            memory_observer_error if memory_observer_fails else None
+        ),
+        recorder_observer_error=(
+            recorder_observer_error if recorder_observer_fails else None
+        ),
+        expected_errors=expected_errors,
+        memory_should_run=not memory_snapshot_fails,
+        recorder_should_run=not recorder_snapshot_fails,
+    )
+
+
+def _make_sync_post_commit_agent(result):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def pd03_sync_action(agent, amount: int) -> object:
+        """Execute one observable synchronous mutation.
+
+        Args:
+            amount: Validated amount.
+
+        Returns:
+            The committed result sentinel.
+        """
+        agent.action_calls += 1
+        agent.timeline.append("action")
+        return agent.committed_result
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_sync_action],
+    )
+    agent.action_calls = 0
+    agent.timeline = []
+    agent.committed_result = result
+    choice = ActionChoice(
+        name="pd03_sync_action",
+        arguments={"amount": "2"},
+        rationale="Exercise post-commit observers.",
+    )
+    return agent, choice
+
+
+def _make_async_post_commit_agent(result):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def pd03_async_action(agent, amount: int) -> object:
+        """Execute one observable asynchronous mutation.
+
+        Args:
+            amount: Validated amount.
+
+        Returns:
+            The committed result sentinel.
+        """
+        agent.action_calls += 1
+        await asyncio.sleep(0)
+        agent.action_await_completions += 1
+        agent.timeline.append("action")
+        return agent.committed_result
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_async_action],
+    )
+    agent.action_calls = 0
+    agent.action_await_completions = 0
+    agent.timeline = []
+    agent.committed_result = result
+    choice = ActionChoice(
+        name="pd03_async_action",
+        arguments={"amount": "2"},
+        rationale="Exercise asynchronous post-commit observers.",
+    )
+    return agent, choice
+
+
+def _install_sync_post_commit_observers(
+    agent,
+    *,
+    memory_error=None,
+    recorder_error=None,
+    recorder_present=True,
+):
+    def observe_memory(*args, **kwargs):
+        agent.timeline.append("memory")
+        if memory_error is not None:
+            raise memory_error
+
+    def observe_recorder(*args, **kwargs):
+        agent.timeline.append("recorder")
+        if recorder_error is not None:
+            raise recorder_error
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(side_effect=observe_memory),
+    )
+    agent.recorder = (
+        SimpleNamespace(record_event=Mock(side_effect=observe_recorder))
+        if recorder_present
+        else None
+    )
+
+
+def _install_async_post_commit_observers(
+    agent,
+    *,
+    memory_error=None,
+    recorder_error=None,
+    recorder_present=True,
+):
+    async def observe_memory(*args, **kwargs):
+        agent.timeline.append("memory")
+        await asyncio.sleep(0)
+        if memory_error is not None:
+            raise memory_error
+
+    def observe_recorder(*args, **kwargs):
+        agent.timeline.append("recorder")
+        if recorder_error is not None:
+            raise recorder_error
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(
+            side_effect=AssertionError("async execution must not use sync memory")
+        ),
+        aadd_to_memory=AsyncMock(side_effect=observe_memory),
+    )
+    agent.recorder = (
+        SimpleNamespace(record_event=Mock(side_effect=observe_recorder))
+        if recorder_present
+        else None
+    )
+
+
+def _make_final_a10_agent_deferred_result(kind, state):
+    if kind == "generator":
+
+        def deferred_result():
+            state.body_calls += 1
+            yield "deferred"
+
+    else:
+
+        async def deferred_result():
+            state.body_calls += 1
+            yield "deferred"
+
+    return deferred_result()
+
+
+def _install_final_a10_deepcopy_guard(monkeypatch):
+    deepcopy_spy = Mock(
+        side_effect=AssertionError(
+            "a rejected deferred result must not reach success deepcopy"
+        )
+    )
+    monkeypatch.setattr(
+        llm_agent_module,
+        "copy",
+        SimpleNamespace(deepcopy=deepcopy_spy),
+    )
+    return deepcopy_spy
+
+
+def _install_final_a11_deepcopy_guard(monkeypatch):
+    deepcopy_spy = Mock(
+        side_effect=AssertionError(
+            "a nested awaitable must not reach successful-action deepcopy"
+        )
+    )
+    monkeypatch.setattr(
+        llm_agent_module,
+        "copy",
+        SimpleNamespace(deepcopy=deepcopy_spy),
+    )
+    return deepcopy_spy
+
+
+def _assert_final_a10_agent_precommit_failure(
+    agent,
+    kind,
+    deferred_result,
+    deepcopy_spy,
+):
+    assert agent.action_calls == 1
+    assert agent.timeline == ["action"]
+    frame = (
+        deferred_result.gi_frame if kind == "generator" else deferred_result.ag_frame
+    )
+    assert frame is None
+    deepcopy_spy.assert_not_called()
+    agent.memory.add_to_memory.assert_not_called()
+    if hasattr(agent.memory, "aadd_to_memory"):
+        agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "kind"),
+    [
+        pytest.param("execute_action", "generator", id="execute-action-generator"),
+        pytest.param("act", "async-generator", id="act-async-generator"),
+    ],
+)
+def test_final_a10_sync_agent_entrypoints_do_not_commit_deferred_results(
+    entrypoint,
+    kind,
+    monkeypatch,
+):
+    state = SimpleNamespace(body_calls=0)
+    deferred_result = _make_final_a10_agent_deferred_result(kind, state)
+    agent, choice = _make_sync_post_commit_agent(deferred_result)
+    _install_sync_post_commit_observers(agent)
+    deepcopy_spy = _install_final_a10_deepcopy_guard(monkeypatch)
+    if entrypoint == "act":
+        agent.choose_action = Mock(return_value=choice)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "execute_action":
+                agent.execute_action(choice)
+            else:
+                agent.act("Choose the deferred-result action.")
+
+        assert type(exc_info.value) is TypeError
+        assert not isinstance(exc_info.value, ActionPostCommitError)
+        assert choice.name in str(exc_info.value)
+        assert state.body_calls == 0
+        _assert_final_a10_agent_precommit_failure(
+            agent,
+            kind,
+            deferred_result,
+            deepcopy_spy,
+        )
+    finally:
+        if kind == "generator":
+            deferred_result.close()
+        else:
+            asyncio.run(deferred_result.aclose())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entrypoint", "kind"),
+    [
+        pytest.param(
+            "aexecute_action",
+            "async-generator",
+            id="aexecute-action-async-generator",
+        ),
+        pytest.param("aact", "generator", id="aact-generator"),
+    ],
+)
+async def test_final_a10_async_agent_entrypoints_do_not_commit_deferred_results(
+    entrypoint,
+    kind,
+    monkeypatch,
+):
+    state = SimpleNamespace(body_calls=0)
+    deferred_result = _make_final_a10_agent_deferred_result(kind, state)
+    agent, choice = _make_async_post_commit_agent(deferred_result)
+    _install_async_post_commit_observers(agent)
+    deepcopy_spy = _install_final_a10_deepcopy_guard(monkeypatch)
+    if entrypoint == "aact":
+        agent.achoose_action = AsyncMock(return_value=choice)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "aexecute_action":
+                await agent.aexecute_action(choice)
+            else:
+                await agent.aact("Choose the deferred-result action.")
+
+        assert type(exc_info.value) is TypeError
+        assert not isinstance(exc_info.value, ActionPostCommitError)
+        assert choice.name in str(exc_info.value)
+        assert agent.action_await_completions == 1
+        assert state.body_calls == 0
+        _assert_final_a10_agent_precommit_failure(
+            agent,
+            kind,
+            deferred_result,
+            deepcopy_spy,
+        )
+    finally:
+        if kind == "generator":
+            deferred_result.close()
+        else:
+            await deferred_result.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        pytest.param("aexecute_action", id="aexecute-action"),
+        pytest.param("aact", id="aact-one-shot-selection"),
+    ],
+)
+async def test_final_a11_async_agent_entrypoints_reject_nested_awaitable_precommit(
+    entrypoint,
+    monkeypatch,
+):
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def final_a11_agent_nested_action(agent) -> object:
+        """Return a nested coroutine after the supported action await."""
+        agent.action_calls += 1
+        await asyncio.sleep(0)
+        agent.action_await_completions += 1
+        agent.outer_mutations += 1
+
+        async def mutate_inner():
+            agent.inner_mutations += 1
+            return "nested completed"
+
+        agent.nested_result = mutate_inner()
+        return agent.nested_result
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[final_a11_agent_nested_action],
+    )
+    agent.action_calls = 0
+    agent.action_await_completions = 0
+    agent.outer_mutations = 0
+    agent.inner_mutations = 0
+    agent.nested_result = None
+    choice = ActionChoice(
+        name="final_a11_agent_nested_action",
+        arguments={},
+        rationale="Exercise the completed-result boundary.",
+    )
+    if entrypoint == "aexecute_action":
+        agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    else:
+        agent.memory = SimpleNamespace(
+            add_to_memory=Mock(),
+            aadd_to_memory=AsyncMock(),
+        )
+        agent.achoose_action = AsyncMock(return_value=choice)
+    agent.recorder = Mock()
+    deepcopy_spy = _install_final_a11_deepcopy_guard(monkeypatch)
+
+    try:
+        with pytest.raises(TypeError) as exc_info:
+            if entrypoint == "aexecute_action":
+                await agent.aexecute_action(choice)
+            else:
+                await agent.aact("Choose the nested-result action once.")
+
+        error = exc_info.value
+        assert type(error) is TypeError
+        assert not isinstance(error, ActionPostCommitError)
+        message = str(error).casefold()
+        assert choice.name.casefold() in message
+        assert "one completed result" in message
+        assert "nested awaitable" in message
+        assert agent.action_calls == 1
+        assert agent.action_await_completions == 1
+        assert agent.outer_mutations == 1
+        assert agent.inner_mutations == 0
+        assert agent.nested_result.cr_frame is None
+        await asyncio.sleep(0)
+        assert agent.inner_mutations == 0
+        deepcopy_spy.assert_not_called()
+        if entrypoint == "aexecute_action":
+            assert "action" not in agent.memory.step_content
+        else:
+            agent.achoose_action.assert_awaited_once_with(
+                "Choose the nested-result action once.",
+                actions=_ACTIONS_UNSET,
+                system_prompt=None,
+            )
+            agent.memory.add_to_memory.assert_not_called()
+            agent.memory.aadd_to_memory.assert_not_awaited()
+        agent.recorder.record_event.assert_not_called()
+    finally:
+        if agent.nested_result is not None and agent.nested_result.cr_frame is not None:
+            agent.nested_result.close()
+
+
+def test_action_post_commit_error_has_established_public_exports():
+    assert action_exports.ActionPostCommitError is ActionPostCommitError
+    assert RootActionPostCommitError is ActionPostCommitError
+
+
+def test_action_post_commit_error_rejects_empty_observer_errors():
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+
+    with pytest.raises(ValueError, match="at least one error"):
+        ActionPostCommitError(action_choice, object(), {})
+
+
+def test_action_post_commit_error_rejects_unsupported_observer_key():
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+
+    with pytest.raises(ValueError, match="unsupported key"):
+        ActionPostCommitError(
+            action_choice,
+            object(),
+            {"cache": RuntimeError("cache failed")},
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_error",
+    [
+        pytest.param("not an exception", id="non-exception"),
+        pytest.param(_ObserverAbort("observer aborted"), id="base-exception-only"),
+    ],
+)
+def test_action_post_commit_error_rejects_non_exception_values(invalid_error):
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+
+    with pytest.raises(TypeError, match="Exception instance"):
+        ActionPostCommitError(
+            action_choice,
+            object(),
+            {"memory": invalid_error},
+        )
+
+
+def test_action_post_commit_error_copies_observer_mapping_shallowly():
+    action_choice = ActionChoice(name="constructor_action", arguments={})
+    memory_error = RuntimeError("memory failed")
+    observer_errors = {"memory": memory_error}
+
+    error = ActionPostCommitError(action_choice, object(), observer_errors)
+
+    assert error.observer_errors is not observer_errors
+    assert error.observer_errors["memory"] is memory_error
+
+    observer_errors["memory"] = RuntimeError("replacement memory failure")
+    observer_errors["recorder"] = ValueError("late recorder failure")
+
+    assert set(error.observer_errors) == {"memory"}
+    assert error.observer_errors["memory"] is memory_error
+
+
+def test_action_post_commit_error_preserves_valid_dual_mapping_and_message():
+    action_choice = ActionChoice(
+        name="constructor_action",
+        arguments={"amount": 2},
+        rationale="Exercise constructor validation.",
+    )
+    result = object()
+    memory_error = RuntimeError("memory failed")
+    recorder_error = ValueError("recorder failed")
+    observer_errors = {
+        "memory": memory_error,
+        "recorder": recorder_error,
+    }
+
+    error = ActionPostCommitError(action_choice, result, observer_errors)
+
+    assert error.committed is True
+    assert error.action is action_choice
+    assert error.result is result
+    assert error.observer_errors is not observer_errors
+    assert error.observer_errors["memory"] is memory_error
+    assert error.observer_errors["recorder"] is recorder_error
+    assert str(error) == (
+        "Action 'constructor_action' committed, but post-commit observer(s) "
+        "failed: memory, recorder."
+    )
+
+
+@pytest.mark.parametrize(
+    ("memory_fails", "recorder_fails"),
+    [
+        pytest.param(True, False, id="memory"),
+        pytest.param(False, True, id="recorder"),
+        pytest.param(True, True, id="both"),
+    ],
+)
+def test_execute_action_reports_post_commit_observer_exceptions(
+    memory_fails,
+    recorder_fails,
+):
+    result = {"items": [{"state": "committed"}]}
+    memory_error = RuntimeError("memory observer failed")
+    recorder_error = ValueError("recorder observer failed")
+    agent, choice = _make_sync_post_commit_agent(result)
+    _install_sync_post_commit_observers(
+        agent,
+        memory_error=memory_error if memory_fails else None,
+        recorder_error=recorder_error if recorder_fails else None,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        agent.execute_action(choice)
+
+    error = exc_info.value
+    assert error.committed is True
+    assert isinstance(error.action, ActionChoice)
+    assert error.action.name == choice.name
+    assert error.action.arguments == {"amount": 2}
+    assert error.action.rationale == choice.rationale
+    assert error.result is result
+    expected_keys = {
+        name
+        for name, failed in (
+            ("memory", memory_fails),
+            ("recorder", recorder_fails),
+        )
+        if failed
+    }
+    assert isinstance(error.observer_errors, dict)
+    assert set(error.observer_errors) == expected_keys
+    if memory_fails:
+        assert error.observer_errors["memory"] is memory_error
+    if recorder_fails:
+        assert error.observer_errors["recorder"] is recorder_error
+
+    assert agent.action_calls == 1
+    assert agent.timeline == ["action", "memory", "recorder"]
+    agent.memory.add_to_memory.assert_called_once()
+    agent.recorder.record_event.assert_called_once()
+    memory_result = agent.memory.add_to_memory.call_args.kwargs["content"]["result"]
+    recorder_result = agent.recorder.record_event.call_args.kwargs["content"]["result"]
+    assert memory_result == result
+    assert recorder_result == result
+    assert memory_result is not result
+    assert recorder_result is not result
+    assert memory_result is not recorder_result
+    assert memory_result["items"] is not recorder_result["items"]
+    assert memory_result["items"][0] is not recorder_result["items"][0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("memory_fails", "recorder_fails"),
+    [
+        pytest.param(True, False, id="memory"),
+        pytest.param(False, True, id="recorder"),
+        pytest.param(True, True, id="both"),
+    ],
+)
+async def test_aexecute_action_reports_post_commit_observer_exceptions(
+    memory_fails,
+    recorder_fails,
+):
+    result = [{"details": {"state": "committed"}}]
+    memory_error = RuntimeError("async memory observer failed")
+    recorder_error = ValueError("async recorder observer failed")
+    agent, choice = _make_async_post_commit_agent(result)
+    _install_async_post_commit_observers(
+        agent,
+        memory_error=memory_error if memory_fails else None,
+        recorder_error=recorder_error if recorder_fails else None,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        await agent.aexecute_action(choice)
+
+    error = exc_info.value
+    assert error.committed is True
+    assert isinstance(error.action, ActionChoice)
+    assert error.action.name == choice.name
+    assert error.action.arguments == {"amount": 2}
+    assert error.action.rationale == choice.rationale
+    assert error.result is result
+    expected_keys = {
+        name
+        for name, failed in (
+            ("memory", memory_fails),
+            ("recorder", recorder_fails),
+        )
+        if failed
+    }
+    assert isinstance(error.observer_errors, dict)
+    assert set(error.observer_errors) == expected_keys
+    if memory_fails:
+        assert error.observer_errors["memory"] is memory_error
+    if recorder_fails:
+        assert error.observer_errors["recorder"] is recorder_error
+
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    assert agent.timeline == ["action", "memory", "recorder"]
+    agent.memory.aadd_to_memory.assert_awaited_once()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_called_once()
+    memory_result = agent.memory.aadd_to_memory.call_args.kwargs["content"]["result"]
+    recorder_result = agent.recorder.record_event.call_args.kwargs["content"]["result"]
+    assert memory_result == result
+    assert recorder_result == result
+    assert memory_result is not result
+    assert recorder_result is not result
+    assert memory_result is not recorder_result
+    assert memory_result[0] is not recorder_result[0]
+    assert memory_result[0]["details"] is not recorder_result[0]["details"]
+
+
+def test_rf_a5_execute_action_returns_original_and_isolates_observer_snapshots():
+    original = {"items": [{"details": {"state": "committed", "tags": ["seed"]}}]}
+    agent, choice = _make_sync_post_commit_agent(original)
+    memory_history = []
+    recorder_history = []
+
+    def remember(*, type, content):
+        assert type == "action"
+        memory_history.append(content)
+        details = content["result"]["items"][0]["details"]
+        details["state"] = "memory-mutated"
+        details["tags"].append("memory")
+
+    def record(event_type, *, content, **kwargs):
+        assert event_type == "action"
+        recorder_history.append(content)
+
+    agent.memory = SimpleNamespace(add_to_memory=Mock(side_effect=remember))
+    agent.recorder = SimpleNamespace(record_event=Mock(side_effect=record))
+
+    returned = agent.execute_action(choice)
+
+    assert returned is original
+    assert returned is agent.committed_result
+    memory_content = memory_history[0]
+    recorder_content = recorder_history[0]
+    memory_result = memory_content["result"]
+    recorder_result = recorder_content["result"]
+    assert memory_content is not recorder_content
+    assert memory_content["action"] is not recorder_content["action"]
+    assert (
+        memory_content["action"]["arguments"]
+        is not recorder_content["action"]["arguments"]
+    )
+    assert memory_result is not original
+    assert recorder_result is not original
+    assert memory_result is not recorder_result
+    assert memory_result["items"] is not recorder_result["items"]
+    assert memory_result["items"][0] is not recorder_result["items"][0]
+    assert (
+        memory_result["items"][0]["details"]
+        is not recorder_result["items"][0]["details"]
+    )
+    assert original["items"][0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+    }
+    assert recorder_result["items"][0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+    }
+
+    returned["items"][0]["details"]["state"] = "caller-mutated"
+    returned["items"][0]["details"]["tags"].append("caller")
+
+    assert memory_result["items"][0]["details"] == {
+        "state": "memory-mutated",
+        "tags": ["seed", "memory"],
+    }
+    assert recorder_result["items"][0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_a5_async_snapshots_precede_memory_await_and_isolate_history():
+    probe = _A5SnapshotProbe()
+    original = [
+        {
+            "details": {"state": "committed", "tags": ["seed"]},
+            "probe": probe,
+        }
+    ]
+    agent, choice = _make_async_post_commit_agent(original)
+    memory_started = asyncio.Event()
+    release_memory = asyncio.Event()
+    copy_attempts_at_memory_start = []
+    memory_history = []
+    recorder_history = []
+    recorder_state_at_entry = []
+
+    async def remember(*, type, content):
+        assert type == "action"
+        copy_attempts_at_memory_start.append(probe.copy_attempts)
+        memory_history.append(content)
+        content["result"][0]["details"]["observer"] = "memory"
+        memory_started.set()
+        await release_memory.wait()
+
+    def record(event_type, *, content, **kwargs):
+        assert event_type == "action"
+        recorder_state_at_entry.append(
+            (
+                content["result"][0]["details"]["state"],
+                list(content["result"][0]["details"]["tags"]),
+            )
+        )
+        recorder_history.append(content)
+        content["result"][0]["details"]["observer"] = "recorder"
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(
+            side_effect=AssertionError("async execution must not use sync memory")
+        ),
+        aadd_to_memory=AsyncMock(side_effect=remember),
+    )
+    agent.recorder = SimpleNamespace(record_event=Mock(side_effect=record))
+
+    execution = asyncio.create_task(agent.aexecute_action(choice))
+    try:
+        await asyncio.wait_for(memory_started.wait(), timeout=2)
+        original[0]["details"]["state"] = "caller-during-memory-await"
+        original[0]["details"]["tags"].append("caller-during-memory-await")
+    finally:
+        release_memory.set()
+    returned = await execution
+
+    assert returned is original
+    assert returned is agent.committed_result
+    assert copy_attempts_at_memory_start == [2]
+    assert recorder_state_at_entry == [("committed", ["seed"])]
+    memory_result = memory_history[0]["result"]
+    recorder_result = recorder_history[0]["result"]
+    assert memory_history[0] is not recorder_history[0]
+    assert memory_result is not original
+    assert recorder_result is not original
+    assert memory_result is not recorder_result
+    assert memory_result[0] is not recorder_result[0]
+    assert memory_result[0]["details"] is not recorder_result[0]["details"]
+    assert memory_result[0]["probe"] is not probe
+    assert recorder_result[0]["probe"] is not probe
+    assert memory_result[0]["probe"] is not recorder_result[0]["probe"]
+    assert memory_result[0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+        "observer": "memory",
+    }
+    assert recorder_result[0]["details"] == {
+        "state": "committed",
+        "tags": ["seed"],
+        "observer": "recorder",
+    }
+
+    returned[0]["details"]["state"] = "caller-after-return"
+    returned[0]["details"]["tags"].append("caller-after-return")
+
+    assert memory_result[0]["details"]["state"] == "committed"
+    assert memory_result[0]["details"]["tags"] == ["seed"]
+    assert recorder_result[0]["details"]["state"] == "committed"
+    assert recorder_result[0]["details"]["tags"] == ["seed"]
+
+
+@pytest.mark.parametrize("scenario", _A5_SNAPSHOT_FAILURE_SCENARIOS)
+def test_rf_a5_execute_action_labels_snapshot_and_observer_failures(scenario):
+    failure_case = _make_a5_snapshot_failure_case(scenario)
+    original = {"items": [{"probe": failure_case.probe}]}
+    agent, choice = _make_sync_post_commit_agent(original)
+    _install_sync_post_commit_observers(
+        agent,
+        memory_error=failure_case.memory_observer_error,
+        recorder_error=failure_case.recorder_observer_error,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        agent.execute_action(choice)
+
+    error = exc_info.value
+    assert error.result is original
+    assert error.result is agent.committed_result
+    assert set(error.observer_errors) == set(failure_case.expected_errors)
+    for observer, expected_error in failure_case.expected_errors.items():
+        assert error.observer_errors[observer] is expected_error
+    assert failure_case.probe.copy_attempts == 2
+    assert agent.action_calls == 1
+    expected_timeline = ["action"]
+    if failure_case.memory_should_run:
+        expected_timeline.append("memory")
+        agent.memory.add_to_memory.assert_called_once()
+    else:
+        agent.memory.add_to_memory.assert_not_called()
+    if failure_case.recorder_should_run:
+        expected_timeline.append("recorder")
+        agent.recorder.record_event.assert_called_once()
+    else:
+        agent.recorder.record_event.assert_not_called()
+    assert agent.timeline == expected_timeline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", _A5_SNAPSHOT_FAILURE_SCENARIOS)
+async def test_rf_a5_aexecute_action_labels_snapshot_and_observer_failures(scenario):
+    failure_case = _make_a5_snapshot_failure_case(scenario)
+    original = [{"probe": failure_case.probe}]
+    agent, choice = _make_async_post_commit_agent(original)
+    _install_async_post_commit_observers(
+        agent,
+        memory_error=failure_case.memory_observer_error,
+        recorder_error=failure_case.recorder_observer_error,
+    )
+
+    with pytest.raises(ActionPostCommitError) as exc_info:
+        await agent.aexecute_action(choice)
+
+    error = exc_info.value
+    assert error.result is original
+    assert error.result is agent.committed_result
+    assert set(error.observer_errors) == set(failure_case.expected_errors)
+    for observer, expected_error in failure_case.expected_errors.items():
+        assert error.observer_errors[observer] is expected_error
+    assert failure_case.probe.copy_attempts == 2
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    expected_timeline = ["action"]
+    if failure_case.memory_should_run:
+        expected_timeline.append("memory")
+        agent.memory.aadd_to_memory.assert_awaited_once()
+    else:
+        agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    if failure_case.recorder_should_run:
+        expected_timeline.append("recorder")
+        agent.recorder.record_event.assert_called_once()
+    else:
+        agent.recorder.record_event.assert_not_called()
+    assert agent.timeline == expected_timeline
+
+
+def test_execute_action_succeeds_without_optional_recorder():
+    result = object()
+    agent, choice = _make_sync_post_commit_agent(result)
+    _install_sync_post_commit_observers(agent, recorder_present=False)
+
+    returned_result = agent.execute_action(choice)
+
+    assert returned_result is result
+    assert agent.action_calls == 1
+    assert agent.timeline == ["action", "memory"]
+    agent.memory.add_to_memory.assert_called_once()
+    assert agent.recorder is None
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_succeeds_without_optional_recorder():
+    result = object()
+    agent, choice = _make_async_post_commit_agent(result)
+    _install_async_post_commit_observers(agent, recorder_present=False)
+
+    returned_result = await agent.aexecute_action(choice)
+
+    assert returned_result is result
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    assert agent.timeline == ["action", "memory"]
+    agent.memory.aadd_to_memory.assert_awaited_once()
+    agent.memory.add_to_memory.assert_not_called()
+    assert agent.recorder is None
+
+
+def test_execute_action_preserves_pre_commit_failures_without_observers():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    action_error = RuntimeError("sync action body failed")
+
+    @action(action_manager=ActionManager())
+    def pd03_failing_sync_action(agent, amount: int) -> None:
+        """Fail during synchronous action execution.
+
+        Args:
+            amount: Required amount.
+        """
+        agent.action_calls += 1
+        raise action_error
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_failing_sync_action],
+    )
+    agent.action_calls = 0
+    agent.memory = SimpleNamespace(add_to_memory=Mock())
+    agent.recorder = SimpleNamespace(record_event=Mock())
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        agent.execute_action(
+            ActionChoice(name="pd03_failing_sync_action", arguments={})
+        )
+
+    assert agent.action_calls == 0
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        agent.execute_action(
+            ActionChoice(
+                name="pd03_failing_sync_action",
+                arguments={"amount": 1},
+            )
+        )
+
+    assert exc_info.value is action_error
+    assert agent.action_calls == 1
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_preserves_pre_commit_failures_without_observers():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    action_error = RuntimeError("async action body failed")
+
+    @action(action_manager=ActionManager())
+    async def pd03_failing_async_action(agent, amount: int) -> None:
+        """Fail during asynchronous action execution.
+
+        Args:
+            amount: Required amount.
+        """
+        agent.action_calls += 1
+        await asyncio.sleep(0)
+        agent.action_await_completions += 1
+        raise action_error
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[pd03_failing_async_action],
+    )
+    agent.action_calls = 0
+    agent.action_await_completions = 0
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(),
+    )
+    agent.recorder = SimpleNamespace(record_event=Mock())
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await agent.aexecute_action(
+            ActionChoice(name="pd03_failing_async_action", arguments={})
+        )
+
+    assert agent.action_calls == 0
+    assert agent.action_await_completions == 0
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await agent.aexecute_action(
+            ActionChoice(
+                name="pd03_failing_async_action",
+                arguments={"amount": 1},
+            )
+        )
+
+    assert exc_info.value is action_error
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_snapshot", ["memory", "recorder"])
+def test_rf_a5_execute_action_does_not_convert_snapshot_base_exceptions(
+    failing_snapshot,
+):
+    snapshot_abort = _ObserverAbort(f"sync {failing_snapshot} snapshot aborted")
+    outcomes = (
+        snapshot_abort if failing_snapshot == "memory" else None,
+        snapshot_abort if failing_snapshot == "recorder" else None,
+    )
+    probe = _A5SnapshotProbe(outcomes)
+    original = {"items": [{"probe": probe}]}
+    agent, choice = _make_sync_post_commit_agent(original)
+    _install_sync_post_commit_observers(agent)
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        agent.execute_action(choice)
+
+    assert exc_info.value is snapshot_abort
+    assert probe.copy_attempts == (1 if failing_snapshot == "memory" else 2)
+    assert agent.action_calls == 1
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_snapshot", ["memory", "recorder"])
+async def test_rf_a5_aexecute_action_does_not_convert_snapshot_base_exceptions(
+    failing_snapshot,
+):
+    snapshot_abort = _ObserverAbort(f"async {failing_snapshot} snapshot aborted")
+    outcomes = (
+        snapshot_abort if failing_snapshot == "memory" else None,
+        snapshot_abort if failing_snapshot == "recorder" else None,
+    )
+    probe = _A5SnapshotProbe(outcomes)
+    original = [{"probe": probe}]
+    agent, choice = _make_async_post_commit_agent(original)
+    _install_async_post_commit_observers(agent)
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        await agent.aexecute_action(choice)
+
+    assert exc_info.value is snapshot_abort
+    assert probe.copy_attempts == (1 if failing_snapshot == "memory" else 2)
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_observer", ["memory", "recorder"])
+def test_execute_action_does_not_convert_observer_base_exceptions(failing_observer):
+    result = object()
+    observer_abort = _ObserverAbort(f"sync {failing_observer} aborted")
+    agent, choice = _make_sync_post_commit_agent(result)
+    _install_sync_post_commit_observers(
+        agent,
+        memory_error=observer_abort if failing_observer == "memory" else None,
+        recorder_error=observer_abort if failing_observer == "recorder" else None,
+    )
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        agent.execute_action(choice)
+
+    assert exc_info.value is observer_abort
+    assert agent.action_calls == 1
+    agent.memory.add_to_memory.assert_called_once()
+    if failing_observer == "recorder":
+        agent.recorder.record_event.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_observer", ["memory", "recorder"])
+async def test_aexecute_action_does_not_convert_observer_base_exceptions(
+    failing_observer,
+):
+    result = object()
+    observer_abort = _ObserverAbort(f"async {failing_observer} aborted")
+    agent, choice = _make_async_post_commit_agent(result)
+    _install_async_post_commit_observers(
+        agent,
+        memory_error=observer_abort if failing_observer == "memory" else None,
+        recorder_error=observer_abort if failing_observer == "recorder" else None,
+    )
+
+    with pytest.raises(_ObserverAbort) as exc_info:
+        await agent.aexecute_action(choice)
+
+    assert exc_info.value is observer_abort
+    assert agent.action_calls == 1
+    assert agent.action_await_completions == 1
+    agent.memory.aadd_to_memory.assert_awaited_once()
+    agent.memory.add_to_memory.assert_not_called()
+    if failing_observer == "recorder":
+        agent.recorder.record_event.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_validates_before_async_execution_and_recording():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def async_recorded_action(agent, amount: int) -> str:
+        """Recorded async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        await asyncio.sleep(0)
+        agent.counter += amount
+        agent.started = True
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[async_recorded_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+    agent.started = False
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await agent.aexecute_action(
+            ActionChoice(name="async_recorded_action", arguments={}),
+        )
+
+    assert agent.counter == 0
+    assert agent.started is False
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_awaits_memory_before_recording_success():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    timeline = []
+
+    @action(action_manager=ActionManager())
+    async def ordered_async_action(agent, amount: int) -> dict[str, int]:
+        """Apply an amount after yielding to the event loop.
+
+        Args:
+            amount: Amount to apply.
+
+        Returns:
+            Applied amount.
+        """
+        await asyncio.sleep(0)
+        agent.counter += amount
+        timeline.append("action-complete")
+        return {"applied": amount}
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[ordered_async_action],
+    )
+    agent.counter = 0
+    choice = ActionChoice(
+        name="ordered_async_action",
+        arguments={"amount": 3},
+        rationale="Apply the requested amount.",
+    )
+    expected_result = {"applied": 3}
+    expected_content = {
+        "action": choice.model_dump(),
+        "result": expected_result,
+    }
+
+    async def record_memory(*, type, content):
+        assert type == "action"
+        assert content == expected_content
+        assert agent.counter == 3
+        timeline.append("memory-start")
+        await asyncio.sleep(0)
+        timeline.append("memory-complete")
+
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(
+            side_effect=AssertionError("async execution must not record synchronously")
+        ),
+        aadd_to_memory=AsyncMock(side_effect=record_memory),
+    )
+    agent.recorder = Mock()
+    agent.recorder.record_event.side_effect = lambda *args, **kwargs: timeline.append(
+        "recorder"
+    )
+
+    result = await agent.aexecute_action(choice)
+
+    assert result == expected_result
+    assert timeline == [
+        "action-complete",
+        "memory-start",
+        "memory-complete",
+        "recorder",
+    ]
+    agent.memory.aadd_to_memory.assert_awaited_once_with(
+        type="action",
+        content=expected_content,
+    )
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_does_not_record_validation_or_execution_failures():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def failing_async_action(agent, amount: int) -> None:
+        """Raise after asynchronous execution begins.
+
+        Args:
+            amount: Required amount.
+        """
+        await asyncio.sleep(0)
+        agent.started = True
+        del amount
+        raise RuntimeError("action failed")
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[failing_async_action],
+    )
+    agent.started = False
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(),
+    )
+    agent.recorder = Mock()
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        await agent.aexecute_action(
+            ActionChoice(name="failing_async_action", arguments={})
+        )
+
+    assert agent.started is False
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="action failed"):
+        await agent.aexecute_action(
+            ActionChoice(name="failing_async_action", arguments={"amount": 1})
+        )
+
+    assert agent.started is True
+    agent.memory.aadd_to_memory.assert_not_awaited()
+    agent.memory.add_to_memory.assert_not_called()
+    agent.recorder.record_event.assert_not_called()
+
+
+def test_execute_action_keeps_synchronous_memory_recording():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def synchronous_recording_action(agent, amount: int) -> str:
+        """Apply an amount synchronously.
+
+        Args:
+            amount: Amount to apply.
+
+        Returns:
+            Completion status.
+        """
+        agent.counter += amount
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[synchronous_recording_action],
+    )
+    agent.counter = 0
+    choice = ActionChoice(
+        name="synchronous_recording_action",
+        arguments={"amount": 2},
+    )
+    expected_content = {
+        "action": choice.model_dump(),
+        "result": "recorded",
+    }
+    agent.memory = SimpleNamespace(
+        add_to_memory=Mock(),
+        aadd_to_memory=AsyncMock(
+            side_effect=AssertionError("sync execution must not use async memory")
+        ),
+    )
+    agent.recorder = None
+
+    result = agent.execute_action(choice)
+
+    assert result == "recorded"
+    assert agent.counter == 2
+    agent.memory.add_to_memory.assert_called_once_with(
+        type="action",
+        content=expected_content,
+    )
+    agent.memory.aadd_to_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_action_uses_episodic_memory_async_importance_grading():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def episodic_async_action(agent) -> str:
+        """Return after yielding to the event loop."""
+        del agent
+        await asyncio.sleep(0)
+        return "remembered"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[episodic_async_action],
+    )
+    memory = EpisodicMemory(agent=agent, llm_model="provider/test_model")
+    memory.agrade_event_importance = AsyncMock(return_value=4)
+    memory.grade_event_importance = Mock(
+        side_effect=AssertionError("async recording must not grade synchronously")
+    )
+    agent.memory = memory
+    agent.recorder = None
+    choice = ActionChoice(name="episodic_async_action", arguments={})
+    expected_content = {
+        "action": choice.model_dump(),
+        "result": "remembered",
+    }
+
+    result = await agent.aexecute_action(choice)
+
+    assert result == "remembered"
+    memory.agrade_event_importance.assert_awaited_once_with(
+        "action",
+        expected_content,
+    )
+    memory.grade_event_importance.assert_not_called()
+    assert len(memory.memory_entries) == 1
+    assert memory.memory_entries[0].content == {
+        "action": {
+            **expected_content,
+            "importance": 4,
+        }
+    }
+
+
+def test_execute_action_records_successful_action_event_after_execution():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def recorded_action(agent, amount: int) -> str:
+        """Recorded action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.counter += amount
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[recorded_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+
+    result = agent.execute_action(
+        ActionChoice(name="recorded_action", arguments={"amount": 3}),
+    )
+
+    assert result == "recorded"
+    assert agent.counter == 3
+    expected_content = {
+        "action": {
+            "name": "recorded_action",
+            "arguments": {"amount": 3},
+            "rationale": None,
+        },
+        "result": "recorded",
+    }
+    actions = agent.memory.step_content["action"]
+    assert actions == [expected_content]
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+def test_execute_action_does_not_record_successful_event_for_failures():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    def failing_action(agent, amount: int) -> str:
+        """Failing action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Never returns.
+        """
+        del agent, amount
+        raise RuntimeError("action failed")
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[failing_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+
+    with pytest.raises(ValueError, match="Missing required argument"):
+        agent.execute_action(ActionChoice(name="failing_action", arguments={}))
+
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="action failed"):
+        agent.execute_action(
+            ActionChoice(name="failing_action", arguments={"amount": 1}),
+        )
+
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_action_rejects_async_action_without_recording_and_aexecute_records():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def async_recorded_action(agent, amount: int) -> str:
+        """Recorded async action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.started = True
+        await asyncio.sleep(0)
+        agent.counter += amount
+        return "recorded"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[async_recorded_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+    agent.started = False
+
+    choice = ActionChoice(
+        name="async_recorded_action",
+        arguments={"amount": 3},
+    )
+
+    _assert_rejects_async_action_without_unawaited_warning(
+        lambda: agent.execute_action(choice),
+    )
+
+    assert agent.counter == 0
+    assert agent.started is False
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+
+    result = await agent.aexecute_action(choice)
+
+    assert result == "recorded"
+    assert agent.counter == 3
+    assert agent.started is True
+    expected_content = {
+        "action": {
+            "name": "async_recorded_action",
+            "arguments": {"amount": 3},
+            "rationale": None,
+        },
+        "result": "recorded",
+    }
+    assert agent.memory.step_content["action"] == [expected_content]
+    agent.recorder.record_event.assert_called_once_with(
+        "action",
+        content=expected_content,
+        agent_id=agent.unique_id,
+        metadata={"source": "LLMAgent.execute_action"},
+    )
+
+
+def test_act_rejects_async_action_without_recording_success_or_warning():
+    class DummyModel(Model):
+        def __init__(self):
+            super().__init__(rng=42)
+
+    @action(action_manager=ActionManager())
+    async def async_act_action(agent, amount: int) -> str:
+        """Async act action.
+
+        Args:
+            amount: Amount to add.
+
+        Returns:
+            Execution result.
+        """
+        agent.started = True
+        await asyncio.sleep(0)
+        agent.counter += amount
+        return "acted"
+
+    agent = LLMAgent(
+        DummyModel(),
+        reasoning=ReActReasoning,
+        actions=[async_act_action],
+    )
+    agent.memory = ShortTermMemory(agent=agent, n=5, display=False)
+    agent.recorder = Mock()
+    agent.counter = 0
+    agent.started = False
+    agent.llm.generate = Mock(
+        return_value=_action_choice_response(
+            json.dumps(
+                {
+                    "name": "async_act_action",
+                    "arguments": {"amount": 2},
+                },
+            ),
+        ),
+    )
+
+    _assert_rejects_async_action_without_unawaited_warning(
+        lambda: agent.act("Take one async action."),
+    )
+
+    assert agent.counter == 0
+    assert agent.started is False
+    assert "action" not in agent.memory.step_content
+    agent.recorder.record_event.assert_not_called()
+    agent.llm.generate.assert_called_once()
 
 
 def test_llm_agent_tool_manager_property_is_deprecated():
@@ -1045,6 +5175,90 @@ def _make_send_message_model(monkeypatch):
     return sender, recipient
 
 
+_MESSAGE_MEMORY_ABSENT = object()
+_MESSAGE_MODES = ("sync", "async")
+
+
+class _MessageDeliveryAbort(BaseException):
+    pass
+
+
+class _MessageMemoryDescriptorFailure:
+    def __init__(self, unique_id, error):
+        self.unique_id = unique_id
+        self.error = error
+
+    @property
+    def memory(self):
+        raise self.error
+
+
+class _MessageWriterDescriptorFailure:
+    def __init__(self, error):
+        self.error = error
+
+    @property
+    def add_to_memory(self):
+        raise self.error
+
+    @property
+    def aadd_to_memory(self):
+        raise self.error
+
+
+def _make_message_recipient(unique_id, memory=_MESSAGE_MEMORY_ABSENT):
+    recipient = SimpleNamespace(unique_id=unique_id)
+    if memory is not _MESSAGE_MEMORY_ABSENT:
+        recipient.memory = memory
+    return recipient
+
+
+def _message_memory(mode, writer):
+    method = "add_to_memory" if mode == "sync" else "aadd_to_memory"
+    return SimpleNamespace(**{method: writer})
+
+
+def _message_writer(mode, events, label, *, error=None, observer=None):
+    def record(*, type, content):
+        events.append(label)
+        if observer is not None:
+            observer(type, content)
+        if error is not None:
+            raise error
+
+    async def arecord(*, type, content):
+        return record(type=type, content=content)
+
+    return (
+        Mock(side_effect=record) if mode == "sync" else AsyncMock(side_effect=arecord)
+    )
+
+
+async def _call_send_message(mode, sender, message, recipients):
+    if mode == "sync":
+        return sender.send_message(message, recipients)
+    return await sender.asend_message(message, recipients)
+
+
+def _assert_message_call(mode, writer, message, *, recipients=_MESSAGE_MEMORY_ABSENT):
+    content = {"message": message, "sender": 10}
+    if recipients is not _MESSAGE_MEMORY_ABSENT:
+        content["recipients"] = recipients
+    assertion = (
+        writer.assert_called_once_with
+        if mode == "sync"
+        else writer.assert_awaited_once_with
+    )
+    assertion(type="message", content=content)
+
+
+def _snapshot_message_content(content):
+    snapshot = dict(content)
+    if "recipients" in snapshot:
+        snapshot["recipients"] = list(snapshot["recipients"])
+    return snapshot
+
+
 def test_send_message_stores_serializable_ids(monkeypatch):
     """send_message stores sender/recipients as unique_ids, not Agent objects."""
     sender, recipient = _make_send_message_model(monkeypatch)
@@ -1145,7 +5359,8 @@ def test_send_message_skips_non_llm_recipient(monkeypatch, caplog):
         result = sender.send_message("hello", recipients=[recipient, skipped])
 
     assert result == (
-        "sent message 'hello' to [20]; skipped [30] because they have no `memory` attribute"
+        "sent message 'hello' to [20]; "
+        "skipped [30] because they have no usable memory method"
     )
     assert len(recorded_calls) == 2
     sender_call = next(call for label, call in recorded_calls if label == "sender")
@@ -1190,7 +5405,8 @@ async def test_asend_message_skips_non_llm_recipient(monkeypatch, caplog):
         result = await sender.asend_message("hello", recipients=[recipient, skipped])
 
     assert result == (
-        "sent message 'hello' to [20]; skipped [30] because they have no `memory` attribute"
+        "sent message 'hello' to [20]; "
+        "skipped [30] because they have no usable memory method"
     )
     assert len(recorded_calls) == 2
     sender_call = next(call for label, call in recorded_calls if label == "sender")
@@ -1203,6 +5419,443 @@ async def test_asend_message_skips_non_llm_recipient(monkeypatch, caplog):
         "30" in record.message and "send_message" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_deduplicates_first_unique_id(monkeypatch, mode):
+    sender, first = _make_send_message_model(monkeypatch)
+    events = []
+    first_writer = _message_writer(mode, events, "recipient-20")
+    first.memory = _message_memory(mode, first_writer)
+    duplicate_writer = _message_writer(mode, events, "duplicate-20")
+    duplicate = _make_message_recipient(20, _message_memory(mode, duplicate_writer))
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(mode, sender, "dedup", [first, first, duplicate])
+
+    assert result == "sent message 'dedup' to [20]"
+    _assert_message_call(mode, first_writer, "dedup")
+    duplicate_writer.assert_not_called()
+    _assert_message_call(mode, sender_writer, "dedup", recipients=[20])
+    assert events == ["recipient-20", "sender"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_ignores_self(monkeypatch, mode):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(mode, sender, "self", [sender, sender])
+
+    assert result == "Could not send message 'self': no matching recipients found."
+    _assert_message_call(mode, sender_writer, "self", recipients=[])
+    assert events == ["sender"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+@pytest.mark.parametrize(
+    "memory_state",
+    ["absent", "none", "missing-writer", "noncallable-writer"],
+)
+async def test_send_message_skips_unusable_recipient_writer(
+    monkeypatch, caplog, mode, memory_state
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    memory = {
+        "none": None,
+        "missing-writer": SimpleNamespace(),
+        "noncallable-writer": _message_memory(mode, "not callable"),
+    }.get(memory_state, _MESSAGE_MEMORY_ABSENT)
+    recipient = _make_message_recipient(30, memory)
+    events = []
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.WARNING, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "skip", [recipient])
+
+    assert result == "skipped [30] because they have no usable memory method"
+    _assert_message_call(mode, sender_writer, "skip", recipients=[])
+    warnings_for_recipient = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "30" in record.getMessage()
+    ]
+    assert len(warnings_for_recipient) == 1
+
+
+_MESSAGE_RECIPIENT_FAILURE_CASES = [
+    pytest.param(
+        ((20, "writer-failure"), (21, "ok")),
+        "sent message 'partition' to [21]; failed to deliver to [20]",
+        [21],
+        [20],
+        id="failure-before-success",
+    ),
+    pytest.param(
+        ((20, "ok"), (21, "writer-failure")),
+        "sent message 'partition' to [20]; failed to deliver to [21]",
+        [20],
+        [21],
+        id="success-before-failure",
+    ),
+    pytest.param(
+        ((20, "writer-failure"), (21, "writer-failure"), (22, "ok")),
+        "sent message 'partition' to [22]; failed to deliver to [20, 21]",
+        [22],
+        [20, 21],
+        id="multiple-failures",
+    ),
+    pytest.param(
+        ((20, "memory-descriptor"), (21, "ok")),
+        "sent message 'partition' to [21]; failed to deliver to [20]",
+        [21],
+        [20],
+        id="memory-descriptor-exception",
+    ),
+    pytest.param(
+        ((20, "writer-descriptor"), (21, "ok")),
+        "sent message 'partition' to [21]; failed to deliver to [20]",
+        [21],
+        [20],
+        id="writer-descriptor-exception",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+@pytest.mark.parametrize(
+    ("outcomes", "expected_status", "delivered_ids", "failed_ids"),
+    _MESSAGE_RECIPIENT_FAILURE_CASES,
+)
+async def test_send_message_partitions_recipient_exceptions_and_continues(
+    monkeypatch,
+    caplog,
+    mode,
+    outcomes,
+    expected_status,
+    delivered_ids,
+    failed_ids,
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    recipients = []
+    writers = []
+    for recipient_id, outcome in outcomes:
+        error_type = (
+            AttributeError
+            if outcome in {"memory-descriptor", "writer-descriptor"}
+            else RuntimeError
+        )
+        error = error_type(f"recipient {recipient_id} failed")
+        if outcome == "memory-descriptor":
+            recipient = _MessageMemoryDescriptorFailure(recipient_id, error)
+        elif outcome == "writer-descriptor":
+            recipient = _make_message_recipient(
+                recipient_id, _MessageWriterDescriptorFailure(error)
+            )
+        else:
+            writer = _message_writer(
+                mode,
+                events,
+                f"recipient-{recipient_id}",
+                error=error if outcome == "writer-failure" else None,
+            )
+            writers.append(writer)
+            recipient = _make_message_recipient(
+                recipient_id, _message_memory(mode, writer)
+            )
+        recipients.append(recipient)
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.ERROR, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "partition", recipients)
+
+    assert result == expected_status
+    for writer in writers:
+        assert writer.call_count == 1
+    assert events[-1] == "sender"
+    _assert_message_call(mode, sender_writer, "partition", recipients=delivered_ids)
+    error_records = [
+        record for record in caplog.records if record.levelno >= logging.ERROR
+    ]
+    assert len(error_records) == len(failed_ids)
+    for recipient_id in failed_ids:
+        assert any(str(recipient_id) in record.getMessage() for record in error_records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_recipient_baseexception_aborts_remaining_work(
+    monkeypatch, mode
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    abort = _MessageDeliveryAbort("recipient delivery aborted")
+    first_writer = _message_writer(mode, events, "recipient-20")
+    aborting_writer = _message_writer(mode, events, "recipient-21", error=abort)
+    later_writer = _message_writer(mode, events, "recipient-22")
+    sender_writer = _message_writer(mode, events, "sender")
+    sender.memory = _message_memory(mode, sender_writer)
+    recipients = [
+        _make_message_recipient(20, _message_memory(mode, first_writer)),
+        _make_message_recipient(21, _message_memory(mode, aborting_writer)),
+        _make_message_recipient(22, _message_memory(mode, later_writer)),
+    ]
+
+    with pytest.raises(_MessageDeliveryAbort) as exc_info:
+        await _call_send_message(mode, sender, "abort", recipients)
+
+    assert exc_info.value is abort
+    assert events == ["recipient-20", "recipient-21"]
+    assert first_writer.call_count == aborting_writer.call_count == 1
+    later_writer.assert_not_called()
+    sender_writer.assert_not_called()
+
+
+_SENDER_HISTORY_FAILURE_CASES = [
+    pytest.param(mode, state, id=f"{mode}-{state}")
+    for mode in _MESSAGE_MODES
+    for state in (
+        "missing-memory",
+        "none-memory",
+        "missing-writer",
+        "noncallable-writer",
+        "memory-descriptor-exception",
+        "writer-descriptor-exception",
+        "writer-exception",
+    )
+] + [pytest.param("async", "nonawaitable", id="async-nonawaitable")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "sender_state"), _SENDER_HISTORY_FAILURE_CASES)
+async def test_send_message_reports_sender_history_failures(
+    monkeypatch, caplog, mode, sender_state
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    recipient_writer = _message_writer(mode, events, "recipient-20")
+    recipient = _make_message_recipient(20, _message_memory(mode, recipient_writer))
+    sender_error = RuntimeError(f"sender {sender_state} failed")
+    sender_writer = None
+
+    if sender_state == "missing-memory":
+        del sender.memory
+    elif sender_state == "none-memory":
+        sender.memory = None
+    elif sender_state == "missing-writer":
+        sender.memory = SimpleNamespace()
+    elif sender_state == "noncallable-writer":
+        sender.memory = _message_memory(mode, "not callable")
+    elif sender_state == "memory-descriptor-exception":
+
+        def fail_memory_descriptor(_sender):
+            raise sender_error
+
+        monkeypatch.setattr(
+            type(sender), "memory", property(fail_memory_descriptor), raising=False
+        )
+    elif sender_state == "writer-descriptor-exception":
+        sender.memory = _MessageWriterDescriptorFailure(sender_error)
+    elif sender_state == "nonawaitable":
+        sender_writer = Mock(return_value=None)
+        sender.memory = SimpleNamespace(aadd_to_memory=sender_writer)
+    else:
+        sender_writer = _message_writer(mode, events, "sender", error=sender_error)
+        sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.ERROR, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "history", [recipient])
+
+    assert result == (
+        "sent message 'history' to [20]; "
+        "sender history recording failed after recipient delivery"
+    )
+    _assert_message_call(mode, recipient_writer, "history")
+    if sender_state == "writer-exception":
+        _assert_message_call(mode, sender_writer, "history", recipients=[20])
+    elif sender_state == "nonawaitable":
+        sender_writer.assert_called_once_with(
+            type="message",
+            content={"message": "history", "sender": 10, "recipients": [20]},
+        )
+    assert any(
+        record.levelno >= logging.ERROR and "10" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_reports_sender_history_exception_without_delivery(
+    monkeypatch, caplog, mode
+):
+    sender, _ = _make_send_message_model(monkeypatch)
+    events = []
+    sender_writer = _message_writer(
+        mode,
+        events,
+        "sender",
+        error=RuntimeError("sender history failed"),
+    )
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with caplog.at_level(logging.ERROR, logger="mesa_llm.llm_agent"):
+        result = await _call_send_message(mode, sender, "empty", [])
+
+    assert result == (
+        "Could not send message 'empty': no matching recipients found.; "
+        "sender history recording failed after recipient delivery"
+    )
+    _assert_message_call(mode, sender_writer, "empty", recipients=[])
+    assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_sender_history_baseexception_propagates(monkeypatch, mode):
+    sender, recipient = _make_send_message_model(monkeypatch)
+    events = []
+    recipient_writer = _message_writer(mode, events, "recipient-20")
+    recipient.memory = _message_memory(mode, recipient_writer)
+    abort = _MessageDeliveryAbort("sender history aborted")
+    sender_writer = _message_writer(mode, events, "sender", error=abort)
+    sender.memory = _message_memory(mode, sender_writer)
+
+    with pytest.raises(_MessageDeliveryAbort) as exc_info:
+        await _call_send_message(mode, sender, "history abort", [recipient])
+
+    assert exc_info.value is abort
+    assert events == ["recipient-20", "sender"]
+    assert recipient_writer.call_count == sender_writer.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_payloads_are_isolated(monkeypatch, mode):
+    sender, first = _make_send_message_model(monkeypatch)
+    events = []
+    observed = {}
+
+    def mutate_first(_type, content):
+        observed["first"] = _snapshot_message_content(content)
+        content.update(message="recipient mutation", sender=-1, recipients=[999])
+
+    def observe_second(_type, content):
+        observed["second"] = _snapshot_message_content(content)
+
+    def mutate_sender(_type, content):
+        observed["sender"] = _snapshot_message_content(content)
+        content["message"] = "sender mutation"
+        content["recipients"].append(999)
+
+    first_writer = _message_writer(mode, events, "recipient-20", observer=mutate_first)
+    first.memory = _message_memory(mode, first_writer)
+    second_writer = _message_writer(
+        mode, events, "recipient-21", observer=observe_second
+    )
+    second = _make_message_recipient(21, _message_memory(mode, second_writer))
+    sender_writer = _message_writer(mode, events, "sender", observer=mutate_sender)
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(mode, sender, "isolation", [first, second])
+
+    assert result == "sent message 'isolation' to [20, 21]"
+    assert observed == {
+        "first": {"message": "isolation", "sender": 10},
+        "second": {"message": "isolation", "sender": 10},
+        "sender": {
+            "message": "isolation",
+            "sender": 10,
+            "recipients": [20, 21],
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", _MESSAGE_MODES)
+async def test_send_message_mixed_status_has_all_clauses_in_frozen_order(
+    monkeypatch, mode
+):
+    sender, delivered = _make_send_message_model(monkeypatch)
+    events = []
+    delivered_writer = _message_writer(mode, events, "recipient-20")
+    delivered.memory = _message_memory(mode, delivered_writer)
+    duplicate_writer = _message_writer(mode, events, "duplicate-20")
+    duplicate = _make_message_recipient(20, _message_memory(mode, duplicate_writer))
+    skipped = _make_message_recipient(30, None)
+    failed_writer = _message_writer(
+        mode,
+        events,
+        "recipient-40",
+        error=RuntimeError("recipient 40 failed"),
+    )
+    failed = _make_message_recipient(40, _message_memory(mode, failed_writer))
+    later_writer = _message_writer(mode, events, "recipient-50")
+    later = _make_message_recipient(50, _message_memory(mode, later_writer))
+    sender_writer = _message_writer(
+        mode,
+        events,
+        "sender",
+        error=RuntimeError("sender history failed"),
+    )
+    sender.memory = _message_memory(mode, sender_writer)
+
+    result = await _call_send_message(
+        mode,
+        sender,
+        "mixed",
+        [sender, delivered, duplicate, skipped, failed, later],
+    )
+
+    assert result == (
+        "sent message 'mixed' to [20, 50]; "
+        "skipped [30] because they have no usable memory method; "
+        "failed to deliver to [40]; "
+        "sender history recording failed after recipient delivery"
+    )
+    duplicate_writer.assert_not_called()
+    _assert_message_call(mode, sender_writer, "mixed", recipients=[20, 50])
+
+
+@pytest.mark.asyncio
+async def test_send_message_async_never_falls_back_to_sync_memory_writer(
+    monkeypatch,
+):
+    sender, recipient = _make_send_message_model(monkeypatch)
+    sender_sync = Mock()
+    sender_async = AsyncMock()
+    sender.memory = SimpleNamespace(
+        add_to_memory=sender_sync, aadd_to_memory=sender_async
+    )
+    recipient_sync = Mock()
+    recipient_async = AsyncMock()
+    recipient.memory = SimpleNamespace(
+        add_to_memory=recipient_sync, aadd_to_memory=recipient_async
+    )
+    fallback = Mock()
+    sync_only = _make_message_recipient(30, SimpleNamespace(add_to_memory=fallback))
+
+    result = await sender.asend_message("async only", [recipient, sync_only])
+
+    assert result == (
+        "sent message 'async only' to [20]; "
+        "skipped [30] because they have no usable memory method"
+    )
+    _assert_message_call("async", recipient_async, "async only")
+    _assert_message_call("async", sender_async, "async only", recipients=[20])
+    recipient_sync.assert_not_called()
+    sender_sync.assert_not_called()
+    fallback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

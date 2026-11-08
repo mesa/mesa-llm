@@ -39,4 +39,4 @@ These examples are useful if you are already familiar with Mesa and want to see 
 
 ## Community and Support
 - [Mesa-LLM Discussion](https://github.com/mesa/mesa-llm/discussions)
-- [Matrix Chat Room](https://matrix.to/#/#mesa-llm:matrix.org)
+- [Discord](https://discord.gg/fa5pEv3NxY)
