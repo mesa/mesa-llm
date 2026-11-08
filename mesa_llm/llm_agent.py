@@ -201,12 +201,14 @@ class LLMAgent(Agent):
         api_base: str | None = None,
         tools: list[Callable | str] | tuple[Callable | str, ...] | None = None,
         actions: list[Callable | str] | tuple[Callable | str, ...] | None = None,
+        record_llm_calls: bool = False,
     ):
         try:
             super().__init__(model=model)
 
             self.model = model
             self.step_prompt = step_prompt
+            self.record_llm_calls = record_llm_calls
             self.llm = ModuleLLM(
                 llm_model=llm_model,
                 fallback_model=fallback_model,
@@ -235,6 +237,42 @@ class LLMAgent(Agent):
 
             # Placeholder so @record_model can attach the SimulationRecorder
             self.recorder: SimulationRecorder | None = None
+
+            self._llm_generate = self.llm.generate
+            self._llm_agenerate = self.llm.agenerate
+
+            def _recording_generate_wrapper(*args, **kwargs):
+                response = self._llm_generate(*args, **kwargs)
+                if self.record_llm_calls:
+                    prompt = kwargs.get("prompt")
+                    if prompt is None and args:
+                        prompt = args[0]
+                    system_prompt_value = kwargs.get("system_prompt")
+                    self._record_llm_generation(
+                        response,
+                        prompt=prompt,
+                        system_prompt=system_prompt_value,
+                        model=getattr(self.llm, "llm_model", None),
+                    )
+                return response
+
+            async def _recording_agenerate_wrapper(*args, **kwargs):
+                response = await self._llm_agenerate(*args, **kwargs)
+                if self.record_llm_calls:
+                    prompt = kwargs.get("prompt")
+                    if prompt is None and args:
+                        prompt = args[0]
+                    system_prompt_value = kwargs.get("system_prompt")
+                    self._record_llm_generation(
+                        response,
+                        prompt=prompt,
+                        system_prompt=system_prompt_value,
+                        model=getattr(self.llm, "llm_model", None),
+                    )
+                return response
+
+            self.llm.generate = _recording_generate_wrapper
+            self.llm.agenerate = _recording_agenerate_wrapper
 
             if isinstance(internal_state, str):
                 internal_state = [internal_state]
@@ -1254,7 +1292,7 @@ class LLMAgent(Agent):
                 reasoning = getattr(response, "content", None)
 
         event_content = {
-            "model": model or self.llm_model,
+            "model": model or self.llm.active_model,
             "reasoning": reasoning,
         }
         if prompt is not None:
