@@ -1,4 +1,5 @@
 from collections import deque
+from itertools import islice
 from typing import TYPE_CHECKING
 
 from mesa_llm.memory.memory import Memory, MemoryEntry, _format_message_entry
@@ -90,8 +91,9 @@ class STLTMemory(Memory):
         into the existing long-term summary.
 
         Args:
-            evicted_entries: the oldest short-term entries that were just
-                removed from the deque and need to be summarized.
+            evicted_entries: the oldest short-term entries selected for
+                consolidation. They are still in the deque while the summary
+                is generated and are removed only after it has been stored.
         """
         evicted_text = "\n".join(
             f"Step {e.step}: \n{e.content}" for e in evicted_entries
@@ -105,13 +107,43 @@ class STLTMemory(Memory):
             "long-term memory summary."
         )
 
+    @staticmethod
+    def _extract_summary(response) -> str:
+        """
+        Return the summary text of an LLM response, or raise ``ValueError``.
+
+        Long-term memory is only overwritten with a valid, non-empty string, so
+        a bad response can never replace a good summary.
+        """
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise ValueError("Consolidation response has no message content") from exc
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Consolidation response must be a non-empty string")
+        return content
+
+    def _discard_consolidated(self, evicted_entries: list[MemoryEntry]) -> None:
+        """
+        Remove the entries that were just consolidated from short-term memory.
+
+        Only call this after the summary has been stored in long-term memory.
+        Entries are matched by identity, oldest first.
+        """
+        for entry in evicted_entries:
+            if self.short_term_memory and self.short_term_memory[0] is entry:
+                self.short_term_memory.popleft()
+
     def _update_long_term_memory(self, evicted_entries: list[MemoryEntry]):
         """
-        Update the long term memory by summarizing the evicted entries
+        Update the long term memory by summarizing the evicted entries.
+
+        Raises if the LLM call fails or returns an invalid response. In both
+        cases long-term memory is left unchanged.
         """
         prompt = self._build_consolidation_prompt(evicted_entries)
         response = self.llm.generate(prompt)
-        self.long_term_memory = response.choices[0].message.content
+        self.long_term_memory = self._extract_summary(response)
 
     async def _aupdate_long_term_memory(self, evicted_entries: list[MemoryEntry]):
         """
@@ -119,20 +151,23 @@ class STLTMemory(Memory):
         """
         prompt = self._build_consolidation_prompt(evicted_entries)
         response = await self.llm.agenerate(prompt)
-        self.long_term_memory = response.choices[0].message.content
+        self.long_term_memory = self._extract_summary(response)
 
     def _process_step_core(self, pre_step: bool):
         """
         Shared core logic for process_step and aprocess_step.
 
         Update short-term memory and decide if consolidation is needed.
-        When entries are evicted for consolidation they are captured and
+        When consolidation is needed, the oldest entries are selected and
         returned so the caller can pass them to the LLM for summarization.
+        They are *not* removed here: the caller removes them with
+        ``_discard_consolidated`` only after the summary has been stored, so a
+        failed LLM call cannot lose them.
 
         Returns:
             ``(new_entry, evicted_entries)`` where *evicted_entries* is a
-            (possibly empty) list of MemoryEntry objects that were removed
-            from short-term memory and should be consolidated.
+            (possibly empty) list of MemoryEntry objects, still present at the
+            left of short-term memory, that should be consolidated.
         """
         if pre_step:
             new_entry = MemoryEntry(
@@ -181,10 +216,9 @@ class STLTMemory(Memory):
             > self.capacity + (self.consolidation_capacity or 0)
             and self.consolidation_capacity
         ):
-            # Pop consolidation_capacity oldest entries for summarization
-            for _ in range(self.consolidation_capacity):
-                if self.short_term_memory:
-                    evicted.append(self.short_term_memory.popleft())
+            # Select (do not remove) the oldest entries for summarization.
+            # They are removed after a successful consolidation.
+            evicted = list(islice(self.short_term_memory, self.consolidation_capacity))
 
         elif (
             len(self.short_term_memory) > self.capacity
@@ -202,7 +236,9 @@ class STLTMemory(Memory):
         new_entry, evicted = self._process_step_core(pre_step)
 
         if evicted:
+            # Raises on failure, leaving the entries in short-term memory
             self._update_long_term_memory(evicted)
+            self._discard_consolidated(evicted)
 
         if new_entry and self.display:
             new_entry.display()
@@ -214,7 +250,9 @@ class STLTMemory(Memory):
         new_entry, evicted = self._process_step_core(pre_step)
 
         if evicted:
+            # Raises on failure, leaving the entries in short-term memory
             await self._aupdate_long_term_memory(evicted)
+            self._discard_consolidated(evicted)
 
         if new_entry and self.display:
             new_entry.display()
