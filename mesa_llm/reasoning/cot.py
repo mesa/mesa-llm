@@ -60,6 +60,18 @@ class CoTReasoning(Reasoning):
         ):
             short_term_memory = memory.format_short_term()
 
+        memory_section = ""
+        if (
+            memory is not None
+            and not callable(getattr(memory, "format_long_term", None))
+            and not callable(getattr(memory, "format_short_term", None))
+            and callable(getattr(memory, "get_prompt_ready", None))
+        ):
+            memory_section = (
+                "\n        # Memory\n"
+                f"        {memory.get_prompt_ready()}\n\n        ---\n"
+            )
+
         obs_str = str(obs)
 
         system_prompt = f"""
@@ -80,6 +92,7 @@ class CoTReasoning(Reasoning):
 
         ---
 
+{memory_section}
         # Current Observation
         {obs_str}
 
