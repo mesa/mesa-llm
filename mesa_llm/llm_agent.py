@@ -685,6 +685,33 @@ class LLMAgent(Agent):
         if observer_errors:
             raise ActionPostCommitError(action_choice, result, observer_errors)
 
+    def _record_to_recorder(
+        self,
+        event_type: str,
+        content: Any,
+        source: str,
+        recipient_ids: list[int] | None = None,
+    ) -> None:
+        """Best-effort recording of an agent event; failures are only logged."""
+        recorder = self.recorder
+        if recorder is None:
+            return
+        try:
+            recorder.record_event(
+                event_type,
+                content=copy.deepcopy(content),
+                agent_id=self.unique_id,
+                metadata={"source": source},
+                recipient_ids=recipient_ids,
+            )
+        except Exception:
+            logger.warning(
+                "Recording %r event for agent %s failed.",
+                event_type,
+                self.unique_id,
+                exc_info=True,
+            )
+
     def _plan_message_recipients(
         self, recipients: list[Agent]
     ) -> list[tuple[int, Agent]]:
@@ -746,14 +773,15 @@ class LLMAgent(Agent):
                 agent=self, llm_response=plan.llm_plan, tools=plan_tools
             )
 
-        await self.memory.aadd_to_memory(
-            type="action",
-            content={
-                "tool_calls": [
-                    {k: v for k, v in tc.items() if k not in ["tool_call_id", "role"]}
-                    for tc in tool_call_resp
-                ]
-            },
+        action_content = {
+            "tool_calls": [
+                {k: v for k, v in tc.items() if k not in ["tool_call_id", "role"]}
+                for tc in tool_call_resp
+            ]
+        }
+        await self.memory.aadd_to_memory(type="action", content=action_content)
+        self._record_to_recorder(
+            "action", action_content, source="LLMAgent.aapply_plan"
         )
 
         return tool_call_resp
@@ -777,15 +805,14 @@ class LLMAgent(Agent):
             )
 
         # Add to memory
-        self.memory.add_to_memory(
-            type="action",
-            content={
-                "tool_calls": [
-                    {k: v for k, v in tc.items() if k not in ["tool_call_id", "role"]}
-                    for tc in tool_call_resp
-                ]
-            },
-        )
+        action_content = {
+            "tool_calls": [
+                {k: v for k, v in tc.items() if k not in ["tool_call_id", "role"]}
+                for tc in tool_call_resp
+            ]
+        }
+        self.memory.add_to_memory(type="action", content=action_content)
+        self._record_to_recorder("action", action_content, source="LLMAgent.apply_plan")
 
         return tool_call_resp
 
@@ -1012,6 +1039,13 @@ class LLMAgent(Agent):
                 self.unique_id,
             )
 
+        self._record_to_recorder(
+            "message",
+            message,
+            source="LLMAgent.asend_message",
+            recipient_ids=delivered_ids.copy(),
+        )
+
         return self._format_message_status(
             message,
             delivered_ids,
@@ -1107,6 +1141,13 @@ class LLMAgent(Agent):
                 "Sender %s history recording failed after recipient delivery.",
                 self.unique_id,
             )
+
+        self._record_to_recorder(
+            "message",
+            message,
+            source="LLMAgent.send_message",
+            recipient_ids=delivered_ids.copy(),
+        )
 
         return self._format_message_status(
             message,

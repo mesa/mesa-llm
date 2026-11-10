@@ -1,3 +1,5 @@
+import copy
+import logging
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass
@@ -10,6 +12,13 @@ from mesa_llm.module_llm import ModuleLLM
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
+
+logger = logging.getLogger(__name__)
+
+# Event types that ``LLMAgent`` records itself, so the memory hook must skip
+# them: a message is written to the sender's and every recipient's memory but
+# is one event, and actions carry their own result payload.
+_SELF_RECORDED_EVENT_TYPES = frozenset({"message", "action"})
 
 
 def _format_message_entry(msg_value) -> str:
@@ -487,6 +496,36 @@ class Memory(ABC):
                 self.__dict__.pop("_step_event_order_cache", None)
         else:
             self.step_content[type] = content
+
+        self._record_event(type, content)
+
+    def _record_event(self, event_type: str, content: dict) -> None:
+        """
+        Forward a memory entry to the agent's ``SimulationRecorder``, if any.
+
+        ``message`` and ``action`` entries are skipped because ``LLMAgent``
+        records those itself. Recording is best-effort: a recorder failure is
+        logged and never interrupts the agent's step.
+        """
+        if event_type in _SELF_RECORDED_EVENT_TYPES:
+            return
+        recorder = getattr(self.agent, "recorder", None)
+        if recorder is None:
+            return
+        try:
+            recorder.record_event(
+                event_type,
+                content=copy.deepcopy(content),
+                agent_id=self.agent.unique_id,
+                metadata={"source": f"{self.__class__.__name__}.add_to_memory"},
+            )
+        except Exception:
+            logger.warning(
+                "Recording %r event for agent %s failed.",
+                event_type,
+                getattr(self.agent, "unique_id", None),
+                exc_info=True,
+            )
 
     # Async Function wrapper for add_to_memory()
     async def aadd_to_memory(self, type: str, content: dict):
