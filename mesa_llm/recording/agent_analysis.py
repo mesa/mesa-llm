@@ -69,6 +69,16 @@ class AgentViewer:
         if not isinstance(content, dict):
             return f"ACTION: {content}"
 
+        if "action" not in content and "tool_calls" in content:
+            lines = ["ACTION: tool calls"]
+            for call in content["tool_calls"] or []:
+                if isinstance(call, dict):
+                    name = call.get("name", "unknown")
+                    lines.append(f"{name} -> {call.get('response', '')}")
+                else:
+                    lines.append(str(call))
+            return "\n".join(lines)
+
         if "action" not in content:
             action = content.get("action_type", content.get("data", ""))
             return f"ACTION: {action}"

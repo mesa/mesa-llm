@@ -242,6 +242,7 @@ class EpisodicMemory(Memory):
             "importance": self.grade_event_importance(type, content),
         }
         self._finalize_entry(type, graded_content)
+        self._record_event(type, content)
 
     async def aadd_to_memory(self, type: str, content: dict):
         """
@@ -252,6 +253,7 @@ class EpisodicMemory(Memory):
             "importance": await self.agrade_event_importance(type, content),
         }
         self._finalize_entry(type, graded_content)
+        self._record_event(type, content)
 
     def get_prompt_ready(self) -> str:
         return f"Top {self.considered_entries} memory entries:\n\n" + "\n".join(
