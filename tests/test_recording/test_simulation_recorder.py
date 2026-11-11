@@ -232,7 +232,7 @@ class TestSimulationRecorder:
         # Save with custom filename
         filepath = recorder.save(filename="test_recording.json", format="json")
 
-        assert filepath == temp_dir / "test_recording.json"
+        assert filepath == recorder.session_dir / "test_recording.json"
         assert filepath.exists()
 
         # Load and verify content
@@ -259,6 +259,71 @@ class TestSimulationRecorder:
         # Check agent summaries
         assert "123" in data["agent_summaries"]
 
+    def test_save_auto_filename(self, recorder, temp_dir):
+        """Test auto-generating filename when saving."""
+        # Add max_steps to mock model
+        recorder.model.max_steps = 10
+
+        # Instead of mocking datetime, just test that auto-filename generation works
+        filepath = recorder.save(format="json")
+
+        # Check that the filename follows the expected pattern
+        assert filepath.parent == recorder.session_dir
+        assert filepath.name == "recording.json"
+        assert filepath.exists()
+
+    def test_save_auto_filename_uses_session_dir(self, recorder, mock_model, temp_dir):
+        """Saving without a filename should create recording.json inside the session dir."""
+        mock_model.max_steps = 10
+        filepath = recorder.save(format="json")
+
+        assert filepath == recorder.session_dir / "recording.json"
+        assert filepath.parent == recorder.session_dir
+        assert filepath.exists()
+
+    def test_autosave_reuses_checkpoint_in_session_dir(self, mock_model, temp_dir):
+        """Autosave must replace a single checkpoint instead of creating a chain of files."""
+        mock_model.max_steps = 10
+        recorder = SimulationRecorder(
+            model=mock_model,
+            output_dir=str(temp_dir),
+            auto_save_interval=2,
+        )
+
+        recorder.record_event("event_1", {"data": "1"})
+        recorder.record_event("event_2", {"data": "2"})
+
+        checkpoint = recorder.session_dir / "checkpoint.json"
+        assert checkpoint.exists()
+        assert list(recorder.session_dir.iterdir()) == [checkpoint]
+
+        with open(checkpoint) as handle:
+            data = json.load(handle)
+
+        event_types = [event["event_type"] for event in data["events"]]
+        assert event_types.count("simulation_end") == 1
+        assert event_types[-1] == "simulation_end"
+
+    def test_session_dir_is_unique_per_simulation(self, mock_model, temp_dir):
+        """Each simulation should own its own unique directory and retain previous folders."""
+        first = SimulationRecorder(model=mock_model, output_dir=str(temp_dir))
+        second = SimulationRecorder(model=mock_model, output_dir=str(temp_dir))
+
+        assert first.session_dir != second.session_dir
+        assert first.session_dir.parent == temp_dir
+        assert second.session_dir.parent == temp_dir
+        assert first.session_dir.name.startswith("TestModel_")
+        assert second.session_dir.name.startswith("TestModel_")
+        assert len(list(temp_dir.iterdir())) == 2
+
+    def test_custom_filename_stays_inside_session_dir(self, recorder):
+        """Relative custom filenames should still be stored inside the simulation session."""
+        recorder.model.max_steps = 10
+        filepath = recorder.save(filename="custom.json", format="json")
+
+        assert filepath == recorder.session_dir / "custom.json"
+        assert filepath.parent == recorder.session_dir
+
     def test_save_pickle_format_warns(self, recorder, temp_dir):
         """Test saving recording in pickle format emits a deprecation warning."""
         recorder.model.max_steps = 10
@@ -270,7 +335,7 @@ class TestSimulationRecorder:
         ):
             filepath = recorder.save(filename="test_recording.pkl", format="pickle")
 
-        assert filepath == temp_dir / "test_recording.pkl"
+        assert filepath == recorder.session_dir / "test_recording.pkl"
         assert filepath.exists()
 
         with open(filepath, "rb") as f:
@@ -279,6 +344,45 @@ class TestSimulationRecorder:
         assert "metadata" in data
         assert "events" in data
         assert "agent_summaries" in data
+
+    def test_save_json_format(self, recorder, mock_model, temp_dir):
+        """Test saving recording in JSON format."""
+        # Add some test data
+        mock_model.steps = 5
+        mock_model.agents = [Mock(), Mock()]  # 2 agents
+        mock_model.max_steps = 10  # Add max_steps to avoid comparison error
+
+        recorder.record_event("test_event", {"data": "test"}, agent_id=123)
+
+        # Save with custom filename
+        filepath = recorder.save(filename="test_recording.json", format="json")
+
+        assert filepath == recorder.session_dir / "test_recording.json"
+        assert filepath.exists()
+
+        # Load and verify content
+        with open(filepath) as f:
+            data = json.load(f)
+
+        assert "metadata" in data
+        assert "events" in data
+        assert "agent_summaries" in data
+
+        # Check metadata
+        metadata = data["metadata"]
+        assert metadata["simulation_id"] == recorder.simulation_id
+        assert metadata["model_class"] == "TestModel"
+        assert metadata["total_steps"] == 5
+        assert metadata["total_agents"] == 2
+        assert "start_time" in metadata
+        assert "end_time" in metadata
+        assert "duration_minutes" in metadata
+
+        # Check events (includes our test event plus simulation_end event)
+        assert len(data["events"]) == 2
+
+        # Check agent summaries
+        assert "123" in data["agent_summaries"]
 
     def test_save_auto_filename(self, recorder, temp_dir):
         """Test auto-generating filename when saving."""
@@ -289,9 +393,8 @@ class TestSimulationRecorder:
         filepath = recorder.save(format="json")
 
         # Check that the filename follows the expected pattern
-        assert filepath.parent == temp_dir
-        assert filepath.name.startswith(f"simulation_{recorder.simulation_id}_")
-        assert filepath.name.endswith(".json")
+        assert filepath.parent == recorder.session_dir
+        assert filepath.name == "recording.json"
         assert filepath.exists()
 
     def test_save_invalid_format(self, recorder):
