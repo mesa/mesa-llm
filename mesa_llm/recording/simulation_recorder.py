@@ -5,9 +5,12 @@ This module provides tools to record all simulation events for post-analysis,
 including agent observations, plans, actions, messages, and state changes.
 """
 
+import contextlib
 import json
 import logging
+import os
 import pickle
+import tempfile
 import uuid
 import warnings
 from dataclasses import asdict, dataclass
@@ -92,12 +95,57 @@ class SimulationRecorder:
         # Auto-save counter
         self.events_since_save = 0
 
+        # Create a unique directory for this simulation run while keeping
+        # `output_dir` as the parent directory for backward compatibility.
+        timestamp = self.start_time.strftime("%Y%m%d_%H%M%S")
+        model_name = self.model.__class__.__name__
+        self.session_dir = self.output_dir / (
+            f"{model_name}_{timestamp}_{self.simulation_id}"
+        )
+        self.session_dir.mkdir(parents=True, exist_ok=False)
+        self.simulation_dir = self.session_dir
+
         # Initialize simulation metadata
         self.simulation_metadata = {
             "simulation_id": self.simulation_id,
             "start_time": self.start_time.isoformat(),
             "model_class": self.model.__class__.__name__,
+            "recording_directory": str(self.session_dir),
         }
+
+    def _atomic_write(self, filepath: Path, payload: Any, *, format: str):
+        """Write a file atomically to avoid corruption during a save."""
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w" if format == "json" else "wb",
+                dir=str(filepath.parent),
+                delete=False,
+                prefix=f".{filepath.name}.",
+            ) as tmp_file:
+                temp_path = Path(tmp_file.name)
+                if format == "json":
+                    json.dump(payload, tmp_file, indent=2, default=str)
+                else:
+                    pickle.dump(payload, tmp_file)
+            os.replace(temp_path, filepath)
+        except Exception:
+            if temp_path is not None:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink(missing_ok=True)
+            raise
+
+    def _resolve_save_path(self, filename: str | None, *, format: str) -> Path:
+        """Resolve the final output path for a recording inside the simulation directory."""
+        if filename is None:
+            default_name = "recording.json" if format == "json" else "recording.pkl"
+            return self.session_dir / default_name
+
+        path = Path(filename)
+        if path.is_absolute():
+            return path
+        return self.session_dir / path
 
     def record_event(
         self,
@@ -165,8 +213,7 @@ class SimulationRecorder:
             self.auto_save_interval
             and self.events_since_save >= self.auto_save_interval
         ):
-            filename = f"autosave_{self.simulation_id}_{len(self.events)}.json"
-            self.save(filename)
+            self.save(filename="checkpoint.json", format="json")
             self.events_since_save = 0
 
     def record_model_event(self, event_type: str, content: dict[str, Any]):
@@ -220,14 +267,7 @@ class SimulationRecorder:
         if format not in ["json", "pickle"]:
             raise ValueError("Format must be 'json' or 'pickle'")
 
-        if filename is None:
-            extension = "json" if format == "json" else "pkl"
-            filename = (
-                f"simulation_{self.simulation_id}_"
-                f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.{extension}"
-            )
-
-        filepath = self.output_dir / filename
+        filepath = self._resolve_save_path(filename, format=format)
 
         if self.events and self.events[-1].event_type == "simulation_end":
             self.events.pop()
@@ -297,8 +337,7 @@ class SimulationRecorder:
         }
 
         if format == "json":
-            with open(filepath, "w") as f:
-                json.dump(export_data, f, indent=2, default=str)
+            self._atomic_write(filepath, export_data, format="json")
         else:
             warnings.warn(
                 "Pickle recording support is deprecated and will be removed "
@@ -307,8 +346,7 @@ class SimulationRecorder:
                 FutureWarning,
                 stacklevel=2,
             )
-            with open(filepath, "wb") as f:
-                pickle.dump(export_data, f)
+            self._atomic_write(filepath, export_data, format="pickle")
 
         logger.info("Simulation recording saved to: %s", filepath)
         return filepath

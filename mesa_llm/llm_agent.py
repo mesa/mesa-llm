@@ -201,12 +201,14 @@ class LLMAgent(Agent):
         api_base: str | None = None,
         tools: list[Callable | str] | tuple[Callable | str, ...] | None = None,
         actions: list[Callable | str] | tuple[Callable | str, ...] | None = None,
+        record_llm_calls: bool = False,
     ):
         try:
             super().__init__(model=model)
 
             self.model = model
             self.step_prompt = step_prompt
+            self.record_llm_calls = record_llm_calls
             self.llm = ModuleLLM(
                 llm_model=llm_model,
                 fallback_model=fallback_model,
@@ -235,6 +237,42 @@ class LLMAgent(Agent):
 
             # Placeholder so @record_model can attach the SimulationRecorder
             self.recorder: SimulationRecorder | None = None
+
+            self._llm_generate = self.llm.generate
+            self._llm_agenerate = self.llm.agenerate
+
+            def _recording_generate_wrapper(*args, **kwargs):
+                response = self._llm_generate(*args, **kwargs)
+                if self.record_llm_calls:
+                    prompt = kwargs.get("prompt")
+                    if prompt is None and args:
+                        prompt = args[0]
+                    system_prompt_value = kwargs.get("system_prompt")
+                    self._record_llm_generation(
+                        response,
+                        prompt=prompt,
+                        system_prompt=system_prompt_value,
+                        model=getattr(self.llm, "llm_model", None),
+                    )
+                return response
+
+            async def _recording_agenerate_wrapper(*args, **kwargs):
+                response = await self._llm_agenerate(*args, **kwargs)
+                if self.record_llm_calls:
+                    prompt = kwargs.get("prompt")
+                    if prompt is None and args:
+                        prompt = args[0]
+                    system_prompt_value = kwargs.get("system_prompt")
+                    self._record_llm_generation(
+                        response,
+                        prompt=prompt,
+                        system_prompt=system_prompt_value,
+                        model=getattr(self.llm, "llm_model", None),
+                    )
+                return response
+
+            self.llm.generate = _recording_generate_wrapper
+            self.llm.agenerate = _recording_agenerate_wrapper
 
             if isinstance(internal_state, str):
                 internal_state = [internal_state]
@@ -1214,3 +1252,106 @@ class LLMAgent(Agent):
                 )
 
             cls.astep = awrapped
+
+    def _record_llm_generation(
+        self,
+        response: object,
+        *,
+        prompt: str | list[str] | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Record a generated LLM response if llm tracing is enabled."""
+        if not self.record_llm_calls:
+            return
+
+        recorder = getattr(self, "recorder", None)
+        if recorder is None:
+            return
+
+        reasoning = None
+
+        def _extract_message_content(payload: object) -> object:
+            if isinstance(payload, dict):
+                choices = payload.get("choices")
+                if isinstance(choices, list) and choices:
+                    first_choice = choices[0]
+                    if isinstance(first_choice, dict):
+                        message = first_choice.get("message")
+                        if isinstance(message, dict):
+                            return message.get("content")
+                        if message is not None:
+                            return getattr(message, "content", None)
+                return payload.get("content") or payload.get("reasoning")
+
+            choices = getattr(payload, "choices", None)
+            if isinstance(choices, list) and choices:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    message = first_choice.get("message")
+                    if isinstance(message, dict):
+                        return message.get("content")
+                    if message is not None:
+                        return getattr(message, "content", None)
+                else:
+                    message = getattr(first_choice, "message", None)
+                    if message is not None:
+                        return getattr(message, "content", None)
+
+            content = getattr(payload, "content", None)
+            if content is not None:
+                return content
+
+            reasoning_attr = getattr(payload, "reasoning", None)
+            if reasoning_attr is not None:
+                return reasoning_attr
+
+            return None
+
+        reasoning = _extract_message_content(response)
+        if isinstance(reasoning, list):
+            normalized_parts = []
+            for item in reasoning:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if text is not None:
+                        normalized_parts.append(str(text))
+                elif item is not None:
+                    normalized_parts.append(str(item))
+            if normalized_parts:
+                reasoning = "".join(normalized_parts)
+
+        if reasoning is None:
+            reasoning = str(response)
+
+        effective_model = (
+            model
+            or getattr(self.llm, "active_model", None)
+            or getattr(self, "llm_model", None)
+        )
+        event_content = {
+            "model": effective_model,
+            "reasoning": reasoning,
+        }
+        if prompt is not None:
+            event_content["prompt"] = (
+                prompt if isinstance(prompt, str) else " | ".join(prompt)
+            )
+        if system_prompt:
+            event_content["system_prompt"] = system_prompt
+
+        recorder.record_event(
+            event_type="llm_generation",
+            content=event_content,
+            agent_id=self.unique_id,
+            metadata={
+                "source": "llm_agent",
+                "model": effective_model,
+                "record_llm_calls": True,
+            },
+        )
+        try:
+            if getattr(recorder, "session_dir", None) is not None:
+                recorder.save(filename="recording.json", format="json")
+        except Exception:
+            logger.exception("Failed to save llm_generation recording.")
