@@ -1324,7 +1324,11 @@ class LLMAgent(Agent):
         if reasoning is None:
             reasoning = str(response)
 
-        effective_model = model or getattr(self.llm, "active_model", None) or getattr(self, "llm_model", None)
+        effective_model = (
+            model
+            or getattr(self.llm, "active_model", None)
+            or getattr(self, "llm_model", None)
+        )
         event_content = {
             "model": effective_model,
             "reasoning": reasoning,
