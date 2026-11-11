@@ -62,6 +62,18 @@ class ReWOOReasoning(Reasoning):
         ):
             short_term_memory = memory.format_short_term()
 
+        memory_section = ""
+        if (
+            memory is not None
+            and not callable(getattr(memory, "format_long_term", None))
+            and not callable(getattr(memory, "format_short_term", None))
+            and callable(getattr(memory, "get_prompt_ready", None))
+        ):
+            memory_section = (
+                "\n        # Memory\n"
+                f"        {memory.get_prompt_ready()}\n\n        ---\n"
+            )
+
         system_prompt = f"""
         You are an autonomous agent that creates multi-step plans without re-observing during execution.
         Using the ReWOO (Reasoning WithOut Observation) approach, you will create a comprehensive plan
@@ -80,6 +92,7 @@ class ReWOOReasoning(Reasoning):
 
         ---
 
+{memory_section}
         # Current Observation
         {obs}
 
