@@ -85,3 +85,57 @@ def test_react_still_includes_episodic_context(episodic_agent):
     agent = episodic_agent
     agent.memory.add_to_memory("observation", {"detail": FACT})
     assert FACT in str(ReActReasoning(agent).get_react_prompt(Observation(1, {}, {})))
+
+
+@pytest.fixture
+def limited_episodic_agent(episodic_agent):
+    """Keep the highest-ranked entry from several stored memories."""
+    agent = episodic_agent
+    agent.memory.considered_entries = 1
+    agent.memory.grade_event_importance.side_effect = [1, 2, 5]
+    for step, detail in enumerate(
+        ["the bakery is open", "the market is busy", FACT], start=1
+    ):
+        agent.model.steps = step
+        agent.memory.add_to_memory("observation", {"detail": detail})
+    agent.memory.grade_event_importance.side_effect = None
+    assert len(agent.memory.memory_entries) == 3
+    assert agent.memory.retrieve_top_k_entries(1) == [agent.memory.memory_entries[-1]]
+    return agent
+
+
+@pytest.mark.parametrize("reasoning_type", [CoTReasoning, ReWOOReasoning])
+def test_sync_planning_respects_episodic_selection(
+    limited_episodic_agent, reasoning_type
+):
+    """Only the selected memory reaches the synchronous planning prompt."""
+    agent = limited_episodic_agent
+    reasoning = reasoning_type(agent)
+    reasoning.execute_tool_call = Mock(
+        return_value=Plan(step=3, llm_plan=SimpleNamespace(tool_calls=[]))
+    )
+    reasoning.plan(prompt="choose an action", obs=Observation(3, {}, {}))
+    prompt = agent.llm.generate.call_args.kwargs["system_prompt"]
+    assert "Top 1 memory entries:" in prompt
+    assert FACT in prompt
+    assert "the bakery is open" not in prompt
+    assert "the market is busy" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reasoning_type", [CoTReasoning, ReWOOReasoning])
+async def test_async_planning_respects_episodic_selection(
+    limited_episodic_agent, reasoning_type
+):
+    """Only the selected memory reaches the asynchronous planning prompt."""
+    agent = limited_episodic_agent
+    reasoning = reasoning_type(agent)
+    reasoning.aexecute_tool_call = AsyncMock(
+        return_value=Plan(step=3, llm_plan=SimpleNamespace(tool_calls=[]))
+    )
+    await reasoning.aplan(prompt="choose an action", obs=Observation(3, {}, {}))
+    prompt = agent.llm.agenerate.call_args.kwargs["system_prompt"]
+    assert "Top 1 memory entries:" in prompt
+    assert FACT in prompt
+    assert "the bakery is open" not in prompt
+    assert "the market is busy" not in prompt
