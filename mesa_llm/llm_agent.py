@@ -1270,29 +1270,63 @@ class LLMAgent(Agent):
             return
 
         reasoning = None
-        if isinstance(response, dict):
-            choices = response.get("choices")
-            if isinstance(choices, list) and choices:
-                message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
-                if isinstance(message, dict):
-                    reasoning = message.get("content")
-                elif message is not None:
-                    reasoning = getattr(message, "content", None)
-            if reasoning is None:
-                reasoning = response.get("content")
-        else:
-            choices = getattr(response, "choices", None)
-            if choices:
-                message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
-                if isinstance(message, dict):
-                    reasoning = message.get("content")
-                elif message is not None:
-                    reasoning = getattr(message, "content", None)
-            if reasoning is None:
-                reasoning = getattr(response, "content", None)
 
+        def _extract_message_content(payload: object) -> object:
+            if isinstance(payload, dict):
+                choices = payload.get("choices")
+                if isinstance(choices, list) and choices:
+                    first_choice = choices[0]
+                    if isinstance(first_choice, dict):
+                        message = first_choice.get("message")
+                        if isinstance(message, dict):
+                            return message.get("content")
+                        if message is not None:
+                            return getattr(message, "content", None)
+                return payload.get("content") or payload.get("reasoning")
+
+            choices = getattr(payload, "choices", None)
+            if isinstance(choices, list) and choices:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    message = first_choice.get("message")
+                    if isinstance(message, dict):
+                        return message.get("content")
+                    if message is not None:
+                        return getattr(message, "content", None)
+                else:
+                    message = getattr(first_choice, "message", None)
+                    if message is not None:
+                        return getattr(message, "content", None)
+
+            content = getattr(payload, "content", None)
+            if content is not None:
+                return content
+
+            reasoning_attr = getattr(payload, "reasoning", None)
+            if reasoning_attr is not None:
+                return reasoning_attr
+
+            return None
+
+        reasoning = _extract_message_content(response)
+        if isinstance(reasoning, list):
+            normalized_parts = []
+            for item in reasoning:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if text is not None:
+                        normalized_parts.append(str(text))
+                elif item is not None:
+                    normalized_parts.append(str(item))
+            if normalized_parts:
+                reasoning = "".join(normalized_parts)
+
+        if reasoning is None:
+            reasoning = str(response)
+
+        effective_model = model or getattr(self.llm, "active_model", None) or getattr(self, "llm_model", None)
         event_content = {
-            "model": model or self.llm.active_model,
+            "model": effective_model,
             "reasoning": reasoning,
         }
         if prompt is not None:
@@ -1308,7 +1342,7 @@ class LLMAgent(Agent):
             agent_id=self.unique_id,
             metadata={
                 "source": "llm_agent",
-                "model": event_content["model"],
+                "model": effective_model,
                 "record_llm_calls": True,
             },
         )
