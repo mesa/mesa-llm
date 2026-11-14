@@ -653,3 +653,35 @@ class TestToolDecoractor:
         assert "agent" not in params["required"]
 
         _GLOBAL_TOOL_REGISTRY.clear()
+
+    def test_tool_schema_marks_only_non_default_parameters_required(self):
+        _GLOBAL_TOOL_REGISTRY.clear()
+
+        @tool
+        def search(
+            agent,
+            query: str,
+            limit: int = 10,
+            exact: bool = False,
+            note: str | None = None,
+        ) -> str:
+            """Search the knowledge base.
+
+            Args:
+                query: What to look for.
+                limit: Maximum number of results.
+                exact: Whether to match exactly.
+                note: Optional note.
+
+            Returns:
+                The matching entries.
+            """
+            del agent, limit, exact, note
+            return query
+
+        params = search.__tool_schema__["function"]["parameters"]
+
+        assert set(params["properties"]) == {"query", "limit", "exact", "note"}
+        assert params["required"] == ["query"]
+
+        _GLOBAL_TOOL_REGISTRY.clear()
