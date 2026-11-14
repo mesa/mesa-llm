@@ -563,7 +563,11 @@ def tool(
                 "parameters": {
                     "type": "object",
                     "properties": properties,
-                    "required": list(required_params),
+                    "required": [
+                        param_name
+                        for param_name, param in required_params.items()
+                        if param.default is inspect.Parameter.empty
+                    ],
                 },
             },
         }
