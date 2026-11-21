@@ -5,9 +5,11 @@ box-drawing characters previously used (U+2514, U+2500, U+251C) crash
 with UnicodeEncodeError on Windows cp125x consoles.
 """
 
+import io
 from typing import ClassVar
 
 import pytest
+from rich.console import Console
 
 from mesa_llm.memory.memory import MemoryEntry
 
@@ -72,3 +74,113 @@ class TestMemoryEntryEncoding:
         output = str(sample_entry)
         assert "+--" in output, "Expected ASCII tree marker '+--' in output"
         assert "|--" in output, "Expected ASCII tree marker '|--' in output"
+
+    @pytest.mark.parametrize("encoding", ["cp1252", "utf-8"])
+    def test_display_preserves_content_on_encoded_stream(
+        self, sample_entry, monkeypatch, encoding
+    ):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(
+            raw, encoding=encoding, errors="strict", write_through=True
+        )
+        monkeypatch.setattr("sys.stdout", stream)
+        sample_entry.agent.memory.display = True
+        sample_entry.content = {"observation": "\u00e9 \u2615 \u65e5\u672c"}
+
+        sample_entry.display()
+
+        output = raw.getvalue().decode(encoding)
+        assert "\u00e9" in output
+        if encoding == "utf-8":
+            assert "\u2615 \u65e5\u672c" in output
+        else:
+            assert r"\u2615 \u65e5\u672c" in output
+        assert sample_entry.content["observation"] == "\u00e9 \u2615 \u65e5\u672c"
+        assert stream.errors == "strict"
+
+    @pytest.mark.parametrize("encoding", ["cp1252", "utf-8"])
+    def test_display_rich_emoji_alias(self, sample_entry, monkeypatch, encoding):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(
+            raw, encoding=encoding, errors="strict", write_through=True
+        )
+        monkeypatch.setattr("sys.stdout", stream)
+        sample_entry.agent.memory.display = True
+        sample_entry.content = {"observation": ":coffee:"}
+
+        sample_entry.display()
+
+        output = raw.getvalue().decode(encoding)
+        assert (r"\u2615" if encoding == "cp1252" else "\u2615") in output
+        assert stream.errors == "strict"
+
+    def test_display_with_stream_without_encoding(self, sample_entry, monkeypatch):
+        stream = io.StringIO()
+        monkeypatch.setattr("sys.stdout", stream)
+        sample_entry.agent.memory.display = True
+        sample_entry.content = {"observation": "\u65e5\u672c"}
+
+        sample_entry.display()
+
+        assert "\u65e5\u672c" in stream.getvalue()
+
+    def test_disabled_display_writes_nothing(self, sample_entry, monkeypatch):
+        stream = io.StringIO()
+        monkeypatch.setattr("sys.stdout", stream)
+        sample_entry.agent.memory.display = False
+
+        sample_entry.display()
+
+        assert stream.getvalue() == ""
+
+    def test_display_with_minimal_stdout(self, sample_entry, monkeypatch):
+        class Capture:
+            def __init__(self):
+                self.value = ""
+
+            def write(self, text):
+                self.value += text
+                return len(text)
+
+            def flush(self):
+                pass
+
+        stream = Capture()
+        monkeypatch.setattr("sys.stdout", stream)
+        sample_entry.agent.memory.display = True
+
+        sample_entry.display()
+
+        assert "price is $20" in stream.value
+
+    def test_escaped_content_fits_panel(self, sample_entry, monkeypatch):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252", write_through=True)
+        monkeypatch.setattr("sys.stdout", stream)
+        sample_entry.agent.memory.display = True
+        sample_entry.content = {"observation": "\u65e5\u672c" * 20}
+
+        sample_entry.display()
+
+        lines = raw.getvalue().decode("cp1252").splitlines()
+        assert len({len(line) for line in lines}) == 1
+
+    @pytest.mark.parametrize("encoding", ["cp1252", "utf-8"])
+    def test_display_with_unicode_hyperlink(self, sample_entry, monkeypatch, encoding):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding=encoding, write_through=True)
+        console = Console(file=stream, force_terminal=True, legacy_windows=False)
+        monkeypatch.setattr("mesa_llm.memory.memory.Console", lambda: console)
+        sample_entry.agent.memory.display = True
+        sample_entry.content = {
+            "observation": "[link=https://example.com/\u65e5\u672c]hello[/link]"
+        }
+
+        sample_entry.display()
+
+        output = raw.getvalue().decode(encoding)
+        assert "hello" in output
+        if encoding == "utf-8":
+            assert "https://example.com/\u65e5\u672c" in output
+        else:
+            assert "https://example.com/" not in output
