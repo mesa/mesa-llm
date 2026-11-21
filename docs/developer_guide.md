@@ -4,7 +4,7 @@ This guide explains how **Mesa-LLM** is designed, how its core components intera
 
 Whether you are fixing a bug, introducing a new reasoning strategy, integrating an LLM provider, or improving memory capabilities, this guide will help you understand the codebase and follow the project's engineering practices.
 
-**Before contributing:** Start with the [Contributing Guide](CONTRIBUTING.md) to understand the contribution process.
+**Before contributing:** Start with the [CONTRIBUTING](https://github.com/niteshver/mesa-llm_contribution/blob/main/CONTRIBUTING.md) to understand the contribution process.
 
 ### What Problem Does Mesa-LLM Solve?
 
