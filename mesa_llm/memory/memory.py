@@ -5,11 +5,29 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
 from mesa_llm.module_llm import ModuleLLM
 
 if TYPE_CHECKING:
     from mesa_llm.llm_agent import LLMAgent
+
+
+def _encoding_safe_text(console: Console, text: str) -> Text:
+    """Resolve Rich markup before escaping characters for panel layout."""
+    result = Text()
+    for segment in console.render_str(text).render(console):
+        safe = segment.text.encode(console.encoding, errors="backslashreplace").decode(
+            console.encoding
+        )
+        style = segment.style
+        if style and style.link:
+            try:
+                style.link.encode(console.encoding)
+            except UnicodeEncodeError:
+                style = style.update_link(None)
+        result.append(safe, style=style)
+    return result
 
 
 def _format_message_entry(msg_value) -> str:
@@ -108,24 +126,24 @@ class MemoryEntry:
 
             for key, value in data.items():
                 if isinstance(value, dict):
-                    lines.append(f"{indent}[blue]└──[/blue] [cyan]{key} :[/cyan]")
+                    lines.append(f"{indent}[blue]+--[/blue] [cyan]{key} :[/cyan]")
                     lines.extend(format_nested_dict(value, indent_level + 1))
                 elif isinstance(value, list):
-                    lines.append(f"{indent}[blue]└──[/blue] [cyan]{key} :[/cyan]")
+                    lines.append(f"{indent}[blue]+--[/blue] [cyan]{key} :[/cyan]")
                     next_indent = "   " * (indent_level + 1)
                     for i, item in enumerate(value):
                         if isinstance(item, dict):
                             lines.append(
-                                f"{next_indent}[blue]├──[/blue] [cyan]({i + 1})[/cyan]"
+                                f"{next_indent}[blue]|--[/blue] [cyan]({i + 1})[/cyan]"
                             )
                             lines.extend(format_nested_dict(item, indent_level + 2))
                         else:
                             lines.append(
-                                f"{next_indent}[blue]├──[/blue] [cyan]{item}[/cyan]"
+                                f"{next_indent}[blue]|--[/blue] [cyan]{item}[/cyan]"
                             )
                 else:
                     lines.append(
-                        f"{indent}[blue]└──[/blue] [cyan]{key} : [/cyan]{value}"
+                        f"{indent}[blue]+--[/blue] [cyan]{key} : [/cyan]{value}"
                     )
 
             return lines
@@ -142,11 +160,11 @@ class MemoryEntry:
                     if isinstance(item, dict):
                         lines.extend(format_nested_dict(item, 2))
                     else:
-                        lines.append(f"      [blue]└──[/blue] [cyan]{item}[/cyan]")
+                        lines.append(f"      [blue]+--[/blue] [cyan]{item}[/cyan]")
             elif isinstance(value, dict):
                 lines.extend(format_nested_dict(value, 1))
             else:
-                lines.append(f"   [blue]└──[/blue] [cyan]{value}[/cyan]")
+                lines.append(f"   [blue]+--[/blue] [cyan]{value}[/cyan]")
 
         content = "\n".join(lines)
 
@@ -154,15 +172,15 @@ class MemoryEntry:
 
     def display(self):
         if self.agent and hasattr(self.agent, "memory") and self.agent.memory.display:
+            console = Console()
             title = f"Step [bold purple]{self.agent.model.steps}[/bold purple] [bold]|[/bold] {type(self.agent).__name__} [bold purple]{self.agent.unique_id}[/bold purple]"
             panel = Panel(
-                self.__str__(),
-                title=title,
+                _encoding_safe_text(console, str(self)),
+                title=_encoding_safe_text(console, title),
                 title_align="left",
                 border_style="bright_blue",
                 padding=(0, 1),
             )
-            console = Console()
             console.print(panel)
 
 
