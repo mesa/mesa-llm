@@ -80,6 +80,7 @@ Getting Started <getting_started>
 Overview <overview>
 Tutorials <tutorials/index>
 Examples <examples>
+Developer Guide <developer_guide>
 API Documentation <apis/api_main>
 ```
 
