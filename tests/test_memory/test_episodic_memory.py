@@ -303,6 +303,28 @@ class TestEpisodicMemory:
         assert "No previous memory entries" in prompt
         assert "observation" in prompt
 
+    def test_build_grade_prompt_with_previous_entries(self, episodic_mock_agent):
+        memory = EpisodicMemory(
+            agent=episodic_mock_agent, llm_model="provider/test_model"
+        )
+        for i in range(3):
+            memory.memory_entries.append(
+                MemoryEntry(
+                    agent=episodic_mock_agent,
+                    content={"observation": {"data": f"entry_{i}"}},
+                    step=i,
+                )
+            )
+
+        prompt = memory._build_grade_prompt("observation", {"data": "new"})
+
+        assert prompt.count("previous memory entries:") == 1
+        header_pos = prompt.index("previous memory entries:")
+        assert header_pos < prompt.index("entry_0")
+        assert (
+            prompt.index("entry_0") < prompt.index("entry_1") < prompt.index("entry_2")
+        )
+
     def test_get_communication_history(self, episodic_mock_agent):
         """
         Return a formatted string of all messages stored in memory.

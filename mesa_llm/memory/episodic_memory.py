@@ -144,8 +144,8 @@ class EpisodicMemory(Memory):
         """
         if len(self.memory_entries) > 0:
             entries = list(self.memory_entries)[-5:]
-            previous_entries = "previous memory entries:\n\n".join(
-                [str(entry) for entry in entries]
+            previous_entries = "previous memory entries:\n\n" + "\n\n".join(
+                str(entry) for entry in entries
             )
         else:
             previous_entries = "No previous memory entries"
