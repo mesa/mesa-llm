@@ -4,7 +4,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from mesa_llm.memory.episodic_memory import EpisodicMemory
+from mesa_llm.memory.lt_memory import LongTermMemory
 from mesa_llm.memory.memory import Memory, MemoryEntry, _format_message_entry
+from mesa_llm.memory.st_lt_memory import STLTMemory
 from mesa_llm.module_llm import ModuleLLM
 
 if TYPE_CHECKING:
@@ -202,3 +205,22 @@ class TestFormatMessageEntry:
         """EpisodicMemory adds 'importance' to the content dict — should still format cleanly."""
         msg = {"message": "critical update", "sender": 5, "importance": 4}
         assert _format_message_entry(msg) == "Agent 5 says: critical update"
+
+
+def test_memory_subclasses_forward_completion_kwargs(mock_agent):
+    """LLM-backed memory subclasses should forward completion_kwargs to their ModuleLLM."""
+    sampling = {"temperature": 0.1, "seed": 123}
+
+    stlt = STLTMemory(
+        agent=mock_agent, llm_model="openai/gpt-4o-mini", completion_kwargs=sampling
+    )
+    lt = LongTermMemory(
+        agent=mock_agent, llm_model="openai/gpt-4o-mini", completion_kwargs=sampling
+    )
+    ep = EpisodicMemory(
+        agent=mock_agent, llm_model="openai/gpt-4o-mini", completion_kwargs=sampling
+    )
+
+    assert stlt.llm.completion_kwargs == sampling
+    assert lt.llm.completion_kwargs == sampling
+    assert ep.llm.completion_kwargs == sampling

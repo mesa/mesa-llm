@@ -38,6 +38,7 @@ class STLTMemory(Memory):
         fallback_model: str | None = None,
         api_base: str | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
+        completion_kwargs: dict | None = None,
     ):
         """
         Initialize the memory
@@ -50,6 +51,8 @@ class STLTMemory(Memory):
             additive_event_types : event types that accumulate multiple values
                 within a step instead of overwriting. Defaults to
                 ``{"message", "action"}``.
+            completion_kwargs : optional dictionary of additional LiteLLM
+                completion parameters forwarded to the memory's ``ModuleLLM``
         """
         if not llm_model:
             raise ValueError(
@@ -63,6 +66,7 @@ class STLTMemory(Memory):
             api_base=api_base,
             display=display,
             additive_event_types=additive_event_types,
+            completion_kwargs=completion_kwargs,
         )
 
         self.capacity = short_term_capacity

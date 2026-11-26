@@ -43,6 +43,7 @@ class ModuleLLM:
         fallback_model: str | None = None,
         api_base: str | None = None,
         system_prompt: str | None = None,
+        completion_kwargs: dict | None = None,
     ):
         """
         Initialize the LLM module
@@ -52,6 +53,9 @@ class ModuleLLM:
                 "{provider}/{model}" (for example, "openai/gpt-4o").
             api_base: The API base to use if the LLM provider is Ollama
             system_prompt: The system prompt to use for the LLM
+            completion_kwargs: Optional dictionary of additional LiteLLM completion
+                parameters (such as ``temperature``, ``seed``, ``top_p``, or
+                ``max_tokens``). Internal keys always take precedence.
 
         Raises:
             ValueError: If llm_model is not in the expected "{provider}/{model}"
@@ -62,6 +66,7 @@ class ModuleLLM:
         self.fallback_model = fallback_model
         self.system_prompt = system_prompt
         self._fallback_active = False
+        self.completion_kwargs = dict(completion_kwargs) if completion_kwargs else {}
 
         if "/" not in llm_model:
             raise ValueError(
@@ -234,6 +239,7 @@ class ModuleLLM:
         model: str,
     ) -> dict:
         completion_kwargs = {
+            **self.completion_kwargs,
             "model": model,
             "messages": messages,
             "tools": tool_schema,

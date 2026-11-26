@@ -626,3 +626,129 @@ class TestModuleLLM:
 
         with pytest.raises(ValueError, match="Invalid or unsupported model"):
             await llm.agenerate(prompt="Hello, how are you?")
+
+    def test_completion_kwargs_forwarded_in_generate(
+        self, monkeypatch, llm_response_factory
+    ):
+        """User completion_kwargs should be forwarded to litellm.completion."""
+        calls = []
+
+        def _dummy_completion(**kwargs):
+            calls.append(kwargs)
+            return llm_response_factory()
+
+        monkeypatch.setattr("mesa_llm.module_llm.completion", _dummy_completion)
+
+        llm = ModuleLLM(
+            llm_model="openai/gpt-4o",
+            completion_kwargs={"temperature": 0.2, "seed": 42, "max_tokens": 128},
+        )
+        llm.generate(prompt="Hello")
+
+        assert len(calls) == 1
+        assert calls[0]["temperature"] == 0.2
+        assert calls[0]["seed"] == 42
+        assert calls[0]["max_tokens"] == 128
+
+    @pytest.mark.asyncio
+    async def test_completion_kwargs_forwarded_in_agenerate(
+        self, monkeypatch, llm_response_factory
+    ):
+        """User completion_kwargs should be forwarded to litellm.acompletion."""
+        calls = []
+
+        async def _dummy_acompletion(**kwargs):
+            calls.append(kwargs)
+            return llm_response_factory()
+
+        monkeypatch.setattr("mesa_llm.module_llm.acompletion", _dummy_acompletion)
+
+        llm = ModuleLLM(
+            llm_model="openai/gpt-4o",
+            completion_kwargs={"temperature": 0.4, "top_p": 0.9},
+        )
+        await llm.agenerate(prompt="Hello")
+
+        assert len(calls) == 1
+        assert calls[0]["temperature"] == 0.4
+        assert calls[0]["top_p"] == 0.9
+
+    def test_completion_kwargs_internal_keys_take_precedence(
+        self, monkeypatch, llm_response_factory
+    ):
+        """Internal completion keys must override any matching user completion_kwargs."""
+        calls = []
+
+        def _dummy_completion(**kwargs):
+            calls.append(kwargs)
+            return llm_response_factory()
+
+        monkeypatch.setattr("mesa_llm.module_llm.completion", _dummy_completion)
+
+        tool_schema = [{"type": "function", "function": {"name": "read_state"}}]
+        response_format = {"type": "json_object"}
+        llm = ModuleLLM(
+            llm_model="openai/gpt-4o",
+            completion_kwargs={
+                "model": "anthropic/claude-3-5-sonnet",
+                "messages": [{"role": "user", "content": "hijacked"}],
+                "tools": ["bad_tool"],
+                "tool_choice": "required",
+                "response_format": {"type": "text"},
+                "temperature": 0.3,
+            },
+        )
+        llm.generate(
+            prompt="Hello",
+            tool_schema=tool_schema,
+            tool_choice="none",
+            response_format=response_format,
+        )
+
+        assert len(calls) == 1
+        captured = calls[0]
+        assert captured["model"] == "openai/gpt-4o"
+        assert captured["messages"] == [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Hello"},
+        ]
+        assert captured["tools"] is tool_schema
+        assert captured["tool_choice"] == "none"
+        assert captured["response_format"] is response_format
+        assert captured["temperature"] == 0.3
+
+    def test_completion_kwargs_copied_on_init(self):
+        """Mutating the caller's dict after init must not affect ModuleLLM."""
+        kwargs = {"temperature": 0.2}
+        llm = ModuleLLM(llm_model="openai/gpt-4o", completion_kwargs=kwargs)
+        kwargs["temperature"] = 0.9
+        kwargs["seed"] = 99
+
+        assert llm.completion_kwargs == {"temperature": 0.2}
+
+    def test_completion_kwargs_forwarded_to_fallback_model(
+        self, monkeypatch, llm_response_factory
+    ):
+        """Fallback calls should also receive user completion_kwargs."""
+        calls = []
+
+        def _dummy_completion(**kwargs):
+            calls.append(kwargs)
+            if kwargs["model"] == "openai/gpt-4o":
+                raise RuntimeError("primary failed")
+            return llm_response_factory()
+
+        monkeypatch.setattr("mesa_llm.module_llm.completion", _dummy_completion)
+
+        llm = ModuleLLM(
+            llm_model="openai/gpt-4o",
+            fallback_model="ollama/llama3",
+            completion_kwargs={"temperature": 0.1, "seed": 7},
+        )
+        llm.generate(prompt="Hello")
+
+        assert len(calls) == 2
+        assert calls[0]["model"] == "openai/gpt-4o"
+        assert calls[1]["model"] == "ollama/llama3"
+        assert calls[1]["temperature"] == 0.1
+        assert calls[1]["seed"] == 7

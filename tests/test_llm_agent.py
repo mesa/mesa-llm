@@ -5907,3 +5907,17 @@ def test_system_prompt_proxies_llm_prompt(basic_agent):
     basic_agent.llm.system_prompt = "LLM prompt"
 
     assert basic_agent.system_prompt == "LLM prompt"
+
+
+def test_llm_agent_forwards_completion_kwargs(basic_model):
+    """LLMAgent should forward completion_kwargs to both its LLM and memory LLM."""
+    sampling = {"temperature": 0.3, "seed": 42}
+    agent = LLMAgent(
+        model=basic_model,
+        reasoning=ReActReasoning,
+        llm_model="openai/gpt-4o-mini",
+        completion_kwargs=sampling,
+    )
+
+    assert agent.llm.completion_kwargs == sampling
+    assert agent.memory.llm.completion_kwargs == sampling

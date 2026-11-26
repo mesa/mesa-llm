@@ -302,6 +302,7 @@ class Memory(ABC):
         fallback_model: str | None = None,
         display: bool = True,
         api_base: str | None = None,
+        completion_kwargs: dict | None = None,
         additive_event_types: list[str] | set[str] | tuple[str, ...] | None = None,
     ):
         """
@@ -312,6 +313,8 @@ class Memory(ABC):
             llm_model : the model to use for summarization
             display : whether to display memory entries in the console
             api_base : the API base URL to use for the LLM provider
+            completion_kwargs : optional dictionary of additional LiteLLM
+                completion parameters forwarded to the memory's ``ModuleLLM``
             additive_event_types : event types that should accumulate multiple
                 values within the same step instead of overwriting. Defaults to
                 ``{"message", "action"}``. For example, ``message`` and
@@ -321,7 +324,10 @@ class Memory(ABC):
         self.agent = agent
         if llm_model:
             self.llm = ModuleLLM(
-                llm_model=llm_model, fallback_model=fallback_model, api_base=api_base
+                llm_model=llm_model,
+                fallback_model=fallback_model,
+                api_base=api_base,
+                completion_kwargs=completion_kwargs,
             )
 
         self.display = display
