@@ -388,11 +388,13 @@ class ToolManager:
             return await asyncio.gather(*tasks)
 
         try:
-            return asyncio.run(_run_all())
+            asyncio.get_running_loop()
         except RuntimeError:
-            # Fallback if event loop already running
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                return executor.submit(lambda: asyncio.run(_run_all())).result()
+            return asyncio.run(_run_all())
+
+        # Run the coroutine in a worker thread when called from an active loop.
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            return executor.submit(lambda: asyncio.run(_run_all())).result()
 
     async def acall_tools(
         self,

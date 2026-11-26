@@ -1,3 +1,5 @@
+import gc
+import warnings
 from unittest.mock import Mock
 
 import pytest
@@ -763,6 +765,82 @@ class TestToolManager:
         assert result[0]["role"] == "tool"
         assert result[0]["name"] == "test_tool"
         assert "Processed: test_value" in result[0]["response"]
+
+    @pytest.mark.asyncio
+    async def test_call_tools_inside_running_loop_does_not_leak_coroutine(self):
+        calls = []
+
+        @tool
+        def test_tool(agent, param1: str) -> str:
+            """Return a processed parameter.
+
+            Args:
+                agent: The agent making the request.
+                param1: The value to process.
+
+            Returns:
+                The processed value.
+            """
+            calls.append(param1)
+            return f"Processed: {param1}"
+
+        manager = ToolManager(tools=[test_tool])
+        mock_tool_call = Mock()
+        mock_tool_call.id = "call_123"
+        mock_tool_call.function.name = "test_tool"
+        mock_tool_call.function.arguments = '{"param1": "test_value"}'
+        mock_response = Mock(tool_calls=[mock_tool_call])
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always", RuntimeWarning)
+            result = manager.call_tools(Mock(), mock_response)
+            gc.collect()
+
+        assert result[0]["response"] == "Processed: test_value"
+        assert calls == ["test_value"]
+        assert not any(
+            issubclass(warning.category, RuntimeWarning)
+            and "was never awaited" in str(warning.message)
+            for warning in caught_warnings
+        )
+
+    @pytest.mark.asyncio
+    async def test_call_tools_inside_running_loop_handles_tool_error(self):
+        calls = []
+
+        @tool
+        def failing_tool(agent, param1: str) -> str:
+            """Raise an error while processing a parameter.
+
+            Args:
+                agent: The agent making the request.
+                param1: The value to process.
+
+            Returns:
+                A processed value.
+            """
+            calls.append(param1)
+            raise ValueError("tool failed")
+
+        manager = ToolManager(tools=[failing_tool])
+        mock_tool_call = Mock()
+        mock_tool_call.id = "call_123"
+        mock_tool_call.function.name = "failing_tool"
+        mock_tool_call.function.arguments = '{"param1": "test_value"}'
+        mock_response = Mock(tool_calls=[mock_tool_call])
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always", RuntimeWarning)
+            result = manager.call_tools(Mock(), mock_response)
+            gc.collect()
+
+        assert result[0]["response"] == "Error: tool failed"
+        assert calls == ["test_value"]
+        assert not any(
+            issubclass(warning.category, RuntimeWarning)
+            and "was never awaited" in str(warning.message)
+            for warning in caught_warnings
+        )
 
     def test_call_tools_single_selectors(self):
         """Execution accepts a single configured callable or name selector."""
